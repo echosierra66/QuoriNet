@@ -1,0 +1,2 @@
+# Quoridor
+Quoridor testing environment
