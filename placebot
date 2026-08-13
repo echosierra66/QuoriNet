@@ -2,13 +2,14 @@ import pygame
 import sys
 import threading
 from collections import deque
+from functools import lru_cache
 
 
 # ==========================================
 # 🤖 3-PLY QUORIDOR BOT
 # ==========================================
 
-def get_bot_move(game_state, player_id):
+def get_bot_move(game_state, player_id, debug=None):
     """
     3-ply minimax Quoridor bot.
 
@@ -21,6 +22,18 @@ def get_bot_move(game_state, player_id):
 
     if player_id != 2:
         return None
+
+    def note(message):
+        if debug is not None:
+            debug['phase'] = message
+
+    def note_check(message):
+        if debug is not None:
+            debug['checking'] = message
+
+    def note_path(message):
+        if debug is not None:
+            debug['path'] = message
 
     def opponent(pid):
         return 1 if pid == 2 else 2
@@ -42,6 +55,50 @@ def get_bot_move(game_state, player_id):
             state['p1_walls'] -= 1
         else:
             state['p2_walls'] -= 1
+
+    BOARD_CELLS = 8
+    NO_PATH = 99999
+
+    def wall_bit(c, r):
+        return 1 << (r * BOARD_CELLS + c)
+
+    def mask_from_walls(walls):
+        mask = 0
+        for c, r in walls:
+            mask |= wall_bit(c, r)
+        return mask
+
+    def iter_bits(mask):
+        while mask:
+            lsb = mask & -mask
+            idx = lsb.bit_length() - 1
+            yield idx % BOARD_CELLS, idx // BOARD_CELLS
+            mask ^= lsb
+
+    def wall_contact_count(state, c, r, orientation):
+        """Only structural walls that make 2+ contacts need path validation."""
+        contacts = set()
+
+        def add_contact(nc, nr):
+            if nc < 0 or nr < 0 or nc > 8 or nr > 8:
+                contacts.add(('edge', nc, nr))
+                return
+            if (nc, nr) in state['walls_h'] or (nc, nr) in state['walls_v']:
+                contacts.add(('wall', nc, nr))
+
+        if orientation == 'H':
+            add_contact(c - 1, r)
+            add_contact(c + 1, r)
+            add_contact(c, r - 1)
+            add_contact(c, r + 1)
+
+        else:
+            add_contact(c - 1, r)
+            add_contact(c + 1, r)
+            add_contact(c, r - 1)
+            add_contact(c, r + 1)
+
+        return len(contacts)
 
     # --------------------------------------------------
     # Movement
@@ -134,25 +191,112 @@ def get_bot_move(game_state, player_id):
         return moves
 
     # --------------------------------------------------
-    # Shortest path
+    # 3x3 zone divide-and-conquer path search
     # --------------------------------------------------
 
-    def shortest_path(state, start, target_row):
+    def board_zone(pos):
+        c, r = pos
+        return (r // 3, c // 3)
+
+    def target_goal_zones(target_row):
+        start_r = max(0, target_row - 2)
+        end_r = min(8, target_row + 2)
+        zones = set()
+
+        for r in range(start_r, end_r + 1):
+            for c in range(9):
+                zones.add((r // 3, c // 3))
+
+        return zones
+
+    def wall_h_exists(mask, c, r):
+        if not (0 <= c <= 8 and 0 <= r <= 8):
+            return False
+        return bool((mask >> (r * BOARD_CELLS + c)) & 1)
+
+    def wall_v_exists(mask, c, r):
+        if not (0 <= c <= 8 and 0 <= r <= 8):
+            return False
+        return bool((mask >> (r * BOARD_CELLS + c)) & 1)
+
+    def adjacent_from_masks(c, r, walls_h_mask, walls_v_mask):
+        moves = []
+
+        if (
+            r > 0
+            and not wall_h_exists(walls_h_mask, c, r - 1)
+            and not wall_h_exists(walls_h_mask, c - 1, r - 1)
+        ):
+            moves.append((c, r - 1))
+
+        if (
+            r < 8
+            and not wall_h_exists(walls_h_mask, c, r)
+            and not wall_h_exists(walls_h_mask, c - 1, r)
+        ):
+            moves.append((c, r + 1))
+
+        if (
+            c > 0
+            and not wall_v_exists(walls_v_mask, c - 1, r)
+            and not wall_v_exists(walls_v_mask, c - 1, r - 1)
+        ):
+            moves.append((c - 1, r))
+
+        if (
+            c < 8
+            and not wall_v_exists(walls_v_mask, c, r)
+            and not wall_v_exists(walls_v_mask, c, r - 1)
+        ):
+            moves.append((c + 1, r))
+
+        return moves
+
+    @lru_cache(maxsize=None)
+    def shortest_path_cached(start, target_row, walls_h_mask, walls_v_mask):
         queue = deque([(start, 0)])
         visited = {start}
+        goal_zones = target_goal_zones(target_row)
 
         while queue:
             pos, distance = queue.popleft()
+            zone = board_zone(pos)
 
-            if pos[1] == target_row:
+            if pos[1] == target_row or zone in goal_zones:
                 return distance
 
-            for nxt in adjacent(state, *pos):
+            c, r = pos
+            for nxt in adjacent_from_masks(c, r, walls_h_mask, walls_v_mask):
                 if nxt not in visited:
                     visited.add(nxt)
                     queue.append((nxt, distance + 1))
 
-        return 999
+        return NO_PATH
+
+    def shortest_path(state, start, target_row):
+        return shortest_path_cached(
+            start,
+            target_row,
+            mask_from_walls(state['walls_h']),
+            mask_from_walls(state['walls_v'])
+        )
+
+    def route_to_target(state, start, target_row):
+        queue = deque([(start, [start])])
+        visited = {start}
+
+        while queue:
+            pos, path = queue.popleft()
+
+            if pos[1] == target_row:
+                return path
+
+            for nxt in adjacent(state, *pos):
+                if nxt not in visited:
+                    visited.add(nxt)
+                    queue.append((nxt, path + [nxt]))
+
+        return [start]
 
     # --------------------------------------------------
     # Wall validation
@@ -173,6 +317,9 @@ def get_bot_move(game_state, player_id):
             if (c, r) in state['walls_v']:
                 return False
 
+            if wall_contact_count(state, c, r, orientation) <= 1:
+                return True
+
             state['walls_h'].add((c, r))
 
         else:
@@ -185,6 +332,9 @@ def get_bot_move(game_state, player_id):
 
             if (c, r) in state['walls_h']:
                 return False
+
+            if wall_contact_count(state, c, r, orientation) <= 1:
+                return True
 
             state['walls_v'].add((c, r))
 
@@ -205,7 +355,7 @@ def get_bot_move(game_state, player_id):
         else:
             state['walls_v'].remove((c, r))
 
-        return p1_path < 999 and p2_path < 999
+        return p1_path < NO_PATH and p2_path < NO_PATH
 
     # --------------------------------------------------
     # Copy state
@@ -280,6 +430,34 @@ def get_bot_move(game_state, player_id):
             enemy_target
         )
 
+        if debug is not None:
+            debug['path'] = f"mine={my_path} enemy={enemy_path}"
+
+        if my_path >= NO_PATH or enemy_path >= NO_PATH:
+            return actions
+
+        def route_cells(start, target_row, max_radius=8):
+            queue = deque([(start, 0)])
+            visited = {start}
+            cells = set()
+
+            while queue:
+                pos, distance = queue.popleft()
+                cells.add(pos)
+
+                if distance >= max_radius:
+                    continue
+
+                if pos[1] == target_row:
+                    break
+
+                for nxt in adjacent(state, *pos):
+                    if nxt not in visited:
+                        visited.add(nxt)
+                        queue.append((nxt, distance + 1))
+
+            return cells
+
         # --------------------------------------------------
         # Find every board coordinate within 4 blocks of:
         #
@@ -288,12 +466,49 @@ def get_bot_move(game_state, player_id):
         # 3. Every existing vertical wall
         # --------------------------------------------------
 
+        corridor_limit = 6
+        my_route = route_cells(my_pos, my_target, max_radius=min(corridor_limit, max(1, my_path)))
+        enemy_route = route_cells(enemy_pos, enemy_target, max_radius=min(corridor_limit, max(1, enemy_path)))
+
         relevant = set()
 
-        important_points = [
-            my_pos,
-            enemy_pos
-        ]
+        if my_path <= corridor_limit or enemy_path <= corridor_limit:
+            important_points = list(my_route | enemy_route)
+        else:
+            my_route = []
+            enemy_route = []
+
+            my_queue = deque([(my_pos, 0)])
+            enemy_queue = deque([(enemy_pos, 0)])
+            my_seen = {my_pos}
+            enemy_seen = {enemy_pos}
+
+            while my_queue:
+                pos, d = my_queue.popleft()
+                my_route.append(pos)
+                if d >= min(3, max(0, my_path - 1)):
+                    break
+                for nxt in adjacent(state, *pos):
+                    if nxt not in my_seen:
+                        my_seen.add(nxt)
+                        my_queue.append((nxt, d + 1))
+
+            while enemy_queue:
+                pos, d = enemy_queue.popleft()
+                enemy_route.append(pos)
+                if d >= min(3, max(0, enemy_path - 1)):
+                    break
+                for nxt in adjacent(state, *pos):
+                    if nxt not in enemy_seen:
+                        enemy_seen.add(nxt)
+                        enemy_queue.append((nxt, d + 1))
+
+            important_points = [
+                my_pos,
+                enemy_pos,
+                *my_route,
+                *enemy_route
+            ]
 
         important_points.extend(state['walls_h'])
         important_points.extend(state['walls_v'])
@@ -301,12 +516,41 @@ def get_bot_move(game_state, player_id):
         for px, py in important_points:
             for dx in range(-4, 5):
                 for dy in range(-4, 5):
-
                     c = px + dx
                     r = py + dy
-
                     if 0 <= c <= 7 and 0 <= r <= 7:
                         relevant.add((c, r))
+
+        if my_path <= corridor_limit or enemy_path <= corridor_limit:
+            relevant |= my_route
+            relevant |= enemy_route
+            narrowed = set()
+            for c, r in relevant:
+                for dx in range(-2, 3):
+                    for dy in range(-2, 3):
+                        cc = c + dx
+                        rr = r + dy
+                        if 0 <= cc <= 7 and 0 <= rr <= 7:
+                            narrowed.add((cc, rr))
+            relevant = narrowed
+
+        wall_mask = mask_from_walls(state['walls_h']) | mask_from_walls(state['walls_v'])
+        for c, r in iter_bits(wall_mask):
+            for dx in range(-4, 5):
+                for dy in range(-4, 5):
+                    cc = c + dx
+                    rr = r + dy
+                    if 0 <= cc <= 7 and 0 <= rr <= 7:
+                        relevant.add((cc, rr))
+
+        candidate_mask = 0
+        for c, r in relevant:
+            candidate_mask |= (1 << (r * 8 + c))
+
+        relevant = set()
+        for idx in range(64):
+            if (candidate_mask >> idx) & 1:
+                relevant.add((idx % 8, idx // 8))
 
         candidates = []
 
@@ -316,6 +560,10 @@ def get_bot_move(game_state, player_id):
 
         for c, r in relevant:
             for orient in ('H', 'V'):
+
+                if debug is not None:
+                    debug['candidate_walls'] = [(c, r, orient)]
+                    debug['checking'] = f"checking wall {orient} at {(c, r)}"
 
                 if not wall_valid(
                     state,
@@ -397,6 +645,12 @@ def get_bot_move(game_state, player_id):
 
         score = enemy_distance - bot_distance
 
+        if bot_distance >= NO_PATH:
+            score -= 10000
+
+        if enemy_distance >= NO_PATH:
+            score += 10000
+
         # Winning / losing dominates normal evaluation.
         if bot_pos[1] == bot_target:
             score += 1000
@@ -406,6 +660,11 @@ def get_bot_move(game_state, player_id):
 
         return score
 
+    def is_terminal_state(state, pid):
+        pos = get_pos(state, pid)
+        target = 8 if pid == 2 else 0
+        return pos[1] == target
+
     # --------------------------------------------------
     # 3-ply minimax
     # --------------------------------------------------
@@ -413,6 +672,32 @@ def get_bot_move(game_state, player_id):
     BOT = player_id
 
     def minimax(state, depth, maximizing):
+
+        note(f"evaluating depth {depth} for {'bot' if maximizing else 'opponent'}")
+
+        if is_terminal_state(state, BOT):
+            return 100000
+
+        if is_terminal_state(state, opponent(BOT)):
+            return -100000
+
+        bot_distance = shortest_path(
+            state,
+            get_pos(state, BOT),
+            8 if BOT == 2 else 0
+        )
+
+        enemy_distance = shortest_path(
+            state,
+            get_pos(state, opponent(BOT)),
+            8 if opponent(BOT) == 2 else 0
+        )
+
+        if bot_distance >= NO_PATH:
+            return -100000
+
+        if enemy_distance >= NO_PATH:
+            return 100000
 
         if depth == 0:
             return evaluate(
@@ -502,11 +787,29 @@ def get_bot_move(game_state, player_id):
 
     for action in actions:
 
+        note(f"testing root move {action}")
+
         new_state = apply_action(
             game_state,
             BOT,
             action
         )
+
+        if is_terminal_state(new_state, BOT):
+            if debug is not None:
+                debug['selected_path'] = route_to_target(
+                    new_state,
+                    get_pos(new_state, BOT),
+                    8 if BOT == 2 else 0
+                )
+            return action
+
+        if debug is not None:
+            debug['selected_path'] = route_to_target(
+                new_state,
+                get_pos(new_state, BOT),
+                8 if BOT == 2 else 0
+            )
 
         score = minimax(
             new_state,
@@ -594,6 +897,14 @@ class Quoridor:
         self.turn = 1
 
         self.wall_orientation = 'H'
+
+        self.bot_debug = {
+            'phase': 'idle',
+            'checking': '',
+            'path': '',
+            'candidate_walls': [],
+            'selected_path': []
+        }
 
         self.game_over = False
         self.winner = None
@@ -1238,6 +1549,59 @@ class Quoridor:
                 )
 
         # --------------------------------------------------
+        # Bot reasoning overlay
+        # --------------------------------------------------
+
+        debug_path = set(self.bot_debug.get('selected_path', []))
+        debug_walls = self.bot_debug.get('candidate_walls', [])
+
+        for c, r in debug_path:
+            x = offset_x + c * (CELL_SIZE + WALL_THICKNESS)
+            y = offset_y + r * (CELL_SIZE + WALL_THICKNESS)
+            pygame.draw.rect(
+                self.screen,
+                (255, 224, 102, 85),
+                pygame.Rect(x + 5, y + 5, CELL_SIZE - 10, CELL_SIZE - 10),
+                border_radius=10
+            )
+
+        for c, r, orient in debug_walls:
+            hx = offset_x + c * (CELL_SIZE + WALL_THICKNESS)
+            hy = offset_y + r * (CELL_SIZE + WALL_THICKNESS)
+            if orient == 'H':
+                pygame.draw.rect(
+                    self.screen,
+                    (200, 220, 255, 115),
+                    (hx, hy + CELL_SIZE, CELL_SIZE * 2 + WALL_THICKNESS, WALL_THICKNESS),
+                    border_radius=6
+                )
+            else:
+                pygame.draw.rect(
+                    self.screen,
+                    (200, 220, 255, 115),
+                    (hx + CELL_SIZE, hy, WALL_THICKNESS, CELL_SIZE * 2 + WALL_THICKNESS),
+                    border_radius=6
+                )
+
+        if self.turn == 2 and self.bot_debug:
+            phase = self.bot_debug.get('phase', 'thinking')
+            checking = self.bot_debug.get('checking', '')
+            path = self.bot_debug.get('path', '')
+
+            lines = [
+                f"Bot: {phase[:42]}",
+                f"Checking: {checking[:42]}",
+                f"Path: {path[:42]}"
+            ]
+
+            for i, text in enumerate(lines):
+                surf = self.small_font.render(text, True, TEXT_COLOR)
+                self.screen.blit(
+                    surf,
+                    (30, 85 + i * 18)
+                )
+
+        # --------------------------------------------------
         # Smooth player positions
         # --------------------------------------------------
 
@@ -1380,13 +1744,29 @@ class Quoridor:
             nonlocal bot_result
             nonlocal bot_thinking
 
+            self.bot_debug = {
+                'phase': 'thinking',
+                'checking': 'opening search',
+                'path': 'calculating routes',
+                'candidate_walls': [],
+                'selected_path': []
+            }
+
             result = get_bot_move(
                 state,
-                2
+                2,
+                self.bot_debug
             )
 
             bot_result = result
             bot_thinking = False
+            self.bot_debug = {
+                'phase': 'done',
+                'checking': 'ready',
+                'path': self.bot_debug.get('path', ''),
+                'candidate_walls': self.bot_debug.get('candidate_walls', []),
+                'selected_path': self.bot_debug.get('selected_path', [])
+            }
 
         while running:
 
