@@ -2,826 +2,244 @@ import pygame
 import sys
 import threading
 from collections import deque
-from functools import lru_cache
-
 
 # ==========================================
-# 🤖 3-PLY QUORIDOR BOT
+# 🧠 OPTIMIZED QUORIDOR BOT
 # ==========================================
 
-def get_bot_move(game_state, player_id, debug=None):
-    """
-    3-ply minimax Quoridor bot.
+class QuoridorBot:
+    def __init__(self, bot_id=2):
+        self.bot_id = bot_id
+        self.max_depth = 3
+        
+    def get_move(self, state):
+        """Entry point for the bot thread."""
+        best_move, _ = self.minimax(state, self.max_depth, float('-inf'), float('inf'), True)
+        return best_move
 
-    Evaluation:
-        opponent shortest path - own shortest path
-
-    Wall search is restricted to positions within
-    4 blocks of either player or an existing wall.
-    """
-
-    if player_id != 2:
-        return None
-
-    def note(message):
-        if debug is not None:
-            debug['phase'] = message
-
-    def note_check(message):
-        if debug is not None:
-            debug['checking'] = message
-
-    def note_path(message):
-        if debug is not None:
-            debug['path'] = message
-
-    def opponent(pid):
+    def get_opponent(self, pid):
         return 1 if pid == 2 else 2
 
-    def get_pos(state, pid):
-        return state['p1_pos'] if pid == 1 else state['p2_pos']
+    def get_target_row(self, pid):
+        return 8 if pid == 2 else 0
 
-    def set_pos(state, pid, pos):
-        if pid == 1:
-            state['p1_pos'] = pos
-        else:
-            state['p2_pos'] = pos
-
-    def get_walls(state, pid):
-        return state['p1_walls'] if pid == 1 else state['p2_walls']
-
-    def remove_wall(state, pid):
-        if pid == 1:
-            state['p1_walls'] -= 1
-        else:
-            state['p2_walls'] -= 1
-
-    BOARD_CELLS = 8
-    NO_PATH = 99999
-
-    def wall_bit(c, r):
-        return 1 << (r * BOARD_CELLS + c)
-
-    def mask_from_walls(walls):
-        mask = 0
-        for c, r in walls:
-            mask |= wall_bit(c, r)
-        return mask
-
-    def iter_bits(mask):
-        while mask:
-            lsb = mask & -mask
-            idx = lsb.bit_length() - 1
-            yield idx % BOARD_CELLS, idx // BOARD_CELLS
-            mask ^= lsb
-
-    def wall_contact_count(state, c, r, orientation):
-        """Only structural walls that make 2+ contacts need path validation."""
-        contacts = set()
-
-        def add_contact(nc, nr):
-            if nc < 0 or nr < 0 or nc > 8 or nr > 8:
-                contacts.add(('edge', nc, nr))
-                return
-            if (nc, nr) in state['walls_h'] or (nc, nr) in state['walls_v']:
-                contacts.add(('wall', nc, nr))
-
-        if orientation == 'H':
-            add_contact(c - 1, r)
-            add_contact(c + 1, r)
-            add_contact(c, r - 1)
-            add_contact(c, r + 1)
-
-        else:
-            add_contact(c - 1, r)
-            add_contact(c + 1, r)
-            add_contact(c, r - 1)
-            add_contact(c, r + 1)
-
-        return len(contacts)
-
-    # --------------------------------------------------
-    # Movement
-    # --------------------------------------------------
-
-    def adjacent(state, c, r):
-        moves = []
-
-        if (
-            r > 0
-            and (c, r - 1) not in state['walls_h']
-            and (c - 1, r - 1) not in state['walls_h']
-        ):
-            moves.append((c, r - 1))
-
-        if (
-            r < 8
-            and (c, r) not in state['walls_h']
-            and (c - 1, r) not in state['walls_h']
-        ):
-            moves.append((c, r + 1))
-
-        if (
-            c > 0
-            and (c - 1, r) not in state['walls_v']
-            and (c - 1, r - 1) not in state['walls_v']
-        ):
-            moves.append((c - 1, r))
-
-        if (
-            c < 8
-            and (c, r) not in state['walls_v']
-            and (c, r - 1) not in state['walls_v']
-        ):
-            moves.append((c + 1, r))
-
-        return moves
-
-    def valid_moves(state, pid):
-        pos = get_pos(state, pid)
-        other = get_pos(state, opponent(pid))
-
-        moves = adjacent(state, *pos)
-
-        if other in moves:
-            moves.remove(other)
-
-            dc = other[0] - pos[0]
-            dr = other[1] - pos[1]
-
-            jump = (
-                other[0] + dc,
-                other[1] + dr
-            )
-
-            # Straight jump.
-            if (
-                0 <= jump[0] <= 8
-                and 0 <= jump[1] <= 8
-                and jump in adjacent(state, *other)
-            ):
-                moves.append(jump)
-
-            # Diagonal jumps when straight jump is blocked.
-            else:
-                if dr != 0:
-                    for side in [
-                        (other[0] - 1, other[1]),
-                        (other[0] + 1, other[1])
-                    ]:
-                        if (
-                            0 <= side[0] <= 8
-                            and 0 <= side[1] <= 8
-                            and side in adjacent(state, *other)
-                        ):
-                            moves.append(side)
-
-                if dc != 0:
-                    for side in [
-                        (other[0], other[1] - 1),
-                        (other[0], other[1] + 1)
-                    ]:
-                        if (
-                            0 <= side[0] <= 8
-                            and 0 <= side[1] <= 8
-                            and side in adjacent(state, *other)
-                        ):
-                            moves.append(side)
-
-        return moves
-
-    # --------------------------------------------------
-    # 3x3 zone divide-and-conquer path search
-    # --------------------------------------------------
-
-    def board_zone(pos):
-        c, r = pos
-        return (r // 3, c // 3)
-
-    def target_goal_zones(target_row):
-        start_r = max(0, target_row - 2)
-        end_r = min(8, target_row + 2)
-        zones = set()
-
-        for r in range(start_r, end_r + 1):
-            for c in range(9):
-                zones.add((r // 3, c // 3))
-
-        return zones
-
-    def wall_h_exists(mask, c, r):
-        if not (0 <= c <= 8 and 0 <= r <= 8):
-            return False
-        return bool((mask >> (r * BOARD_CELLS + c)) & 1)
-
-    def wall_v_exists(mask, c, r):
-        if not (0 <= c <= 8 and 0 <= r <= 8):
-            return False
-        return bool((mask >> (r * BOARD_CELLS + c)) & 1)
-
-    def adjacent_from_masks(c, r, walls_h_mask, walls_v_mask):
-        moves = []
-
-        if (
-            r > 0
-            and not wall_h_exists(walls_h_mask, c, r - 1)
-            and not wall_h_exists(walls_h_mask, c - 1, r - 1)
-        ):
-            moves.append((c, r - 1))
-
-        if (
-            r < 8
-            and not wall_h_exists(walls_h_mask, c, r)
-            and not wall_h_exists(walls_h_mask, c - 1, r)
-        ):
-            moves.append((c, r + 1))
-
-        if (
-            c > 0
-            and not wall_v_exists(walls_v_mask, c - 1, r)
-            and not wall_v_exists(walls_v_mask, c - 1, r - 1)
-        ):
-            moves.append((c - 1, r))
-
-        if (
-            c < 8
-            and not wall_v_exists(walls_v_mask, c, r)
-            and not wall_v_exists(walls_v_mask, c, r - 1)
-        ):
-            moves.append((c + 1, r))
-
-        return moves
-
-    @lru_cache(maxsize=None)
-    def shortest_path_cached(start, target_row, walls_h_mask, walls_v_mask):
-        queue = deque([(start, 0)])
-        visited = {start}
-        goal_zones = target_goal_zones(target_row)
-
-        while queue:
-            pos, distance = queue.popleft()
-            zone = board_zone(pos)
-
-            if pos[1] == target_row or zone in goal_zones:
-                return distance
-
-            c, r = pos
-            for nxt in adjacent_from_masks(c, r, walls_h_mask, walls_v_mask):
-                if nxt not in visited:
-                    visited.add(nxt)
-                    queue.append((nxt, distance + 1))
-
-        return NO_PATH
-
-    def shortest_path(state, start, target_row):
-        return shortest_path_cached(
-            start,
-            target_row,
-            mask_from_walls(state['walls_h']),
-            mask_from_walls(state['walls_v'])
-        )
-
-    def route_to_target(state, start, target_row):
-        queue = deque([(start, [start])])
-        visited = {start}
+    def get_shortest_path(self, state, pid):
+        """True BFS to find the exact shortest path. No zone shortcuts."""
+        start_pos = state['p1_pos'] if pid == 1 else state['p2_pos']
+        target_row = self.get_target_row(pid)
+        
+        queue = deque([(start_pos, [start_pos])])
+        visited = {start_pos}
 
         while queue:
             pos, path = queue.popleft()
-
+            
             if pos[1] == target_row:
                 return path
-
-            for nxt in adjacent(state, *pos):
+                
+            for nxt in self.get_adjacent(state, *pos):
                 if nxt not in visited:
                     visited.add(nxt)
                     queue.append((nxt, path + [nxt]))
+                    
+        return None # Path blocked
 
-        return [start]
+    def get_adjacent(self, state, c, r):
+        """Gets valid adjacent moves considering walls (ignoring other player)."""
+        moves = []
+        # Up
+        if r > 0 and (c, r - 1) not in state['walls_h'] and (c - 1, r - 1) not in state['walls_h']:
+            moves.append((c, r - 1))
+        # Down
+        if r < 8 and (c, r) not in state['walls_h'] and (c - 1, r) not in state['walls_h']:
+            moves.append((c, r + 1))
+        # Left
+        if c > 0 and (c - 1, r) not in state['walls_v'] and (c - 1, r - 1) not in state['walls_v']:
+            moves.append((c - 1, r))
+        # Right
+        if c < 8 and (c, r) not in state['walls_v'] and (c, r - 1) not in state['walls_v']:
+            moves.append((c + 1, r))
+        return moves
 
-    # --------------------------------------------------
-    # Wall validation
-    # --------------------------------------------------
-
-    def wall_valid(state, c, r, orientation):
-        if not (0 <= c <= 7 and 0 <= r <= 7):
-            return False
-
-        if orientation == 'H':
-            if (
-                (c, r) in state['walls_h']
-                or (c - 1, r) in state['walls_h']
-                or (c + 1, r) in state['walls_h']
-            ):
-                return False
-
-            if (c, r) in state['walls_v']:
-                return False
-
-            if wall_contact_count(state, c, r, orientation) <= 1:
-                return True
-
-            state['walls_h'].add((c, r))
-
-        else:
-            if (
-                (c, r) in state['walls_v']
-                or (c, r - 1) in state['walls_v']
-                or (c, r + 1) in state['walls_v']
-            ):
-                return False
-
-            if (c, r) in state['walls_h']:
-                return False
-
-            if wall_contact_count(state, c, r, orientation) <= 1:
-                return True
-
-            state['walls_v'].add((c, r))
-
-        p1_path = shortest_path(
-            state,
-            state['p1_pos'],
-            0
-        )
-
-        p2_path = shortest_path(
-            state,
-            state['p2_pos'],
-            8
-        )
-
-        if orientation == 'H':
-            state['walls_h'].remove((c, r))
-        else:
-            state['walls_v'].remove((c, r))
-
-        return p1_path < NO_PATH and p2_path < NO_PATH
-
-    # --------------------------------------------------
-    # Copy state
-    # --------------------------------------------------
-
-    def copy_state(state):
-        return {
-            'p1_pos': state['p1_pos'],
-            'p2_pos': state['p2_pos'],
-            'p1_walls': state['p1_walls'],
-            'p2_walls': state['p2_walls'],
-            'walls_h': state['walls_h'].copy(),
-            'walls_v': state['walls_v'].copy(),
-            'turn': state['turn']
-        }
-
-    # --------------------------------------------------
-    # Apply action
-    # --------------------------------------------------
-
-    def apply_action(state, pid, action):
-        new_state = copy_state(state)
-
-        action_type, data = action
-
-        if action_type == 'move':
-            set_pos(new_state, pid, data)
-
-        elif action_type == 'wall':
-            c, r, orient = data
-
-            if orient == 'H':
-                new_state['walls_h'].add((c, r))
+    def get_valid_moves(self, state, pid):
+        """Gets valid player moves, including jumps over the opponent."""
+        pos = state['p1_pos'] if pid == 1 else state['p2_pos']
+        other_pos = state['p2_pos'] if pid == 1 else state['p1_pos']
+        
+        moves = self.get_adjacent(state, *pos)
+        
+        if other_pos in moves:
+            moves.remove(other_pos)
+            dc = other_pos[0] - pos[0]
+            dr = other_pos[1] - pos[1]
+            jump_straight = (other_pos[0] + dc, other_pos[1] + dr)
+            
+            # Check if straight jump is valid
+            other_adj = self.get_adjacent(state, *other_pos)
+            if jump_straight in other_adj:
+                moves.append(jump_straight)
             else:
-                new_state['walls_v'].add((c, r))
+                # Diagonal jumps if straight is blocked by wall or board edge
+                if dr != 0: # Approaching vertically
+                    for side in [(other_pos[0]-1, other_pos[1]), (other_pos[0]+1, other_pos[1])]:
+                        if side in other_adj: moves.append(side)
+                elif dc != 0: # Approaching horizontally
+                    for side in [(other_pos[0], other_pos[1]-1), (other_pos[0], other_pos[1]+1)]:
+                        if side in other_adj: moves.append(side)
+        return moves
 
-            remove_wall(new_state, pid)
-
-        new_state['turn'] = opponent(pid)
-
-        return new_state
-
-    # --------------------------------------------------
-    # Wall candidate generation
-    # --------------------------------------------------
-
-    def generate_actions(state, pid):
-        actions = []
-
-        # Always consider movement.
-        for move in valid_moves(state, pid):
-            actions.append(('move', move))
-
-        if get_walls(state, pid) <= 0:
-            return actions
-
-        my_pos = get_pos(state, pid)
-        enemy_pos = get_pos(state, opponent(pid))
-
-        my_target = 8 if pid == 2 else 0
-        enemy_target = 8 if pid == 1 else 0
-
-        my_path = shortest_path(
-            state,
-            my_pos,
-            my_target
-        )
-
-        enemy_path = shortest_path(
-            state,
-            enemy_pos,
-            enemy_target
-        )
-
-        if debug is not None:
-            debug['path'] = f"mine={my_path} enemy={enemy_path}"
-
-        if my_path >= NO_PATH or enemy_path >= NO_PATH:
-            return actions
-
-        def route_cells(start, target_row, max_radius=8):
-            queue = deque([(start, 0)])
-            visited = {start}
-            cells = set()
-
-            while queue:
-                pos, distance = queue.popleft()
-                cells.add(pos)
-
-                if distance >= max_radius:
-                    continue
-
-                if pos[1] == target_row:
-                    break
-
-                for nxt in adjacent(state, *pos):
-                    if nxt not in visited:
-                        visited.add(nxt)
-                        queue.append((nxt, distance + 1))
-
-            return cells
-
-        # --------------------------------------------------
-        # Find every board coordinate within 4 blocks of:
-        #
-        # 1. Either player
-        # 2. Every existing horizontal wall
-        # 3. Every existing vertical wall
-        # --------------------------------------------------
-
-        corridor_limit = 6
-        my_route = route_cells(my_pos, my_target, max_radius=min(corridor_limit, max(1, my_path)))
-        enemy_route = route_cells(enemy_pos, enemy_target, max_radius=min(corridor_limit, max(1, enemy_path)))
-
-        relevant = set()
-
-        if my_path <= corridor_limit or enemy_path <= corridor_limit:
-            important_points = list(my_route | enemy_route)
+    def is_valid_wall(self, state, c, r, orient):
+        """Strict wall validation ensuring no paths are blocked."""
+        if not (0 <= c <= 7 and 0 <= r <= 7): return False
+        
+        if orient == 'H':
+            if (c, r) in state['walls_h'] or (c-1, r) in state['walls_h'] or (c+1, r) in state['walls_h']: return False
+            if (c, r) in state['walls_v']: return False
+            state['walls_h'].add((c, r))
         else:
-            my_route = []
-            enemy_route = []
+            if (c, r) in state['walls_v'] or (c, r-1) in state['walls_v'] or (c, r+1) in state['walls_v']: return False
+            if (c, r) in state['walls_h']: return False
+            state['walls_v'].add((c, r))
+            
+        p1_safe = self.get_shortest_path(state, 1) is not None
+        p2_safe = self.get_shortest_path(state, 2) is not None
+        
+        if orient == 'H': state['walls_h'].remove((c, r))
+        else: state['walls_v'].remove((c, r))
+        
+        return p1_safe and p2_safe
 
-            my_queue = deque([(my_pos, 0)])
-            enemy_queue = deque([(enemy_pos, 0)])
-            my_seen = {my_pos}
-            enemy_seen = {enemy_pos}
+    def generate_actions(self, state, pid):
+        actions = []
+        
+        # 1. Always consider moving
+        for move in self.get_valid_moves(state, pid):
+            actions.append(('move', move))
+            
+        walls_left = state['p1_walls'] if pid == 1 else state['p2_walls']
+        if walls_left <= 0:
+            return actions
 
-            while my_queue:
-                pos, d = my_queue.popleft()
-                my_route.append(pos)
-                if d >= min(3, max(0, my_path - 1)):
-                    break
-                for nxt in adjacent(state, *pos):
-                    if nxt not in my_seen:
-                        my_seen.add(nxt)
-                        my_queue.append((nxt, d + 1))
+        # 2. Smart Wall Generation: Only test walls that intercept the opponent's current path
+        opponent_id = self.get_opponent(pid)
+        opp_path = self.get_shortest_path(state, opponent_id)
+        
+        if not opp_path: 
+            return actions
 
-            while enemy_queue:
-                pos, d = enemy_queue.popleft()
-                enemy_route.append(pos)
-                if d >= min(3, max(0, enemy_path - 1)):
-                    break
-                for nxt in adjacent(state, *pos):
-                    if nxt not in enemy_seen:
-                        enemy_seen.add(nxt)
-                        enemy_queue.append((nxt, d + 1))
+        candidate_walls = set()
+        for i in range(len(opp_path) - 1):
+            c1, r1 = opp_path[i]
+            c2, r2 = opp_path[i+1]
+            
+            # If moving vertically, test horizontal walls blocking them
+            if c1 == c2: 
+                r_min = min(r1, r2)
+                candidate_walls.update([(c1, r_min, 'H'), (c1-1, r_min, 'H')])
+            # If moving horizontally, test vertical walls
+            else:
+                c_min = min(c1, c2)
+                candidate_walls.update([(c_min, r1, 'V'), (c_min, r1-1, 'V')])
+                
+        # Filter valid walls and evaluate their impact
+        scored_walls = []
+        my_path = self.get_shortest_path(state, pid)
+        base_my_dist = len(my_path)
+        base_opp_dist = len(opp_path)
 
-            important_points = [
-                my_pos,
-                enemy_pos,
-                *my_route,
-                *enemy_route
-            ]
+        for c, r, orient in candidate_walls:
+            if self.is_valid_wall(state, c, r, orient):
+                if orient == 'H': state['walls_h'].add((c, r))
+                else: state['walls_v'].add((c, r))
+                
+                new_opp_path = self.get_shortest_path(state, opponent_id)
+                new_my_path = self.get_shortest_path(state, pid)
+                
+                if orient == 'H': state['walls_h'].remove((c, r))
+                else: state['walls_v'].remove((c, r))
+                
+                # How much does this delay the opponent vs delaying me?
+                delay = (len(new_opp_path) - base_opp_dist) - (len(new_my_path) - base_my_dist)
+                if delay > 0:
+                    scored_walls.append((delay, ('wall', (c, r, orient))))
 
-        important_points.extend(state['walls_h'])
-        important_points.extend(state['walls_v'])
-
-        for px, py in important_points:
-            for dx in range(-4, 5):
-                for dy in range(-4, 5):
-                    c = px + dx
-                    r = py + dy
-                    if 0 <= c <= 7 and 0 <= r <= 7:
-                        relevant.add((c, r))
-
-        if my_path <= corridor_limit or enemy_path <= corridor_limit:
-            relevant |= my_route
-            relevant |= enemy_route
-            narrowed = set()
-            for c, r in relevant:
-                for dx in range(-2, 3):
-                    for dy in range(-2, 3):
-                        cc = c + dx
-                        rr = r + dy
-                        if 0 <= cc <= 7 and 0 <= rr <= 7:
-                            narrowed.add((cc, rr))
-            relevant = narrowed
-
-        wall_mask = mask_from_walls(state['walls_h']) | mask_from_walls(state['walls_v'])
-        for c, r in iter_bits(wall_mask):
-            for dx in range(-4, 5):
-                for dy in range(-4, 5):
-                    cc = c + dx
-                    rr = r + dy
-                    if 0 <= cc <= 7 and 0 <= rr <= 7:
-                        relevant.add((cc, rr))
-
-        candidate_mask = 0
-        for c, r in relevant:
-            candidate_mask |= (1 << (r * 8 + c))
-
-        relevant = set()
-        for idx in range(64):
-            if (candidate_mask >> idx) & 1:
-                relevant.add((idx % 8, idx // 8))
-
-        candidates = []
-
-        # --------------------------------------------------
-        # Evaluate each nearby wall.
-        # --------------------------------------------------
-
-        for c, r in relevant:
-            for orient in ('H', 'V'):
-
-                if debug is not None:
-                    debug['candidate_walls'] = [(c, r, orient)]
-                    debug['checking'] = f"checking wall {orient} at {(c, r)}"
-
-                if not wall_valid(
-                    state,
-                    c,
-                    r,
-                    orient
-                ):
-                    continue
-
-                if orient == 'H':
-                    state['walls_h'].add((c, r))
-                else:
-                    state['walls_v'].add((c, r))
-
-                new_my_path = shortest_path(
-                    state,
-                    my_pos,
-                    my_target
-                )
-
-                new_enemy_path = shortest_path(
-                    state,
-                    enemy_pos,
-                    enemy_target
-                )
-
-                if orient == 'H':
-                    state['walls_h'].remove((c, r))
-                else:
-                    state['walls_v'].remove((c, r))
-
-                value = (
-                    new_enemy_path - enemy_path
-                ) - (
-                    new_my_path - my_path
-                )
-
-                candidates.append(
-                    (
-                        value,
-                        ('wall', (c, r, orient))
-                    )
-                )
-
-        candidates.sort(
-            key=lambda x: x[0],
-            reverse=True
-        )
-
-        for _, action in candidates[:12]:
-            actions.append(action)
+        scored_walls.sort(key=lambda x: x[0], reverse=True)
+        for _, wall_action in scored_walls[:5]: # Take top 5 best walls to keep branching factor low
+            actions.append(wall_action)
 
         return actions
 
-    # --------------------------------------------------
-    # Evaluation
-    # --------------------------------------------------
+    def evaluate(self, state):
+        p1_path = self.get_shortest_path(state, 1)
+        p2_path = self.get_shortest_path(state, 2)
+        
+        if not p1_path: return 10000 if self.bot_id == 2 else -10000
+        if not p2_path: return -10000 if self.bot_id == 2 else 10000
+        
+        d1 = len(p1_path)
+        d2 = len(p2_path)
+        
+        # Bot wants to maximize (opponent distance - its own distance)
+        if self.bot_id == 2:
+            return d1 - d2
+        return d2 - d1
 
-    def evaluate(state, bot_pid):
-        enemy_pid = opponent(bot_pid)
+    def apply_action(self, state, pid, action):
+        new_state = {
+            'p1_pos': state['p1_pos'], 'p2_pos': state['p2_pos'],
+            'p1_walls': state['p1_walls'], 'p2_walls': state['p2_walls'],
+            'walls_h': state['walls_h'].copy(), 'walls_v': state['walls_v'].copy(),
+            'turn': self.get_opponent(pid)
+        }
+        
+        if action[0] == 'move':
+            if pid == 1: new_state['p1_pos'] = action[1]
+            else: new_state['p2_pos'] = action[1]
+        else:
+            c, r, orient = action[1]
+            if orient == 'H': new_state['walls_h'].add((c, r))
+            else: new_state['walls_v'].add((c, r))
+            if pid == 1: new_state['p1_walls'] -= 1
+            else: new_state['p2_walls'] -= 1
+            
+        return new_state
 
-        bot_pos = get_pos(state, bot_pid)
-        enemy_pos = get_pos(state, enemy_pid)
+    def minimax(self, state, depth, alpha, beta, maximizing):
+        if depth == 0 or state['p1_pos'][1] == 0 or state['p2_pos'][1] == 8:
+            # Win heavily overrides standard evaluation
+            if state['p2_pos'][1] == 8: return None, 10000 if self.bot_id == 2 else -10000
+            if state['p1_pos'][1] == 0: return None, -10000 if self.bot_id == 2 else 10000
+            return None, self.evaluate(state)
 
-        bot_target = 8 if bot_pid == 2 else 0
-        enemy_target = 8 if enemy_pid == 2 else 0
-
-        bot_distance = shortest_path(
-            state,
-            bot_pos,
-            bot_target
-        )
-
-        enemy_distance = shortest_path(
-            state,
-            enemy_pos,
-            enemy_target
-        )
-
-        score = enemy_distance - bot_distance
-
-        if bot_distance >= NO_PATH:
-            score -= 10000
-
-        if enemy_distance >= NO_PATH:
-            score += 10000
-
-        # Winning / losing dominates normal evaluation.
-        if bot_pos[1] == bot_target:
-            score += 1000
-
-        if enemy_pos[1] == enemy_target:
-            score -= 1000
-
-        return score
-
-    def is_terminal_state(state, pid):
-        pos = get_pos(state, pid)
-        target = 8 if pid == 2 else 0
-        return pos[1] == target
-
-    # --------------------------------------------------
-    # 3-ply minimax
-    # --------------------------------------------------
-
-    BOT = player_id
-
-    def minimax(state, depth, maximizing):
-
-        note(f"evaluating depth {depth} for {'bot' if maximizing else 'opponent'}")
-
-        if is_terminal_state(state, BOT):
-            return 100000
-
-        if is_terminal_state(state, opponent(BOT)):
-            return -100000
-
-        bot_distance = shortest_path(
-            state,
-            get_pos(state, BOT),
-            8 if BOT == 2 else 0
-        )
-
-        enemy_distance = shortest_path(
-            state,
-            get_pos(state, opponent(BOT)),
-            8 if opponent(BOT) == 2 else 0
-        )
-
-        if bot_distance >= NO_PATH:
-            return -100000
-
-        if enemy_distance >= NO_PATH:
-            return 100000
-
-        if depth == 0:
-            return evaluate(
-                state,
-                BOT
-            )
-
-        pid = (
-            BOT
-            if maximizing
-            else opponent(BOT)
-        )
-
-        actions = generate_actions(
-            state,
-            pid
-        )
-
-        if not actions:
-            return evaluate(
-                state,
-                BOT
-            )
+        pid = self.bot_id if maximizing else self.get_opponent(self.bot_id)
+        actions = self.generate_actions(state, pid)
+        
+        if not actions: return None, self.evaluate(state)
+        
+        best_action = actions[0]
 
         if maximizing:
-            best = -float('inf')
-
+            max_eval = float('-inf')
             for action in actions:
-
-                new_state = apply_action(
-                    state,
-                    pid,
-                    action
-                )
-
-                score = minimax(
-                    new_state,
-                    depth - 1,
-                    False
-                )
-
-                best = max(
-                    best,
-                    score
-                )
-
-            return best
-
+                new_state = self.apply_action(state, pid, action)
+                _, eval_score = self.minimax(new_state, depth - 1, alpha, beta, False)
+                if eval_score > max_eval:
+                    max_eval = eval_score
+                    best_action = action
+                alpha = max(alpha, eval_score)
+                if beta <= alpha: break
+            return best_action, max_eval
         else:
-            best = float('inf')
-
+            min_eval = float('inf')
             for action in actions:
-
-                new_state = apply_action(
-                    state,
-                    pid,
-                    action
-                )
-
-                score = minimax(
-                    new_state,
-                    depth - 1,
-                    True
-                )
-
-                best = min(
-                    best,
-                    score
-                )
-
-            return best
-
-    # --------------------------------------------------
-    # Root search
-    # --------------------------------------------------
-
-    actions = generate_actions(
-        game_state,
-        BOT
-    )
-
-    if not actions:
-        return None
-
-    best_action = None
-    best_score = -float('inf')
-
-    for action in actions:
-
-        note(f"testing root move {action}")
-
-        new_state = apply_action(
-            game_state,
-            BOT,
-            action
-        )
-
-        if is_terminal_state(new_state, BOT):
-            if debug is not None:
-                debug['selected_path'] = route_to_target(
-                    new_state,
-                    get_pos(new_state, BOT),
-                    8 if BOT == 2 else 0
-                )
-            return action
-
-        if debug is not None:
-            debug['selected_path'] = route_to_target(
-                new_state,
-                get_pos(new_state, BOT),
-                8 if BOT == 2 else 0
-            )
-
-        score = minimax(
-            new_state,
-            2,
-            False
-        )
-
-        if score > best_score:
-            best_score = score
-            best_action = action
-
-    return best_action
+                new_state = self.apply_action(state, pid, action)
+                _, eval_score = self.minimax(new_state, depth - 1, alpha, beta, True)
+                if eval_score < min_eval:
+                    min_eval = eval_score
+                    best_action = action
+                beta = min(beta, eval_score)
+                if beta <= alpha: break
+            return best_action, min_eval
 
 
 # ==========================================
@@ -835,12 +253,9 @@ CELL_HOVER = (246, 248, 252)
 
 P1_COLOR = (238, 92, 105)
 P2_COLOR = (82, 143, 219)
-
 WALL_COLOR = (82, 88, 98)
 WALL_SHADOW = (210, 214, 220)
-
 VALID_MOVE_DOT = (205, 211, 220)
-
 TEXT_COLOR = (78, 84, 94)
 MUTED_TEXT = (145, 151, 160)
 
@@ -849,1177 +264,243 @@ WALL_THICKNESS = 14
 BOARD_SIZE = 9
 PADDING = 25
 
-BOARD_PIXEL_SIZE = (
-    BOARD_SIZE * CELL_SIZE
-    + (BOARD_SIZE - 1) * WALL_THICKNESS
-    + (PADDING * 2)
-)
-
+BOARD_PIXEL_SIZE = (BOARD_SIZE * CELL_SIZE + (BOARD_SIZE - 1) * WALL_THICKNESS + (PADDING * 2))
 WIDTH = BOARD_PIXEL_SIZE
 HEIGHT = BOARD_PIXEL_SIZE + 120
 
-
 class Quoridor:
-
     def __init__(self):
         pygame.init()
+        self.screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.SRCALPHA)
+        pygame.display.set_caption("Quoridor - Engine")
+        
+        self.font = pygame.font.SysFont("sans-serif", 24, bold=True)
+        self.small_font = pygame.font.SysFont("sans-serif", 16, bold=True)
 
-        self.screen = pygame.display.set_mode(
-            (WIDTH, HEIGHT),
-            pygame.SRCALPHA
-        )
-
-        pygame.display.set_caption(
-            "Quoridor - Engine"
-        )
-
-        self.font = pygame.font.SysFont(
-            "sans-serif",
-            24,
-            bold=True
-        )
-
-        self.small_font = pygame.font.SysFont(
-            "sans-serif",
-            16,
-            bold=True
-        )
-
-        self.p1_pos = (4, 8)
-        self.p2_pos = (4, 0)
-
-        self.p1_walls = 10
-        self.p2_walls = 10
-
-        self.walls_h = set()
-        self.walls_v = set()
-
-        self.turn = 1
-
-        self.wall_orientation = 'H'
-
-        self.bot_debug = {
-            'phase': 'idle',
-            'checking': '',
-            'path': '',
-            'candidate_walls': [],
-            'selected_path': []
+        self.state = {
+            'p1_pos': (4, 8), 'p2_pos': (4, 0),
+            'p1_walls': 10, 'p2_walls': 10,
+            'walls_h': set(), 'walls_v': set(),
+            'turn': 1
         }
-
+        
+        self.wall_orientation = 'H'
         self.game_over = False
         self.winner = None
+        self.bot = QuoridorBot()
 
-        self.p1_draw_x, self.p1_draw_y = (
-            self._get_center_pixels(self.p1_pos)
-        )
-
-        self.p2_draw_x, self.p2_draw_y = (
-            self._get_center_pixels(self.p2_pos)
-        )
+        self.p1_draw_x, self.p1_draw_y = self._get_center_pixels(self.state['p1_pos'])
+        self.p2_draw_x, self.p2_draw_y = self._get_center_pixels(self.state['p2_pos'])
 
     def _get_center_pixels(self, pos):
-        offset_x = PADDING
-        offset_y = 85 + PADDING
-
-        x = (
-            offset_x
-            + pos[0] * (CELL_SIZE + WALL_THICKNESS)
-            + CELL_SIZE / 2
-        )
-
-        y = (
-            offset_y
-            + pos[1] * (CELL_SIZE + WALL_THICKNESS)
-            + CELL_SIZE / 2
-        )
-
+        offset_x, offset_y = PADDING, 85 + PADDING
+        x = offset_x + pos[0] * (CELL_SIZE + WALL_THICKNESS) + CELL_SIZE / 2
+        y = offset_y + pos[1] * (CELL_SIZE + WALL_THICKNESS) + CELL_SIZE / 2
         return x, y
 
-    def get_state(self):
-        return {
-            'p1_pos': self.p1_pos,
-            'p2_pos': self.p2_pos,
-            'p1_walls': self.p1_walls,
-            'p2_walls': self.p2_walls,
-            'walls_h': self.walls_h.copy(),
-            'walls_v': self.walls_v.copy(),
-            'turn': self.turn
-        }
-
-    # --------------------------------------------------
-    # Movement
-    # --------------------------------------------------
-
-    def get_adjacent(self, c, r):
-        moves = []
-
-        if (
-            r > 0
-            and (c, r - 1) not in self.walls_h
-            and (c - 1, r - 1) not in self.walls_h
-        ):
-            moves.append((c, r - 1))
-
-        if (
-            r < 8
-            and (c, r) not in self.walls_h
-            and (c - 1, r) not in self.walls_h
-        ):
-            moves.append((c, r + 1))
-
-        if (
-            c > 0
-            and (c - 1, r) not in self.walls_v
-            and (c - 1, r - 1) not in self.walls_v
-        ):
-            moves.append((c - 1, r))
-
-        if (
-            c < 8
-            and (c, r) not in self.walls_v
-            and (c, r - 1) not in self.walls_v
-        ):
-            moves.append((c + 1, r))
-
-        return moves
-
-    def get_valid_moves(self, pos):
-        c, r = pos
-
-        moves = self.get_adjacent(c, r)
-
-        other_pos = (
-            self.p2_pos
-            if self.turn == 1
-            else self.p1_pos
-        )
-
-        if other_pos in moves:
-
-            moves.remove(other_pos)
-
-            dc = other_pos[0] - c
-            dr = other_pos[1] - r
-
-            jump_pos = (
-                other_pos[0] + dc,
-                other_pos[1] + dr
-            )
-
-            if (
-                0 <= jump_pos[0] <= 8
-                and 0 <= jump_pos[1] <= 8
-            ):
-
-                jump_valid = False
-
-                if (
-                    dr == -1
-                    and (
-                        other_pos[0],
-                        other_pos[1] - 1
-                    ) not in self.walls_h
-                    and (
-                        other_pos[0] - 1,
-                        other_pos[1] - 1
-                    ) not in self.walls_h
-                ):
-                    jump_valid = True
-
-                if (
-                    dr == 1
-                    and (
-                        other_pos[0],
-                        other_pos[1]
-                    ) not in self.walls_h
-                    and (
-                        other_pos[0] - 1,
-                        other_pos[1]
-                    ) not in self.walls_h
-                ):
-                    jump_valid = True
-
-                if (
-                    dc == -1
-                    and (
-                        other_pos[0] - 1,
-                        other_pos[1]
-                    ) not in self.walls_v
-                    and (
-                        other_pos[0] - 1,
-                        other_pos[1] - 1
-                    ) not in self.walls_v
-                ):
-                    jump_valid = True
-
-                if (
-                    dc == 1
-                    and (
-                        other_pos[0],
-                        other_pos[1]
-                    ) not in self.walls_v
-                    and (
-                        other_pos[0],
-                        other_pos[1] - 1
-                    ) not in self.walls_v
-                ):
-                    jump_valid = True
-
-                if jump_valid:
-                    moves.append(jump_pos)
-
-        return moves
-
-    # --------------------------------------------------
-    # Path validation
-    # --------------------------------------------------
-
-    def has_path(self, start_pos, target_row):
-        queue = deque([start_pos])
-        visited = {start_pos}
-
-        while queue:
-
-            c, r = queue.popleft()
-
-            if r == target_row:
-                return True
-
-            for nc, nr in self.get_adjacent(c, r):
-
-                if (nc, nr) not in visited:
-
-                    visited.add((nc, nr))
-                    queue.append((nc, nr))
-
-        return False
-
-    # --------------------------------------------------
-    # Wall validation
-    # --------------------------------------------------
-
-    def is_valid_wall(self, c, r, orientation):
-
-        if (
-            c < 0
-            or c > 7
-            or r < 0
-            or r > 7
-        ):
-            return False
-
-        if orientation == 'H':
-
-            if (
-                (c, r) in self.walls_h
-                or (c - 1, r) in self.walls_h
-                or (c + 1, r) in self.walls_h
-            ):
-                return False
-
-            if (c, r) in self.walls_v:
-                return False
-
-        else:
-
-            if (
-                (c, r) in self.walls_v
-                or (c, r - 1) in self.walls_v
-                or (c, r + 1) in self.walls_v
-            ):
-                return False
-
-            if (c, r) in self.walls_h:
-                return False
-
-        if orientation == 'H':
-            self.walls_h.add((c, r))
-        else:
-            self.walls_v.add((c, r))
-
-        p1_safe = self.has_path(
-            self.p1_pos,
-            0
-        )
-
-        p2_safe = self.has_path(
-            self.p2_pos,
-            8
-        )
-
-        if orientation == 'H':
-            self.walls_h.remove((c, r))
-        else:
-            self.walls_v.remove((c, r))
-
-        return p1_safe and p2_safe
-
-    # --------------------------------------------------
-    # Drawing
-    # --------------------------------------------------
-
     def draw(self, mouse_pos):
-
         self.screen.fill(BG_COLOR)
 
-        # --------------------------------------------------
         # Header
-        # --------------------------------------------------
-
-        p1_txt = self.small_font.render(
-            f"Red  ·  {self.p1_walls}",
-            True,
-            TEXT_COLOR
-        )
-
-        p2_txt = self.small_font.render(
-            f"{self.p2_walls}  ·  Blue",
-            True,
-            TEXT_COLOR
-        )
-
-        self.screen.blit(
-            p1_txt,
-            (30, 35)
-        )
-
-        self.screen.blit(
-            p2_txt,
-            (
-                WIDTH
-                - p2_txt.get_width()
-                - 30,
-                35
-            )
-        )
+        p1_txt = self.small_font.render(f"Red  ·  {self.state['p1_walls']}", True, TEXT_COLOR)
+        p2_txt = self.small_font.render(f"{self.state['p2_walls']}  ·  Blue", True, TEXT_COLOR)
+        self.screen.blit(p1_txt, (30, 35))
+        self.screen.blit(p2_txt, (WIDTH - p2_txt.get_width() - 30, 35))
 
         if self.game_over:
-
             status_text = f"{self.winner} wins"
-
-            status_color = (
-                P1_COLOR
-                if self.winner == "Red"
-                else P2_COLOR
-            )
-
+            status_color = P1_COLOR if self.winner == "Red" else P2_COLOR
         else:
+            status_text = "Red's turn" if self.state['turn'] == 1 else "Blue's turn"
+            status_color = P1_COLOR if self.state['turn'] == 1 else P2_COLOR
 
-            status_text = (
-                "Red's turn"
-                if self.turn == 1
-                else "Blue's turn"
-            )
+        status_surf = self.small_font.render(status_text, True, status_color)
+        self.screen.blit(status_surf, status_surf.get_rect(center=(WIDTH // 2, 45)))
 
-            status_color = (
-                P1_COLOR
-                if self.turn == 1
-                else P2_COLOR
-            )
-
-        status_surf = self.small_font.render(
-            status_text,
-            True,
-            status_color
-        )
-
-        status_rect = status_surf.get_rect(
-            center=(WIDTH // 2, 45)
-        )
-
-        self.screen.blit(
-            status_surf,
-            status_rect
-        )
-
-        # --------------------------------------------------
         # Board background
-        # --------------------------------------------------
+        board_rect = pygame.Rect(12, 78, WIDTH - 24, WIDTH - 12)
+        pygame.draw.rect(self.screen, (224, 227, 232), board_rect.move(0, 4), border_radius=18)
+        pygame.draw.rect(self.screen, BOARD_BG, board_rect, border_radius=18)
 
-        board_rect = pygame.Rect(
-            12,
-            78,
-            WIDTH - 24,
-            WIDTH - 12
-        )
-
-        pygame.draw.rect(
-            self.screen,
-            (224, 227, 232),
-            board_rect.move(0, 4),
-            border_radius=18
-        )
-
-        pygame.draw.rect(
-            self.screen,
-            BOARD_BG,
-            board_rect,
-            border_radius=18
-        )
-
-        offset_x = PADDING
-        offset_y = 85 + PADDING
-
-        # --------------------------------------------------
-        # Valid moves
-        # --------------------------------------------------
+        offset_x, offset_y = PADDING, 85 + PADDING
 
         valid_moves = []
-
         if not self.game_over:
+            valid_moves = self.bot.get_valid_moves(self.state, self.state['turn'])
 
-            valid_moves = self.get_valid_moves(
-                self.p1_pos
-                if self.turn == 1
-                else self.p2_pos
-            )
-
-        # --------------------------------------------------
-        # Hover detection
-        # --------------------------------------------------
-
+        # Hover logic
         mx, my = mouse_pos
-
-        local_x = mx - offset_x
-        local_y = my - offset_y
-
+        local_x, local_y = mx - offset_x, my - offset_y
         unit = CELL_SIZE + WALL_THICKNESS
-
-        hover_type = 'none'
-        hover_c = -1
-        hover_r = -1
-
+        
+        hover_type, hover_c, hover_r = 'none', -1, -1
         active_orient = self.wall_orientation
 
-        board_content_size = (
-            BOARD_SIZE * CELL_SIZE
-            + (BOARD_SIZE - 1) * WALL_THICKNESS
-        )
-
-        if (
-            0 <= local_x <= board_content_size
-            and 0 <= local_y <= board_content_size
-            and not self.game_over
-        ):
-
-            c_idx = int(local_x // unit)
-            r_idx = int(local_y // unit)
-
-            rx = local_x % unit
-            ry = local_y % unit
+        board_size_px = BOARD_SIZE * CELL_SIZE + (BOARD_SIZE - 1) * WALL_THICKNESS
+        if 0 <= local_x <= board_size_px and 0 <= local_y <= board_size_px and not self.game_over:
+            c_idx, r_idx = int(local_x // unit), int(local_y // unit)
+            rx, ry = local_x % unit, local_y % unit
 
             if c_idx < 9 and r_idx < 9:
-
-                in_cell_x = rx < CELL_SIZE
-                in_cell_y = ry < CELL_SIZE
-
-                if in_cell_x and in_cell_y:
-
-                    hover_type = 'cell'
-                    hover_c = c_idx
-                    hover_r = r_idx
-
-                elif not in_cell_x and in_cell_y:
-
-                    if c_idx < 8:
-
-                        hover_type = 'wall'
-                        hover_c = c_idx
-                        hover_r = r_idx
-                        active_orient = 'V'
-
-                elif in_cell_x and not in_cell_y:
-
-                    if r_idx < 8:
-
-                        hover_type = 'wall'
-                        hover_c = c_idx
-                        hover_r = r_idx
-                        active_orient = 'H'
-
+                in_c, in_r = rx < CELL_SIZE, ry < CELL_SIZE
+                if in_c and in_r:
+                    hover_type, hover_c, hover_r = 'cell', c_idx, r_idx
+                elif not in_c and in_r and c_idx < 8:
+                    hover_type, hover_c, hover_r, active_orient = 'wall', c_idx, r_idx, 'V'
+                elif in_c and not in_r and r_idx < 8:
+                    hover_type, hover_c, hover_r, active_orient = 'wall', c_idx, r_idx, 'H'
                 else:
+                    hover_type, hover_c, hover_r = 'wall', min(c_idx, 7), min(r_idx, 7)
 
-                    hover_type = 'wall'
-                    hover_c = min(c_idx, 7)
-                    hover_r = min(r_idx, 7)
-                    active_orient = self.wall_orientation
-
-        # --------------------------------------------------
-        # Cells
-        # --------------------------------------------------
-
+        # Draw Cells
         for r in range(BOARD_SIZE):
-
             for c in range(BOARD_SIZE):
+                x = offset_x + c * unit
+                y = offset_y + r * unit
+                is_hovered = (hover_type == 'cell' and hover_c == c and hover_r == r)
+                
+                pygame.draw.rect(self.screen, CELL_HOVER if is_hovered else CELL_COLOR, 
+                                 pygame.Rect(x, y, CELL_SIZE, CELL_SIZE), border_radius=9)
+                
+                if (c, r) in valid_moves and self.state['turn'] == 1:
+                    pygame.draw.circle(self.screen, VALID_MOVE_DOT, (x + CELL_SIZE // 2, y + CELL_SIZE // 2), 7)
 
-                x = (
-                    offset_x
-                    + c * (CELL_SIZE + WALL_THICKNESS)
-                )
+        # Draw Walls
+        for (c, r) in self.state['walls_h']:
+            x, y = offset_x + c * unit, offset_y + r * unit + CELL_SIZE
+            rct = pygame.Rect(x, y, CELL_SIZE * 2 + WALL_THICKNESS, WALL_THICKNESS)
+            pygame.draw.rect(self.screen, WALL_SHADOW, rct.move(0, 2), border_radius=6)
+            pygame.draw.rect(self.screen, WALL_COLOR, rct, border_radius=6)
 
-                y = (
-                    offset_y
-                    + r * (CELL_SIZE + WALL_THICKNESS)
-                )
+        for (c, r) in self.state['walls_v']:
+            x, y = offset_x + c * unit + CELL_SIZE, offset_y + r * unit
+            rct = pygame.Rect(x, y, WALL_THICKNESS, CELL_SIZE * 2 + WALL_THICKNESS)
+            pygame.draw.rect(self.screen, WALL_SHADOW, rct.move(2, 0), border_radius=6)
+            pygame.draw.rect(self.screen, WALL_COLOR, rct, border_radius=6)
 
-                cell_rect = pygame.Rect(
-                    x,
-                    y,
-                    CELL_SIZE,
-                    CELL_SIZE
-                )
-
-                is_hovered = (
-                    hover_type == 'cell'
-                    and hover_c == c
-                    and hover_r == r
-                )
-
-                color = (
-                    CELL_HOVER
-                    if is_hovered
-                    else CELL_COLOR
-                )
-
-                pygame.draw.rect(
-                    self.screen,
-                    color,
-                    cell_rect,
-                    border_radius=9
-                )
-
-                if (c, r) in valid_moves:
-
-                    pygame.draw.circle(
-                        self.screen,
-                        VALID_MOVE_DOT,
-                        (
-                            x + CELL_SIZE // 2,
-                            y + CELL_SIZE // 2
-                        ),
-                        7
-                    )
-
-        # --------------------------------------------------
-        # Horizontal walls
-        # --------------------------------------------------
-
-        for (c, r) in self.walls_h:
-
-            x = (
-                offset_x
-                + c * (CELL_SIZE + WALL_THICKNESS)
-            )
-
-            y = (
-                offset_y
-                + r * (CELL_SIZE + WALL_THICKNESS)
-                + CELL_SIZE
-            )
-
-            wall_rect = pygame.Rect(
-                x,
-                y,
-                CELL_SIZE * 2 + WALL_THICKNESS,
-                WALL_THICKNESS
-            )
-
-            pygame.draw.rect(
-                self.screen,
-                WALL_SHADOW,
-                wall_rect.move(0, 2),
-                border_radius=6
-            )
-
-            pygame.draw.rect(
-                self.screen,
-                WALL_COLOR,
-                wall_rect,
-                border_radius=6
-            )
-
-        # --------------------------------------------------
-        # Vertical walls
-        # --------------------------------------------------
-
-        for (c, r) in self.walls_v:
-
-            x = (
-                offset_x
-                + c * (CELL_SIZE + WALL_THICKNESS)
-                + CELL_SIZE
-            )
-
-            y = (
-                offset_y
-                + r * (CELL_SIZE + WALL_THICKNESS)
-            )
-
-            wall_rect = pygame.Rect(
-                x,
-                y,
-                WALL_THICKNESS,
-                CELL_SIZE * 2 + WALL_THICKNESS
-            )
-
-            pygame.draw.rect(
-                self.screen,
-                WALL_SHADOW,
-                wall_rect.move(2, 0),
-                border_radius=6
-            )
-
-            pygame.draw.rect(
-                self.screen,
-                WALL_COLOR,
-                wall_rect,
-                border_radius=6
-            )
-
-        # --------------------------------------------------
-        # Wall preview
-        # --------------------------------------------------
-
-        if (
-            hover_type == 'wall'
-            and not self.game_over
-        ):
-
-            if self.is_valid_wall(
-                hover_c,
-                hover_r,
-                active_orient
-            ):
-
-                overlay = pygame.Surface(
-                    (WIDTH, HEIGHT),
-                    pygame.SRCALPHA
-                )
-
-                hx = (
-                    offset_x
-                    + hover_c * (CELL_SIZE + WALL_THICKNESS)
-                )
-
-                hy = (
-                    offset_y
-                    + hover_r * (CELL_SIZE + WALL_THICKNESS)
-                )
-
-                preview_color = (
-                    82,
-                    88,
-                    98,
-                    115
-                )
-
+        # Wall Preview
+        if hover_type == 'wall' and not self.game_over and self.state['turn'] == 1:
+            if self.bot.is_valid_wall(self.state, hover_c, hover_r, active_orient) and self.state['p1_walls'] > 0:
+                hx, hy = offset_x + hover_c * unit, offset_y + hover_r * unit
+                overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+                
                 if active_orient == 'H':
-
-                    pygame.draw.rect(
-                        overlay,
-                        preview_color,
-                        (
-                            hx,
-                            hy + CELL_SIZE,
-                            CELL_SIZE * 2
-                            + WALL_THICKNESS,
-                            WALL_THICKNESS
-                        ),
-                        border_radius=6
-                    )
-
+                    pygame.draw.rect(overlay, (82, 88, 98, 115), 
+                                     (hx, hy + CELL_SIZE, CELL_SIZE * 2 + WALL_THICKNESS, WALL_THICKNESS), border_radius=6)
                 else:
+                    pygame.draw.rect(overlay, (82, 88, 98, 115), 
+                                     (hx + CELL_SIZE, hy, WALL_THICKNESS, CELL_SIZE * 2 + WALL_THICKNESS), border_radius=6)
+                self.screen.blit(overlay, (0, 0))
 
-                    pygame.draw.rect(
-                        overlay,
-                        preview_color,
-                        (
-                            hx + CELL_SIZE,
-                            hy,
-                            WALL_THICKNESS,
-                            CELL_SIZE * 2
-                            + WALL_THICKNESS
-                        ),
-                        border_radius=6
-                    )
+        # Smooth Player Movement
+        t1_x, t1_y = self._get_center_pixels(self.state['p1_pos'])
+        t2_x, t2_y = self._get_center_pixels(self.state['p2_pos'])
 
-                self.screen.blit(
-                    overlay,
-                    (0, 0)
-                )
-
-        # --------------------------------------------------
-        # Bot reasoning overlay
-        # --------------------------------------------------
-
-        debug_path = set(self.bot_debug.get('selected_path', []))
-        debug_walls = self.bot_debug.get('candidate_walls', [])
-
-        for c, r in debug_path:
-            x = offset_x + c * (CELL_SIZE + WALL_THICKNESS)
-            y = offset_y + r * (CELL_SIZE + WALL_THICKNESS)
-            pygame.draw.rect(
-                self.screen,
-                (255, 224, 102, 85),
-                pygame.Rect(x + 5, y + 5, CELL_SIZE - 10, CELL_SIZE - 10),
-                border_radius=10
-            )
-
-        for c, r, orient in debug_walls:
-            hx = offset_x + c * (CELL_SIZE + WALL_THICKNESS)
-            hy = offset_y + r * (CELL_SIZE + WALL_THICKNESS)
-            if orient == 'H':
-                pygame.draw.rect(
-                    self.screen,
-                    (200, 220, 255, 115),
-                    (hx, hy + CELL_SIZE, CELL_SIZE * 2 + WALL_THICKNESS, WALL_THICKNESS),
-                    border_radius=6
-                )
-            else:
-                pygame.draw.rect(
-                    self.screen,
-                    (200, 220, 255, 115),
-                    (hx + CELL_SIZE, hy, WALL_THICKNESS, CELL_SIZE * 2 + WALL_THICKNESS),
-                    border_radius=6
-                )
-
-        if self.turn == 2 and self.bot_debug:
-            phase = self.bot_debug.get('phase', 'thinking')
-            checking = self.bot_debug.get('checking', '')
-            path = self.bot_debug.get('path', '')
-
-            lines = [
-                f"Bot: {phase[:42]}",
-                f"Checking: {checking[:42]}",
-                f"Path: {path[:42]}"
-            ]
-
-            for i, text in enumerate(lines):
-                surf = self.small_font.render(text, True, TEXT_COLOR)
-                self.screen.blit(
-                    surf,
-                    (30, 85 + i * 18)
-                )
-
-        # --------------------------------------------------
-        # Smooth player positions
-        # --------------------------------------------------
-
-        t1_x, t1_y = self._get_center_pixels(
-            self.p1_pos
-        )
-
-        t2_x, t2_y = self._get_center_pixels(
-            self.p2_pos
-        )
-
-        self.p1_draw_x += (
-            t1_x - self.p1_draw_x
-        ) * 0.3
-
-        self.p1_draw_y += (
-            t1_y - self.p1_draw_y
-        ) * 0.3
-
-        self.p2_draw_x += (
-            t2_x - self.p2_draw_x
-        ) * 0.3
-
-        self.p2_draw_y += (
-            t2_y - self.p2_draw_y
-        ) * 0.3
+        self.p1_draw_x += (t1_x - self.p1_draw_x) * 0.3
+        self.p1_draw_y += (t1_y - self.p1_draw_y) * 0.3
+        self.p2_draw_x += (t2_x - self.p2_draw_x) * 0.3
+        self.p2_draw_y += (t2_y - self.p2_draw_y) * 0.3
 
         radius = CELL_SIZE // 2 - 7
+        pygame.draw.circle(self.screen, (218, 221, 226), (int(self.p1_draw_x), int(self.p1_draw_y + 3)), radius)
+        pygame.draw.circle(self.screen, P1_COLOR, (int(self.p1_draw_x), int(self.p1_draw_y)), radius)
+        
+        pygame.draw.circle(self.screen, (218, 221, 226), (int(self.p2_draw_x), int(self.p2_draw_y + 3)), radius)
+        pygame.draw.circle(self.screen, P2_COLOR, (int(self.p2_draw_x), int(self.p2_draw_y)), radius)
 
-        # Red shadow
-        pygame.draw.circle(
-            self.screen,
-            (218, 221, 226),
-            (
-                int(self.p1_draw_x),
-                int(self.p1_draw_y + 3)
-            ),
-            radius
-        )
-
-        # Red
-        pygame.draw.circle(
-            self.screen,
-            P1_COLOR,
-            (
-                int(self.p1_draw_x),
-                int(self.p1_draw_y)
-            ),
-            radius
-        )
-
-        # Blue shadow
-        pygame.draw.circle(
-            self.screen,
-            (218, 221, 226),
-            (
-                int(self.p2_draw_x),
-                int(self.p2_draw_y + 3)
-            ),
-            radius
-        )
-
-        # Blue
-        pygame.draw.circle(
-            self.screen,
-            P2_COLOR,
-            (
-                int(self.p2_draw_x),
-                int(self.p2_draw_y)
-            ),
-            radius
-        )
-
-        # --------------------------------------------------
         # Footer
-        # --------------------------------------------------
-
         controls_txt = self.small_font.render(
-            (
-                f"{'Horizontal' if self.wall_orientation == 'H' else 'Vertical'}"
-                " wall  ·  Right click / R / Space"
-            ),
-            True,
-            MUTED_TEXT
-        )
-
-        self.screen.blit(
-            controls_txt,
-            (
-                WIDTH // 2
-                - controls_txt.get_width() // 2,
-                HEIGHT - 32
-            )
-        )
+            f"{'Horizontal' if self.wall_orientation == 'H' else 'Vertical'} wall  ·  Right click / R / Space", True, MUTED_TEXT)
+        self.screen.blit(controls_txt, (WIDTH // 2 - controls_txt.get_width() // 2, HEIGHT - 32))
 
         pygame.display.flip()
-
-        return (
-            hover_type,
-            hover_c,
-            hover_r,
-            active_orient
-        )
-
-    # --------------------------------------------------
-    # Win condition
-    # --------------------------------------------------
+        return hover_type, hover_c, hover_r, active_orient
 
     def check_win(self):
-
-        if self.p1_pos[1] == 0:
-
+        if self.state['p1_pos'][1] == 0:
             self.game_over = True
             self.winner = "Red"
-
-        elif self.p2_pos[1] == 8:
-
+        elif self.state['p2_pos'][1] == 8:
             self.game_over = True
             self.winner = "Blue"
 
-    # --------------------------------------------------
-    # Main game loop
-    # --------------------------------------------------
-
     def play(self):
-
         clock = pygame.time.Clock()
-
         running = True
-
-        # --------------------------------------------------
-        # Background bot state
-        # --------------------------------------------------
-
         bot_thinking = False
         bot_result = None
 
-        def think_bot(state):
-
-            nonlocal bot_result
-            nonlocal bot_thinking
-
-            self.bot_debug = {
-                'phase': 'thinking',
-                'checking': 'opening search',
-                'path': 'calculating routes',
-                'candidate_walls': [],
-                'selected_path': []
-            }
-
-            result = get_bot_move(
-                state,
-                2,
-                self.bot_debug
-            )
-
-            bot_result = result
+        def think_bot(current_state):
+            nonlocal bot_result, bot_thinking
+            bot_result = self.bot.get_move(current_state)
             bot_thinking = False
-            self.bot_debug = {
-                'phase': 'done',
-                'checking': 'ready',
-                'path': self.bot_debug.get('path', ''),
-                'candidate_walls': self.bot_debug.get('candidate_walls', []),
-                'selected_path': self.bot_debug.get('selected_path', [])
-            }
 
         while running:
-
             mouse_pos = pygame.mouse.get_pos()
-
-            (
-                hover_type,
-                hover_c,
-                hover_r,
-                active_orient
-            ) = self.draw(mouse_pos)
-
-            # --------------------------------------------------
-            # Events
-            # --------------------------------------------------
+            hover_type, hover_c, hover_r, active_orient = self.draw(mouse_pos)
 
             for event in pygame.event.get():
-
                 if event.type == pygame.QUIT:
-
                     running = False
                     continue
 
-                # --------------------------------------------------
-                # Keyboard
-                # --------------------------------------------------
+                if not self.game_over and not bot_thinking and self.state['turn'] == 1:
+                    if event.type == pygame.KEYDOWN and event.key in (pygame.K_r, pygame.K_SPACE):
+                        self.wall_orientation = 'V' if self.wall_orientation == 'H' else 'H'
 
-                if (
-                    not self.game_over
-                    and not bot_thinking
-                    and self.turn == 1
-                    and event.type == pygame.KEYDOWN
-                ):
+                    elif event.type == pygame.MOUSEBUTTONDOWN:
+                        if event.button == 3:
+                            self.wall_orientation = 'V' if self.wall_orientation == 'H' else 'H'
+                        elif event.button == 1:
+                            if hover_type == 'cell':
+                                if (hover_c, hover_r) in self.bot.get_valid_moves(self.state, 1):
+                                    self.state['p1_pos'] = (hover_c, hover_r)
+                                    self.state['turn'] = 2
+                                    self.check_win()
+                                    self.draw(pygame.mouse.get_pos())
+                                    
+                            elif hover_type == 'wall':
+                                if self.state['p1_walls'] > 0 and self.bot.is_valid_wall(self.state, hover_c, hover_r, active_orient):
+                                    if active_orient == 'H': self.state['walls_h'].add((hover_c, hover_r))
+                                    else: self.state['walls_v'].add((hover_c, hover_r))
+                                    self.state['p1_walls'] -= 1
+                                    self.state['turn'] = 2
+                                    self.draw(pygame.mouse.get_pos())
 
-                    if event.key in (
-                        pygame.K_r,
-                        pygame.K_SPACE
-                    ):
-
-                        self.wall_orientation = (
-                            'V'
-                            if self.wall_orientation == 'H'
-                            else 'H'
-                        )
-
-                # --------------------------------------------------
-                # Mouse
-                # --------------------------------------------------
-
-                if (
-                    not self.game_over
-                    and not bot_thinking
-                    and self.turn == 1
-                    and event.type == pygame.MOUSEBUTTONDOWN
-                ):
-
-                    # ------------------------------------------
-                    # Right click: toggle wall orientation
-                    # ------------------------------------------
-
-                    if event.button == 3:
-
-                        self.wall_orientation = (
-                            'V'
-                            if self.wall_orientation == 'H'
-                            else 'H'
-                        )
-
-                    # ------------------------------------------
-                    # Left click
-                    # ------------------------------------------
-
-                    elif event.button == 1:
-
-                        # --------------------------------------
-                        # Movement
-                        # --------------------------------------
-
-                        if hover_type == 'cell':
-
-                            valid_moves = self.get_valid_moves(
-                                self.p1_pos
-                            )
-
-                            if (
-                                hover_c,
-                                hover_r
-                            ) in valid_moves:
-
-                                self.p1_pos = (
-                                    hover_c,
-                                    hover_r
-                                )
-
-                                self.turn = 2
-
-                                self.check_win()
-
-                                # Immediately render player move.
-                                self.draw(
-                                    pygame.mouse.get_pos()
-                                )
-
-                        # --------------------------------------
-                        # Wall
-                        # --------------------------------------
-
-                        elif hover_type == 'wall':
-
-                            if (
-                                self.p1_walls > 0
-                                and self.is_valid_wall(
-                                    hover_c,
-                                    hover_r,
-                                    active_orient
-                                )
-                            ):
-
-                                if active_orient == 'H':
-
-                                    self.walls_h.add(
-                                        (
-                                            hover_c,
-                                            hover_r
-                                        )
-                                    )
-
-                                else:
-
-                                    self.walls_v.add(
-                                        (
-                                            hover_c,
-                                            hover_r
-                                        )
-                                    )
-
-                                self.p1_walls -= 1
-
-                                self.turn = 2
-
-                                # Immediately render wall.
-                                self.draw(
-                                    pygame.mouse.get_pos()
-                                )
-
-            # --------------------------------------------------
-            # Start bot thinking
-            # --------------------------------------------------
-
-            if (
-                not self.game_over
-                and self.turn == 2
-                and not bot_thinking
-                and bot_result is None
-            ):
-
+            # Bot Turn
+            if not self.game_over and self.state['turn'] == 2 and not bot_thinking and bot_result is None:
                 bot_thinking = True
+                
+                # Make a clean copy of the state for the bot thread
+                bot_state = {
+                    'p1_pos': self.state['p1_pos'], 'p2_pos': self.state['p2_pos'],
+                    'p1_walls': self.state['p1_walls'], 'p2_walls': self.state['p2_walls'],
+                    'walls_h': self.state['walls_h'].copy(), 'walls_v': self.state['walls_v'].copy(),
+                    'turn': 2
+                }
+                threading.Thread(target=think_bot, args=(bot_state,), daemon=True).start()
 
-                # Complete independent copy.
-                bot_state = self.get_state()
-
-                bot_thread = threading.Thread(
-                    target=think_bot,
-                    args=(bot_state,),
-                    daemon=True
-                )
-
-                bot_thread.start()
-
-            # --------------------------------------------------
-            # Bot has finished thinking
-            # --------------------------------------------------
-
-            if (
-                self.turn == 2
-                and not bot_thinking
-                and bot_result is not None
-                and not self.game_over
-            ):
-
+            # Apply Bot Result
+            if self.state['turn'] == 2 and not bot_thinking and bot_result is not None and not self.game_over:
                 action, data = bot_result
-
                 bot_result = None
-
-                # ------------------------------------------
-                # Bot movement
-                # ------------------------------------------
-
+                
                 if action == 'move':
-
-                    valid_moves = self.get_valid_moves(
-                        self.p2_pos
-                    )
-
-                    if data in valid_moves:
-
-                        self.p2_pos = data
-
-                        self.turn = 1
-
-                        self.check_win()
-
-                # ------------------------------------------
-                # Bot wall
-                # ------------------------------------------
-
+                    self.state['p2_pos'] = data
                 elif action == 'wall':
-
                     c, r, orient = data
-
-                    if (
-                        self.p2_walls > 0
-                        and self.is_valid_wall(
-                            c,
-                            r,
-                            orient
-                        )
-                    ):
-
-                        if orient == 'H':
-
-                            self.walls_h.add(
-                                (c, r)
-                            )
-
-                        else:
-
-                            self.walls_v.add(
-                                (c, r)
-                            )
-
-                        self.p2_walls -= 1
-
-                        self.turn = 1
-
-                # Render bot move immediately.
-                self.draw(
-                    pygame.mouse.get_pos()
-                )
-
-            # --------------------------------------------------
-            # Keep rendering at 60 FPS while bot thinks.
-            # --------------------------------------------------
+                    if orient == 'H': self.state['walls_h'].add((c, r))
+                    else: self.state['walls_v'].add((c, r))
+                    self.state['p2_walls'] -= 1
+                    
+                self.state['turn'] = 1
+                self.check_win()
+                self.draw(pygame.mouse.get_pos())
 
             clock.tick(60)
 
         pygame.quit()
         sys.exit()
-
-
-# ==========================================
-# 🚀 START GAME
-# ==========================================
 
 if __name__ == "__main__":
     game = Quoridor()
