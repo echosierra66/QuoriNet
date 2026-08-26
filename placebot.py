@@ -113,20 +113,30 @@ def get_state_key(state):
     return (state['p1_pos'], state['p2_pos'], tuple(sorted(state['walls_h'])), tuple(sorted(state['walls_v'])))
 
 class QuoridorBot:
+    # How many of a player's own most-recent squares to remember, purely to
+    # discourage short A<->B (or small-loop) oscillation when two paths are
+    # otherwise perfectly tied. This is a soft nudge (see _oscillation_penalty),
+    # not a hard rule, so a truly forced backtrack is still allowed.
+    RECENT_MEMORY_LEN = 8
+    OSCILLATION_PENALTY = 45.0
+
     def __init__(self, bot_id=2, max_depth=3, nn_model=None, heuristic_weight=1.0):
         self.bot_id = bot_id
         self.max_depth = max_depth
         self.nn_model = nn_model
         self.heuristic_weight = heuristic_weight
+        self.was_last_random = False
         
     def get_move_and_eval(self, state, epsilon=0.0):
         if epsilon > 0.0 and random.random() < epsilon:
             raw_actions = self.generate_actions(state, self.bot_id)
             if raw_actions:
                 chosen_action = random.choice(raw_actions)
-                next_state = self.apply_action(state, self.bot_id, chosen_action)
+                next_state = self.apply_action(state, self.bot_id, chosen_action, is_random=True)
+                self.was_last_random = True
                 return chosen_action, self.evaluate(next_state, self.bot_id)
 
+        self.was_last_random = False
         best_move, max_eval = self.minimax(state, self.max_depth, float('-inf'), float('inf'), True)
         if best_move is None:
             raw_actions = self.generate_actions(state, self.bot_id)
@@ -292,11 +302,36 @@ class QuoridorBot:
         scored_actions.sort(key=lambda x: x[0], reverse=True)
         return [act for _, act in scored_actions[:top_k]]
 
+    def _oscillation_penalty(self, state, pid):
+        """Soft penalty for landing on a square this player occupied recently.
+
+        Two genuinely equal-length paths (e.g. a fork around a wall) produce
+        an *exact* tie in evaluate()'s distance/progress terms, so without a
+        tiebreaker the bot can happily bounce between them forever -- the
+        joint-state 'is_repeated' check almost never catches this because the
+        opponent is also moving, so the full board rarely repeats exactly.
+        Weighting by recency means a single necessary backtrack barely costs
+        anything, while repeatedly ping-ponging over the same square or two
+        gets progressively more expensive and reliably breaks the tie.
+        """
+        my_pos = state['p1_pos'] if pid == 1 else state['p2_pos']
+        recent = state.get('p1_recent', ()) if pid == 1 else state.get('p2_recent', ())
+        if not recent:
+            return 0.0
+        penalty = 0.0
+        n = len(recent)
+        for i, pos in enumerate(recent):
+            if pos == my_pos:
+                recency_weight = (i + 1) / n  # most recent entries weigh close to 1.0
+                penalty += self.OSCILLATION_PENALTY * recency_weight
+        return penalty
+
     def evaluate(self, state, eval_pid):
         if state['p1_pos'][1] == 0: return 10000 if eval_pid == 1 else -10000
         if state['p2_pos'][1] == 8: return -10000 if eval_pid == 1 else 10000
         
         is_repeated = get_state_key(state) in state.get('history', set())
+        osc_penalty = self._oscillation_penalty(state, eval_pid)
 
         p1_path = self.get_shortest_path(state, 1)
         p2_path = self.get_shortest_path(state, 2)
@@ -311,6 +346,7 @@ class QuoridorBot:
             score = (d2 - d1) * 50.0 + (p1_progress - p2_progress) * 10.0
             if eval_pid == 2: score = -score
             if is_repeated: score -= 8000
+            score -= osc_penalty
             return score
 
         if self.nn_model is not None:
@@ -323,6 +359,7 @@ class QuoridorBot:
             
             score = nn_score + heur_score
             if is_repeated: score -= 8000
+            score -= osc_penalty
             return score
 
         if eval_pid == 1:
@@ -331,28 +368,49 @@ class QuoridorBot:
             score = (d1 - d2) * 25.0 + (p2_progress - p1_progress) * 5.0
 
         if is_repeated: score -= 8000
+        score -= osc_penalty
         return score
 
-    def apply_action(self, state, pid, action):
+    def apply_action(self, state, pid, action, is_random=False):
         new_state = {
             'p1_pos': state['p1_pos'], 'p2_pos': state['p2_pos'],
             'p1_walls': state['p1_walls'], 'p2_walls': state['p2_walls'],
             'walls_h': state['walls_h'].copy(), 'walls_v': state['walls_v'].copy(),
             'turn': self.get_opponent(pid),
             'turns_played': state.get('turns_played', 0) + 1,
-            'history': state.get('history', set()).copy()
+            'history': state.get('history', set()).copy(),
+            'p1_recent': state.get('p1_recent', ()),
+            'p2_recent': state.get('p2_recent', ()),
+            'random_walls': state.get('random_walls', set()).copy(),
+            'p1_last_random': state.get('p1_last_random', False),
+            'p2_last_random': state.get('p2_last_random', False)
         }
         new_state['history'].add(get_state_key(state))
 
         if action[0] == 'move':
-            if pid == 1: new_state['p1_pos'] = action[1]
-            else: new_state['p2_pos'] = action[1]
+            old_pos = state['p1_pos'] if pid == 1 else state['p2_pos']
+            new_pos = action[1]
+            if pid == 1:
+                new_state['p1_pos'] = new_pos
+                new_state['p1_recent'] = (state.get('p1_recent', ()) + (old_pos,))[-self.RECENT_MEMORY_LEN:]
+                new_state['p1_last_random'] = is_random
+            else:
+                new_state['p2_pos'] = new_pos
+                new_state['p2_recent'] = (state.get('p2_recent', ()) + (old_pos,))[-self.RECENT_MEMORY_LEN:]
+                new_state['p2_last_random'] = is_random
         else:
             c, r, orient = action[1]
             if orient == 'H': new_state['walls_h'].add((c, r))
             else: new_state['walls_v'].add((c, r))
-            if pid == 1: new_state['p1_walls'] -= 1
-            else: new_state['p2_walls'] -= 1
+            if pid == 1:
+                new_state['p1_walls'] -= 1
+                new_state['p1_last_random'] = False
+            else:
+                new_state['p2_walls'] -= 1
+                new_state['p2_last_random'] = False
+
+            if is_random:
+                new_state['random_walls'].add((c, r, orient))
 
         return new_state
 
@@ -410,6 +468,7 @@ P1_COLOR, P2_COLOR = (238, 92, 105), (82, 143, 219)
 WALL_COLOR, WALL_SHADOW = (82, 88, 98), (210, 214, 220)
 VALID_MOVE_DOT = (205, 211, 220)
 TEXT_COLOR, MUTED_TEXT = (78, 84, 94), (145, 151, 160)
+ORANGE_COLOR = (255, 140, 0)
 
 CELL_SIZE = int(55 * SCALE)
 WALL_THICKNESS = int(14 * SCALE)
@@ -468,7 +527,7 @@ class Quoridor:
         self.teacher_net = SpatialQuoriNetV2(in_channels=8)
         self.student_net.eval()
         self.teacher_net.eval()
-        self.optimizer = optim.Adam(self.student_net.parameters(), lr=0.005)
+        self.optimizer = optim.Adam(self.student_net.parameters(), lr=0.0001)
         self.loss_fn = nn.MSELoss()
         
         self.games_played = 0
@@ -640,7 +699,9 @@ class Quoridor:
             'p1_pos': (4, 8), 'p2_pos': (4, 0),
             'p1_walls': 10, 'p2_walls': 10,
             'walls_h': set(), 'walls_v': set(),
-            'turn': 1, 'turns_played': 0, 'history': set()
+            'turn': 1, 'turns_played': 0, 'history': set(),
+            'p1_recent': (), 'p2_recent': (),
+            'random_walls': set(), 'p1_last_random': False, 'p2_last_random': False
         }
         self.wall_orientation = 'H'
         self.game_over = False
@@ -734,7 +795,9 @@ class Quoridor:
             'p1_pos': (4, 8), 'p2_pos': (4, 0),
             'p1_walls': 10, 'p2_walls': 10,
             'walls_h': set(), 'walls_v': set(),
-            'turn': 1, 'turns_played': 0, 'history': set()
+            'turn': 1, 'turns_played': 0, 'history': set(),
+            'p1_recent': (), 'p2_recent': (),
+            'random_walls': set(), 'p1_last_random': False, 'p2_last_random': False
         }
         self.eval_game_curr, self.eval_game_total, self.eval_vs_gen = game_curr, game_total, vs_gen
         saved_state = self.state
@@ -761,7 +824,7 @@ class Quoridor:
                 if not action:
                     result = 2 if pid == 1 else 1
                     break
-                eval_state = active_bot.apply_action(eval_state, pid, action)
+                eval_state = active_bot.apply_action(eval_state, pid, action, is_random=getattr(active_bot, 'was_last_random', False))
                 self.state = eval_state
         finally:
             self.state = saved_state
@@ -1117,13 +1180,15 @@ class Quoridor:
             x, y = offset_x + c * unit, offset_y + r * unit + CELL_SIZE
             rct = pygame.Rect(x, y, CELL_SIZE * 2 + WALL_THICKNESS, WALL_THICKNESS)
             pygame.draw.rect(self.virtual_screen, WALL_SHADOW, rct.move(0, int(2 * SCALE)), border_radius=int(6 * SCALE))
-            pygame.draw.rect(self.virtual_screen, WALL_COLOR, rct, border_radius=int(6 * SCALE))
+            wall_col = ORANGE_COLOR if (c, r, 'H') in self.state.get('random_walls', set()) else WALL_COLOR
+            pygame.draw.rect(self.virtual_screen, wall_col, rct, border_radius=int(6 * SCALE))
 
         for (c, r) in self.state['walls_v']:
             x, y = offset_x + c * unit + CELL_SIZE, offset_y + r * unit
             rct = pygame.Rect(x, y, WALL_THICKNESS, CELL_SIZE * 2 + WALL_THICKNESS)
             pygame.draw.rect(self.virtual_screen, WALL_SHADOW, rct.move(int(2 * SCALE), 0), border_radius=int(6 * SCALE))
-            pygame.draw.rect(self.virtual_screen, WALL_COLOR, rct, border_radius=int(6 * SCALE))
+            wall_col = ORANGE_COLOR if (c, r, 'V') in self.state.get('random_walls', set()) else WALL_COLOR
+            pygame.draw.rect(self.virtual_screen, wall_col, rct, border_radius=int(6 * SCALE))
 
         if hover_type == 'wall' and not self.game_over and self.mode == "PLAY" and self.state['turn'] == 1:
             if self.bot2.is_valid_wall(self.state, hover_c, hover_r, active_orient) and self.state['p1_walls'] > 0:
@@ -1144,9 +1209,11 @@ class Quoridor:
 
         radius = CELL_SIZE // 2 - int(7 * SCALE)
         pygame.draw.circle(self.virtual_screen, (218, 221, 226), (int(self.p1_draw_x), int(self.p1_draw_y + int(3 * SCALE))), radius)
-        pygame.draw.circle(self.virtual_screen, P1_COLOR, (int(self.p1_draw_x), int(self.p1_draw_y)), radius)
+        p1_color = ORANGE_COLOR if self.state.get('p1_last_random') else P1_COLOR
+        pygame.draw.circle(self.virtual_screen, p1_color, (int(self.p1_draw_x), int(self.p1_draw_y)), radius)
         pygame.draw.circle(self.virtual_screen, (218, 221, 226), (int(self.p2_draw_x), int(self.p2_draw_y + int(3 * SCALE))), radius)
-        pygame.draw.circle(self.virtual_screen, P2_COLOR, (int(self.p2_draw_x), int(self.p2_draw_y)), radius)
+        p2_color = ORANGE_COLOR if self.state.get('p2_last_random') else P2_COLOR
+        pygame.draw.circle(self.virtual_screen, p2_color, (int(self.p2_draw_x), int(self.p2_draw_y)), radius)
 
         btn_y = HEIGHT - int(46 * SCALE)
         btn_h, btn_w = int(34 * SCALE), int(110 * SCALE)
@@ -1285,10 +1352,10 @@ class Quoridor:
             
             # Resolution logic: Disable epsilon entirely for Teacher, enable for Student
             is_teacher = (active_bot.nn_model != self.student_net)
-            eps = 0.0 if is_teacher else (0.15 * (0.95 ** self.state['turns_played']))
+            eps = 0.0 if is_teacher else (0.30 * (0.85 ** self.state['turns_played']))
             
             action, _ = active_bot.get_move_and_eval(self.state, epsilon=eps)
-            if action: self.state = active_bot.apply_action(self.state, pre_action_pid, action)
+            if action: self.state = active_bot.apply_action(self.state, pre_action_pid, action, is_random=getattr(active_bot, 'was_last_random', False))
             else: self.state['turns_played'] = 200
                 
             self.check_win()
@@ -1375,7 +1442,7 @@ class Quoridor:
                     eps = 0.0 if is_teacher else (0.15 * (0.95 ** self.state['turns_played']))
                     
                     action, _ = active_bot.get_move_and_eval(self.state, epsilon=eps)
-                    if action: self.state = active_bot.apply_action(self.state, pre_action_pid, action)
+                    if action: self.state = active_bot.apply_action(self.state, pre_action_pid, action, is_random=getattr(active_bot, 'was_last_random', False))
                     else: self.state['turns_played'] = 200
 
                     self.check_win()
@@ -1391,12 +1458,13 @@ class Quoridor:
                         'p1_pos': self.state['p1_pos'], 'p2_pos': self.state['p2_pos'],
                         'p1_walls': self.state['p1_walls'], 'p2_walls': self.state['p2_walls'],
                         'walls_h': self.state['walls_h'].copy(), 'walls_v': self.state['walls_v'].copy(),
-                        'turn': 2, 'turns_played': self.state['turns_played'], 'history': self.state['history'].copy()
+                        'turn': 2, 'turns_played': self.state['turns_played'], 'history': self.state['history'].copy(),
+                        'p1_recent': self.state.get('p1_recent', ()), 'p2_recent': self.state.get('p2_recent', ())
                     }
                     threading.Thread(target=think_bot, args=(bot_state,), daemon=True).start()
                 
                 if not bot_thinking and bot_result is not None:
-                    self.state = self.bot2.apply_action(self.state, 2, bot_result)
+                    self.state = self.bot2.apply_action(self.state, 2, bot_result, is_random=getattr(self.bot2, 'was_last_random', False))
                     bot_result = None
                     self.check_win()
 
