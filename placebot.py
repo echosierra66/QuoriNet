@@ -503,6 +503,8 @@ class Quoridor:
 
         # Constants from Section 1
         self.RECENT_WINDOW_SIZE = 5
+        # These two masses now divide only the non-latest support pool. The
+        # latest teacher receives its own adaptive majority share below.
         self.RECENT_BUCKET_MASS = 0.60
         self.HISTORIC_BUCKET_MASS = 0.40
         self.RECENT_DECAY_RATIO = 2.0
@@ -517,10 +519,41 @@ class Quoridor:
         self.ESCALATION_MAX_MULTIPLIER = 8.0
         self.ESCALATION_STALL_LIMIT = 5
         self.ESCALATION_MAX_SHARE_OF_HISTORIC_BUCKET = 0.15
-        self.LR_MIN_FLOOR = 0.0005
-        self.LR_TRIGGER_PLATEAU_CYCLES = 5
-        self.LR_TRIGGER_EPS = 0.01
-        self.LR_TRIGGER_COOLDOWN_CYCLES = 3
+
+        # Latest-teacher curriculum. The latest teacher is always the majority
+        # opponent; its share rises smoothly as the student becomes competitive.
+        self.LATEST_TEACHER_LOG_WINDOW = 60
+        self.CURRICULUM_LATEST_BASE_SHARE = 0.60
+        self.CURRICULUM_LATEST_MIN_SHARE = 0.55
+        self.CURRICULUM_LATEST_MAX_SHARE = 0.90
+
+        # Replay is split so old easy generations can never swamp the current
+        # target. Latest-teacher data gets a majority of every train batch once
+        # enough of it exists.
+        self.REPLAY_LATEST_CAPACITY = 140000
+        self.REPLAY_HISTORIC_CAPACITY = 60000
+        self.REPLAY_LATEST_MIN_SHARE = 0.70
+        self.REPLAY_WARMUP = 256
+        self.REPLAY_BATCH_SIZE = 128
+
+        # Sparse terminal reward is propagated through latest-teacher games and
+        # blended with the stable teacher bootstrap already used by this model.
+        self.OUTCOME_BACKFILL_MIX = 0.70
+        self.OUTCOME_BACKFILL_DISCOUNT = 0.995
+
+        # AutoML-style metric controller. Unlike the old scheduler, these bounds
+        # are valid around the existing 1e-4 starting LR and can move both up
+        # (escape a plateau) and down (converge/stabilize).
+        self.LR_MIN = 0.00001
+        self.LR_MAX = 0.0008
+        self.LR_TUNE_INTERVAL_LATEST_GAMES = 15
+        self.LR_MIN_SAMPLES = 15
+        self.LR_PLATEAU_EPS = 0.015
+        self.LR_REGRESSION_EPS = 0.03
+        self.LR_UP_FACTOR = 1.25
+        self.LR_DOWN_FACTOR = 0.80
+        self.LR_CONVERGE_FACTOR = 0.85
+        self.GRAD_CLIP_NORM = 1.0
 
         # State vars
         self.student_net = SpatialQuoriNetV2(in_channels=8)
@@ -529,31 +562,48 @@ class Quoridor:
         self.teacher_net.eval()
         self.optimizer = optim.Adam(self.student_net.parameters(), lr=0.0001)
         self.loss_fn = nn.MSELoss()
-        
+
         self.games_played = 0
         self.teacher_gen = 1
         self.heuristic_weight = 1.0
-        
-        self.student_eval_history = deque(maxlen=100) 
+
+        # Kept for backward-compatible metadata/UI. Promotion no longer uses
+        # this mixed-opponent history.
+        self.student_eval_history = deque(maxlen=100)
+        self.latest_teacher_history = deque(maxlen=self.LATEST_TEACHER_LOG_WINDOW)
         self.student_win_rate_str = "Pending Eval"
         self.student_id = 2
-        
+
         self.p1_gen_str = "Gen #1"
         self.p2_gen_str = "Gen #1"
 
-        self.replay_buffer = deque(maxlen=200000) 
+        self.latest_replay_buffer = deque(maxlen=self.REPLAY_LATEST_CAPACITY)
+        self.historic_replay_buffer = deque(maxlen=self.REPLAY_HISTORIC_CAPACITY)
+        self.episode_trajectory = []
         self.last_loss = 0.0
-        
+
         self.match_history = deque(maxlen=6)
         self.opponent_pool = []
         self.opponent_weights = []
+        self.opponent_support_base_weights = []
 
         # New State from Section 2
-        self.checkpoint_log = {}       
-        self.escalation_state = {}     
-        self.wawr_history = []         
-        self.lr_last_reduced_at_gen = 0
+        self.checkpoint_log = {}
+        self.escalation_state = {}
+        self.wawr_history = []
+        self.lr_last_reduced_at_gen = 0  # legacy metadata compatibility
         self.current_opponent_gen = 1
+        self.current_opponent_is_latest = True
+        self.curriculum_latest_credit = 1.0
+
+        # Latest-teacher LR search state. Reset whenever a new teacher becomes
+        # the target so metrics from different difficulty levels never mix.
+        self.latest_teacher_games_seen = 0
+        self.lr_metric_history = deque(maxlen=12)
+        self.lr_last_tuned_at_latest_game = 0
+        self.lr_best_metric = -1.0
+        self.lr_best_value = self.optimizer.param_groups[0]['lr']
+        self.lr_search_direction = 0
 
         self.is_evaluating = False
         self.eval_vs_gen = 0
@@ -577,37 +627,350 @@ class Quoridor:
     # ==========================================
     def update_opponent_pool(self):
         self.opponent_pool = []
-        self.opponent_weights = []
+        self.opponent_support_base_weights = []
+
+        # Latest teacher is explicit and always present. Its actual probability
+        # is computed dynamically from latest-teacher competence.
+        self.opponent_pool.append((self.teacher_net, self.teacher_gen))
+        self.opponent_support_base_weights.append(0.0)
 
         recent_start = max(1, self.teacher_gen - self.RECENT_WINDOW_SIZE + 1)
-        recent_gens = list(range(recent_start, self.teacher_gen + 1))
+        recent_support_gens = list(range(recent_start, self.teacher_gen))
         recent_entries = []
-        
-        for i, gen in enumerate(recent_gens, start=1):
+
+        for i, gen in enumerate(recent_support_gens, start=1):
             net = self._load_net_for_gen(gen)
-            if net is None: continue
+            if net is None:
+                continue
             raw_weight = self.RECENT_DECAY_RATIO ** i
             recent_entries.append((net, gen, raw_weight))
 
-        raw_sum = sum(e[2] for e in recent_entries) or 1.0
+        recent_raw_sum = sum(e[2] for e in recent_entries) or 1.0
         for net, gen, raw_weight in recent_entries:
             self.opponent_pool.append((net, gen))
-            self.opponent_weights.append(raw_weight / raw_sum * self.RECENT_BUCKET_MASS)
+            self.opponent_support_base_weights.append(
+                raw_weight / recent_raw_sum * self.RECENT_BUCKET_MASS
+            )
 
-        historic_gens = [g for g in range(1, recent_start) if os.path.exists(f'quorinet_teacher_gen_{g}.pth')]
+        historic_gens = [
+            g for g in range(1, recent_start)
+            if os.path.exists(f'quorinet_teacher_gen_{g}.pth')
+        ]
         if historic_gens:
             hist_weights = {}
             for g in historic_gens:
                 mult = self.escalation_state.get(g, {}).get("multiplier", 1.0)
                 hist_weights[g] = 1.0 * mult
-            hist_weights = self._apply_escalation_cap(hist_weights, self.HISTORIC_BUCKET_MASS, self.ESCALATION_MAX_SHARE_OF_HISTORIC_BUCKET)
+
+            hist_weights = self._apply_escalation_cap(
+                hist_weights,
+                self.HISTORIC_BUCKET_MASS,
+                self.ESCALATION_MAX_SHARE_OF_HISTORIC_BUCKET
+            )
+
             for g in historic_gens:
                 net = self._load_net_for_gen(g)
-                if net is None: continue
+                if net is None:
+                    continue
                 self.opponent_pool.append((net, g))
-                self.opponent_weights.append(hist_weights[g])
+                self.opponent_support_base_weights.append(hist_weights[g])
 
-        print(f"Opponent pool updated. Recent: {len(recent_entries)} | Historic: {len(historic_gens)} | Total weight: {sum(self.opponent_weights):.4f}")
+        self._refresh_opponent_weights()
+        latest_share = self._latest_teacher_share()
+        print(
+            f"Opponent pool updated. Latest target: Gen #{self.teacher_gen} "
+            f"({latest_share*100:.1f}%) | Support models: {len(self.opponent_pool)-1} "
+            f"| Total weight: {sum(self.opponent_weights):.4f}"
+        )
+
+    def _latest_teacher_win_rate(self):
+        if not self.latest_teacher_history:
+            return None
+        return sum(self.latest_teacher_history) / len(self.latest_teacher_history)
+
+    def _latest_teacher_share(self):
+        # Start with a safe majority while the metric is still uncertain.
+        samples = len(self.latest_teacher_history)
+        if samples == 0:
+            return self.CURRICULUM_LATEST_BASE_SHARE
+
+        win_rate = self._latest_teacher_win_rate()
+        progress = max(0.0, min(1.0, win_rate / self.GATE_WIN_RATE_THRESHOLD))
+        target_share = (
+            self.CURRICULUM_LATEST_MIN_SHARE
+            + (self.CURRICULUM_LATEST_MAX_SHARE - self.CURRICULUM_LATEST_MIN_SHARE)
+            * (progress ** 0.75)
+        )
+
+        # Confidence blending prevents a handful of early games from swinging
+        # the curriculum sharply.
+        confidence = min(1.0, samples / self.GATE_MIN_GAMES)
+        share = (
+            self.CURRICULUM_LATEST_BASE_SHARE * (1.0 - confidence)
+            + target_share * confidence
+        )
+        return max(
+            self.CURRICULUM_LATEST_MIN_SHARE,
+            min(self.CURRICULUM_LATEST_MAX_SHARE, share)
+        )
+
+    def _refresh_opponent_weights(self):
+        if not self.opponent_pool:
+            self.opponent_weights = []
+            return
+
+        latest_share = self._latest_teacher_share()
+        support_total = sum(self.opponent_support_base_weights)
+
+        if support_total <= 0.0:
+            self.opponent_weights = [
+                1.0 if gen == self.teacher_gen else 0.0
+                for _, gen in self.opponent_pool
+            ]
+            return
+
+        support_mass = 1.0 - latest_share
+        self.opponent_weights = []
+        for (_, gen), base_weight in zip(
+            self.opponent_pool, self.opponent_support_base_weights
+        ):
+            if gen == self.teacher_gen:
+                self.opponent_weights.append(latest_share)
+            else:
+                self.opponent_weights.append(
+                    (base_weight / support_total) * support_mass
+                )
+
+    def _select_training_opponent(self):
+        self._refresh_opponent_weights()
+
+        latest_idx = next(
+            (i for i, (_, gen) in enumerate(self.opponent_pool)
+             if gen == self.teacher_gen),
+            None
+        )
+        support_indices = [
+            i for i, (_, gen) in enumerate(self.opponent_pool)
+            if gen != self.teacher_gen and self.opponent_weights[i] > 0.0
+        ]
+
+        if latest_idx is None:
+            return self.teacher_net, self.teacher_gen
+
+        if not support_indices:
+            self.curriculum_latest_credit = 0.0
+            return self.opponent_pool[latest_idx]
+
+        # Deficit/credit scheduling gives the requested smooth distribution but
+        # avoids pathological single-game alternation. As latest share rises,
+        # naturally longer back-to-back latest-teacher streaks appear.
+        latest_share = self.opponent_weights[latest_idx]
+        self.curriculum_latest_credit += latest_share
+
+        if self.curriculum_latest_credit >= 1.0:
+            self.curriculum_latest_credit -= 1.0
+            return self.opponent_pool[latest_idx]
+
+        support_pool = [self.opponent_pool[i] for i in support_indices]
+        support_weights = [self.opponent_weights[i] for i in support_indices]
+        return random.choices(support_pool, weights=support_weights, k=1)[0]
+
+    def _append_replay_sample(self, state_tensor, target, opponent_gen):
+        item = (state_tensor, float(max(-1.0, min(1.0, target))))
+        if opponent_gen == self.teacher_gen:
+            self.latest_replay_buffer.append(item)
+        else:
+            self.historic_replay_buffer.append(item)
+
+    def _sample_replay_batch(self):
+        total_samples = (
+            len(self.latest_replay_buffer) + len(self.historic_replay_buffer)
+        )
+        if total_samples < self.REPLAY_WARMUP:
+            return None
+
+        latest_share = max(
+            self.REPLAY_LATEST_MIN_SHARE,
+            self._latest_teacher_share()
+        )
+        desired_latest = int(round(self.REPLAY_BATCH_SIZE * latest_share))
+
+        n_latest = min(len(self.latest_replay_buffer), desired_latest)
+        n_historic = min(
+            len(self.historic_replay_buffer),
+            self.REPLAY_BATCH_SIZE - n_latest
+        )
+
+        remaining = self.REPLAY_BATCH_SIZE - n_latest - n_historic
+        if remaining > 0:
+            extra_latest = min(
+                len(self.latest_replay_buffer) - n_latest,
+                remaining
+            )
+            n_latest += extra_latest
+            remaining -= extra_latest
+
+        if remaining > 0:
+            extra_historic = min(
+                len(self.historic_replay_buffer) - n_historic,
+                remaining
+            )
+            n_historic += extra_historic
+            remaining -= extra_historic
+
+        if n_latest + n_historic < self.REPLAY_BATCH_SIZE:
+            return None
+
+        batch = []
+        if n_latest:
+            batch.extend(random.sample(self.latest_replay_buffer, n_latest))
+        if n_historic:
+            batch.extend(random.sample(self.historic_replay_buffer, n_historic))
+        random.shuffle(batch)
+        return batch
+
+    def _roll_replay_buffers_for_new_teacher(self):
+        # The old "latest" data is still useful for anti-forgetting, but after
+        # promotion it must no longer occupy the protected current-target bucket.
+        while self.latest_replay_buffer:
+            self.historic_replay_buffer.append(self.latest_replay_buffer.popleft())
+
+    def _set_learning_rate(self, requested_lr, reason):
+        old_lr = self.optimizer.param_groups[0]['lr']
+        new_lr = max(self.LR_MIN, min(self.LR_MAX, requested_lr))
+        if abs(new_lr - old_lr) < 1e-12:
+            return False
+
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = new_lr
+
+        print(f"AutoLR: {old_lr:.6f} -> {new_lr:.6f} | {reason}")
+        return True
+
+    def _reset_lr_search_for_new_teacher(self):
+        self.latest_teacher_games_seen = 0
+        self.lr_metric_history.clear()
+        self.lr_last_tuned_at_latest_game = 0
+        self.lr_best_metric = -1.0
+        self.lr_best_value = self.optimizer.param_groups[0]['lr']
+        self.lr_search_direction = 0
+
+    def _tune_learning_rate_from_latest_teacher(self, force=False):
+        samples = len(self.latest_teacher_history)
+        if samples < self.LR_MIN_SAMPLES:
+            return
+
+        if (
+            not force
+            and self.latest_teacher_games_seen - self.lr_last_tuned_at_latest_game
+            < self.LR_TUNE_INTERVAL_LATEST_GAMES
+        ):
+            return
+
+        metric = self._latest_teacher_win_rate()
+        if metric is None:
+            return
+
+        previous_metric = self.lr_metric_history[-1] if self.lr_metric_history else None
+        current_lr = self.optimizer.param_groups[0]['lr']
+
+        if metric > self.lr_best_metric + self.LR_PLATEAU_EPS:
+            self.lr_best_metric = metric
+            self.lr_best_value = current_lr
+
+        # Use two adjacent halves of the rolling latest-teacher results so the
+        # controller reacts to actual skill acquisition, not lower-tier wins.
+        history = list(self.latest_teacher_history)
+        half = min(15, len(history) // 2)
+        if half > 0:
+            older = history[-2 * half:-half]
+            newer = history[-half:]
+            trend = (sum(newer) / len(newer)) - (sum(older) / len(older))
+        else:
+            trend = 0.0
+
+        reason = None
+        candidate_lr = current_lr
+
+        if previous_metric is None:
+            if metric < self.GATE_WIN_RATE_THRESHOLD:
+                candidate_lr = current_lr * self.LR_UP_FACTOR
+                self.lr_search_direction = 1
+                reason = (
+                    f"initial probe; latest WR={metric:.3f}, trend={trend:+.3f}"
+                )
+            else:
+                candidate_lr = current_lr * self.LR_CONVERGE_FACTOR
+                self.lr_search_direction = -1
+                reason = (
+                    f"already competitive; convergence probe at latest WR={metric:.3f}"
+                )
+        else:
+            delta = metric - previous_metric
+
+            if metric < self.GATE_WIN_RATE_THRESHOLD:
+                if delta > self.LR_PLATEAU_EPS or trend > self.LR_PLATEAU_EPS:
+                    # Current LR is producing measurable acquisition. Keep it
+                    # rather than perturbing a working trajectory.
+                    self.lr_search_direction = 0
+                    reason = (
+                        f"hold; latest WR improving ({metric:.3f}, "
+                        f"delta={delta:+.3f}, trend={trend:+.3f})"
+                    )
+                elif (
+                    delta < -self.LR_REGRESSION_EPS
+                    or trend < -self.LR_REGRESSION_EPS
+                ):
+                    # If a previous LR performed better, pull back toward it;
+                    # otherwise damp the current LR.
+                    if self.lr_best_metric >= 0.0 and abs(self.lr_best_value - current_lr) > 1e-12:
+                        candidate_lr = (current_lr * self.lr_best_value) ** 0.5
+                        reason = (
+                            f"regression; returning toward best LR "
+                            f"{self.lr_best_value:.6f} (best WR={self.lr_best_metric:.3f})"
+                        )
+                    else:
+                        candidate_lr = current_lr * self.LR_DOWN_FACTOR
+                        reason = (
+                            f"regression; damping LR at latest WR={metric:.3f}"
+                        )
+                    self.lr_search_direction = -1
+                else:
+                    # Plateau below the target: increase step size to escape the
+                    # local minimum. This is the key anti-stagnation branch.
+                    candidate_lr = current_lr * self.LR_UP_FACTOR
+                    self.lr_search_direction = 1
+                    reason = (
+                        f"plateau below target; exploration increase "
+                        f"(latest WR={metric:.3f}, trend={trend:+.3f})"
+                    )
+            else:
+                # Once competitive, bias toward smaller updates so the student
+                # converges instead of bouncing around the promotion boundary.
+                if (
+                    delta < -self.LR_REGRESSION_EPS
+                    or trend < -self.LR_REGRESSION_EPS
+                ):
+                    candidate_lr = current_lr * self.LR_DOWN_FACTOR
+                    reason = (
+                        f"competitive but regressing; stabilize "
+                        f"(latest WR={metric:.3f})"
+                    )
+                else:
+                    candidate_lr = current_lr * self.LR_CONVERGE_FACTOR
+                    reason = (
+                        f"competitive; convergence decay "
+                        f"(latest WR={metric:.3f}, trend={trend:+.3f})"
+                    )
+                self.lr_search_direction = -1
+
+        if reason is not None and candidate_lr != current_lr:
+            self._set_learning_rate(candidate_lr, reason)
+        elif reason is not None:
+            print(f"AutoLR: {reason}; LR held at {current_lr:.6f}")
+
+        self.lr_metric_history.append(metric)
+        self.lr_last_tuned_at_latest_game = self.latest_teacher_games_seen
 
     def _load_net_for_gen(self, gen):
         if gen == self.teacher_gen: return self.teacher_net
@@ -673,6 +1036,7 @@ class Quoridor:
         print(f"Red Player (P1):  {self.p1_gen_str}")
         print(f"Blue Player (P2): {self.p2_gen_str}")
         print(f"Latest Teacher:   Gen #{self.teacher_gen}")
+        print(f"Latest Share:     {self._latest_teacher_share()*100:.1f}%")
         print(f"Heuristic Dep:   {self.heuristic_weight:.3f}")
         print(f"Studt Win Rate:  {self.student_win_rate_str}")
         print(f"AI Board Eval:   {eval_score} | LR: {current_lr:.6f} | Loss: {self.last_loss:.5f}")
@@ -708,15 +1072,18 @@ class Quoridor:
         self.winner = None
         self.winner_id = 0
         self.game_start_time = time.time()
-        
+        self.episode_trajectory = []
+
         if getattr(self, 'mode', 'MENU') == 'TRAIN':
             if hasattr(self, 'opponent_pool') and self.opponent_pool:
-                pool_opponent, pool_gen = random.choices(self.opponent_pool, weights=self.opponent_weights, k=1)[0]
+                pool_opponent, pool_gen = self._select_training_opponent()
                 self.current_opponent_gen = pool_gen
             else:
                 pool_opponent, pool_gen = self.teacher_net, self.teacher_gen
                 self.current_opponent_gen = pool_gen
-            
+
+            self.current_opponent_is_latest = (pool_gen == self.teacher_gen)
+
             if self.games_played % 2 == 0:
                 self.bot1 = QuoridorBot(bot_id=1, max_depth=2, nn_model=pool_opponent, heuristic_weight=self.heuristic_weight)
                 self.bot2 = QuoridorBot(bot_id=2, max_depth=2, nn_model=self.student_net, heuristic_weight=self.heuristic_weight)
@@ -741,13 +1108,24 @@ class Quoridor:
             try:
                 self.teacher_net.load_state_dict(torch.load('quorinet_teacher_weights.pth', weights_only=True))
                 teacher_loaded = True
-            except: pass
-                
+            except:
+                pass
+
         if os.path.exists('quorinet_student_weights.pth'):
-            try: self.student_net.load_state_dict(torch.load('quorinet_student_weights.pth', weights_only=True))
-            except: pass
+            try:
+                self.student_net.load_state_dict(torch.load('quorinet_student_weights.pth', weights_only=True))
+            except:
+                pass
         elif teacher_loaded:
             self.student_net.load_state_dict(self.teacher_net.state_dict())
+
+        if os.path.exists('quorinet_optimizer.pth'):
+            try:
+                self.optimizer.load_state_dict(
+                    torch.load('quorinet_optimizer.pth', weights_only=True)
+                )
+            except Exception:
+                pass
 
         self.heuristic_weight = 1.0
         if os.path.exists('quorinet_meta.json'):
@@ -757,17 +1135,73 @@ class Quoridor:
                     self.games_played = meta.get('games_played', 0)
                     self.teacher_gen = meta.get('teacher_gen', 1)
                     self.heuristic_weight = meta.get('heuristic_weight', 1.0)
+
                     eval_hist = meta.get('student_eval_history', [])
                     self.student_eval_history = deque(eval_hist, maxlen=100)
-                    if self.student_eval_history:
-                        wins, games = sum(self.student_eval_history), len(self.student_eval_history)
-                        self.student_win_rate_str = f"{wins/games * 100:.1f}% ({wins}/{games})"
-                    
-                    self.checkpoint_log = {int(k): deque(v, maxlen=self.LOG_WINDOW_SIZE) for k, v in meta.get('checkpoint_log', {}).items()}
-                    self.escalation_state = {int(k): v for k, v in meta.get('escalation_state', {}).items()}
+
+                    self.checkpoint_log = {
+                        int(k): deque(v, maxlen=self.LOG_WINDOW_SIZE)
+                        for k, v in meta.get('checkpoint_log', {}).items()
+                    }
+                    self.escalation_state = {
+                        int(k): v for k, v in meta.get('escalation_state', {}).items()
+                    }
                     self.wawr_history = meta.get('wawr_history', [])
                     self.lr_last_reduced_at_gen = meta.get('lr_last_reduced_at_gen', 0)
-            except Exception: pass
+
+                    # New metadata is optional so every old checkpoint remains
+                    # loadable. If absent, seed the latest-only metric from the
+                    # already generation-tagged checkpoint log.
+                    latest_hist = meta.get('latest_teacher_history')
+                    if latest_hist is None:
+                        latest_hist = list(self.checkpoint_log.get(self.teacher_gen, []))
+                    self.latest_teacher_history = deque(
+                        latest_hist,
+                        maxlen=self.LATEST_TEACHER_LOG_WINDOW
+                    )
+
+                    self.latest_teacher_games_seen = meta.get(
+                        'latest_teacher_games_seen',
+                        len(self.latest_teacher_history)
+                    )
+                    self.lr_metric_history = deque(
+                        meta.get('lr_metric_history', []),
+                        maxlen=12
+                    )
+                    self.lr_last_tuned_at_latest_game = meta.get(
+                        'lr_last_tuned_at_latest_game',
+                        0
+                    )
+                    self.lr_best_metric = meta.get('lr_best_metric', -1.0)
+                    self.lr_best_value = meta.get(
+                        'lr_best_value',
+                        self.optimizer.param_groups[0]['lr']
+                    )
+                    self.lr_search_direction = meta.get('lr_search_direction', 0)
+                    self.curriculum_latest_credit = meta.get(
+                        'curriculum_latest_credit',
+                        1.0
+                    )
+
+                    saved_lr = meta.get('current_lr')
+                    if saved_lr is not None:
+                        saved_lr = max(self.LR_MIN, min(self.LR_MAX, float(saved_lr)))
+                        for param_group in self.optimizer.param_groups:
+                            param_group['lr'] = saved_lr
+
+                    latest_wr = self._latest_teacher_win_rate()
+                    if latest_wr is not None:
+                        wins = sum(self.latest_teacher_history)
+                        games = len(self.latest_teacher_history)
+                        self.student_win_rate_str = (
+                            f"{latest_wr * 100:.1f}% Latest ({wins}/{games})"
+                        )
+                    elif self.student_eval_history:
+                        wins = sum(self.student_eval_history)
+                        games = len(self.student_eval_history)
+                        self.student_win_rate_str = f"{wins/games * 100:.1f}% ({wins}/{games})"
+            except Exception as e:
+                print(f"Metadata load warning: {e}")
 
     def save_meta(self):
         with open('quorinet_meta.json', 'w') as f:
@@ -776,16 +1210,26 @@ class Quoridor:
                 'teacher_gen': self.teacher_gen,
                 'heuristic_weight': self.heuristic_weight,
                 'student_eval_history': list(self.student_eval_history),
+                'latest_teacher_history': list(self.latest_teacher_history),
                 'checkpoint_log': {k: list(v) for k, v in self.checkpoint_log.items()},
                 'escalation_state': self.escalation_state,
                 'wawr_history': self.wawr_history,
-                'lr_last_reduced_at_gen': self.lr_last_reduced_at_gen
+                'lr_last_reduced_at_gen': self.lr_last_reduced_at_gen,
+                'current_lr': self.optimizer.param_groups[0]['lr'],
+                'latest_teacher_games_seen': self.latest_teacher_games_seen,
+                'lr_metric_history': list(self.lr_metric_history),
+                'lr_last_tuned_at_latest_game': self.lr_last_tuned_at_latest_game,
+                'lr_best_metric': self.lr_best_metric,
+                'lr_best_value': self.lr_best_value,
+                'lr_search_direction': self.lr_search_direction,
+                'curriculum_latest_credit': self.curriculum_latest_credit
             }, f)
 
     def save_checkpoint(self, manual=False):
         torch.save(self.teacher_net.state_dict(), f'quorinet_teacher_gen_{self.teacher_gen}.pth')
         torch.save(self.teacher_net.state_dict(), 'quorinet_teacher_weights.pth')
         torch.save(self.student_net.state_dict(), 'quorinet_student_weights.pth')
+        torch.save(self.optimizer.state_dict(), 'quorinet_optimizer.pth')
         self.save_meta()
         print(f"[{'Manual' if manual else 'Auto'} Saved] Gen #{self.teacher_gen} saved.")
         self.toast_msg, self.toast_timer = f"Saved Checkpoint! (Gen #{self.teacher_gen})", 120
@@ -836,6 +1280,7 @@ class Quoridor:
     def evaluate_and_tune_lr(self, games_per_model=20):
         if self.teacher_gen <= 1:
             print("No previous historical models available to evaluate against.")
+            self._tune_learning_rate_from_latest_teacher(force=False)
             return 1.0
 
         eval_gens = list(range(1, self.teacher_gen + 1))
@@ -847,18 +1292,23 @@ class Quoridor:
         completed_eval_games = 0
         weighted_wins, weighted_total = 0.0, 0.0
         decay_factor = 0.85
-        
+
         try:
             for gen_i in eval_gens:
-                file_path = f'quorinet_teacher_gen_{gen_i}.pth'
-                if not os.path.exists(file_path): continue
-                    
-                past_net = SpatialQuoriNetV2(in_channels=8)
-                try:
-                    past_net.load_state_dict(torch.load(file_path, weights_only=True))
-                    past_net.eval()
-                except Exception: continue
-                    
+                if gen_i == self.teacher_gen:
+                    past_net = self.teacher_net
+                else:
+                    file_path = f'quorinet_teacher_gen_{gen_i}.pth'
+                    if not os.path.exists(file_path):
+                        continue
+
+                    past_net = SpatialQuoriNetV2(in_channels=8)
+                    try:
+                        past_net.load_state_dict(torch.load(file_path, weights_only=True))
+                        past_net.eval()
+                    except Exception:
+                        continue
+
                 gen_wins = 0
                 for g in range(games_per_model):
                     completed_eval_games += 1
@@ -872,43 +1322,41 @@ class Quoridor:
                         eval_bot2 = QuoridorBot(bot_id=2, max_depth=2, nn_model=self.student_net, heuristic_weight=self.heuristic_weight)
                         res = self.play_eval_game(eval_bot1, eval_bot2, completed_eval_games, total_eval_games, gen_i)
                         student_won = 1 if res == 2 else 0
-                    
-                    if student_won: gen_wins += 1
-                    
-                    # Section 3 requirement applied to evaluation loops
+
+                    if student_won:
+                        gen_wins += 1
+
+                    # Historical diagnostics remain generation-specific, but
+                    # never feed the latest-teacher promotion/LR metric.
                     if gen_i not in self.checkpoint_log:
                         self.checkpoint_log[gen_i] = deque(maxlen=self.LOG_WINDOW_SIZE)
                     self.checkpoint_log[gen_i].append(student_won)
-                
+
                 gen_win_rate = gen_wins / games_per_model
                 age = min(self.teacher_gen - gen_i, 10)
                 weight = decay_factor ** age
                 weighted_wins += gen_win_rate * weight
                 weighted_total += weight
                 req = min(0.55 + (0.05 * age), 0.85)
-                print(f"Vs Gen #{gen_i} (Age {age}): {gen_wins}/{games_per_model} wins | Req: {req * 100:.1f}% [{'PASS' if gen_win_rate >= req else 'FAIL'}]")
+                print(
+                    f"Vs Gen #{gen_i} (Age {age}): {gen_wins}/{games_per_model} wins "
+                    f"| Req: {req * 100:.1f}% "
+                    f"[{'PASS' if gen_win_rate >= req else 'FAIL'}]"
+                )
         finally:
             self.is_evaluating = False
 
-        if weighted_total == 0: return 1.0
+        if weighted_total == 0:
+            return 1.0
+
         final_weighted_win_rate = weighted_wins / weighted_total
         print(f"Overall Weighted Pool Win Rate: {final_weighted_win_rate * 100:.1f}%")
-        
         self.wawr_history.append(final_weighted_win_rate)
-        plateaued = (len(self.wawr_history) >= self.LR_TRIGGER_PLATEAU_CYCLES and 
-                    (max(self.wawr_history[-self.LR_TRIGGER_PLATEAU_CYCLES:]) - min(self.wawr_history[-self.LR_TRIGGER_PLATEAU_CYCLES:])) <= self.LR_TRIGGER_EPS)
-        cooldown_ok = (self.teacher_gen - self.lr_last_reduced_at_gen) >= self.LR_TRIGGER_COOLDOWN_CYCLES
 
-        if final_weighted_win_rate >= 0.75 and plateaued and cooldown_ok:
-            lr_scale = max(0.5, 1.0 - (0.3 * final_weighted_win_rate))
-            for param_group in self.optimizer.param_groups:
-                new_lr = max(param_group['lr'] * lr_scale, self.LR_MIN_FLOOR)
-                param_group['lr'] = new_lr
-                print(f"LR reduced to {new_lr:.6f} (plateau confirmed, WAWR={final_weighted_win_rate:.3f})")
-            self.lr_last_reduced_at_gen = self.teacher_gen
-        else:
-            print(f"LR unchanged. WAWR={final_weighted_win_rate:.3f}, plateaued={plateaued}, cooldown_ok={cooldown_ok}")
-
+        # Historical pool performance is diagnostic only. AutoLR is explicitly
+        # driven by the rolling latest-teacher metric so easy old teachers can
+        # neither reduce nor inflate the learning rate.
+        self._tune_learning_rate_from_latest_teacher(force=False)
         return final_weighted_win_rate
 
     def train_step(self, state_tensor, turn_pid, next_state_tensor, next_turn_pid, done, winner_id):
@@ -919,17 +1367,69 @@ class Quoridor:
             with torch.no_grad():
                 next_val = self.teacher_net(next_state_tensor.unsqueeze(0)).item()
             target = gamma * next_val if next_turn_pid == turn_pid else gamma * (-next_val)
-                
-        self.replay_buffer.append((state_tensor, target))
-        if len(self.replay_buffer) >= 256:
+
+        opponent_gen = self.current_opponent_gen
+        was_latest = self.current_opponent_is_latest
+
+        # Keep the original stable one-step teacher target.
+        self._append_replay_sample(state_tensor, target, opponent_gen)
+
+        # Retain the episode only long enough to propagate the real terminal
+        # outcome through hard latest-teacher games.
+        self.episode_trajectory.append(
+            (state_tensor, turn_pid, target, opponent_gen, was_latest)
+        )
+
+        if done:
+            if was_latest and self.episode_trajectory:
+                final_index = len(self.episode_trajectory) - 1
+                for i, (
+                    episode_state,
+                    episode_pid,
+                    bootstrap_target,
+                    episode_gen,
+                    episode_was_latest
+                ) in enumerate(self.episode_trajectory):
+                    if not episode_was_latest:
+                        continue
+
+                    if winner_id == 0:
+                        outcome = 0.0
+                    else:
+                        outcome = 1.0 if episode_pid == winner_id else -1.0
+
+                    horizon = final_index - i
+                    discounted_outcome = (
+                        outcome * (self.OUTCOME_BACKFILL_DISCOUNT ** horizon)
+                    )
+                    mixed_target = (
+                        self.OUTCOME_BACKFILL_MIX * discounted_outcome
+                        + (1.0 - self.OUTCOME_BACKFILL_MIX) * bootstrap_target
+                    )
+                    self._append_replay_sample(
+                        episode_state,
+                        mixed_target,
+                        episode_gen
+                    )
+
+            self.episode_trajectory.clear()
+
+        batch = self._sample_replay_batch()
+        if batch is not None:
             self.student_net.train()
-            batch = random.sample(self.replay_buffer, 128)
             states = torch.stack([item[0] for item in batch])
-            targets = torch.tensor([[item[1]] for item in batch], dtype=torch.float32)
+            targets = torch.tensor(
+                [[item[1]] for item in batch],
+                dtype=torch.float32
+            )
             self.optimizer.zero_grad()
             predictions = self.student_net(states)
             loss = self.loss_fn(predictions, targets)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.student_net.parameters(),
+                self.GRAD_CLIP_NORM
+            )
             self.optimizer.step()
             self.last_loss = loss.item()
             self.student_net.eval()
@@ -1055,7 +1555,7 @@ class Quoridor:
         pygame.draw.line(self.virtual_screen, (235, 238, 242), (card1_rect.x + int(10 * SCALE), card1_rect.y + int(28 * SCALE)), (card1_rect.right - int(10 * SCALE), card1_rect.y + int(28 * SCALE)))
 
         eval_score = round(self.bot1.evaluate(self.state, self.state['turn']), 1)
-        eval_counter_str = f"{len(self.student_eval_history)}/30 min games"
+        eval_counter_str = f"{len(self.latest_teacher_history)}/{self.GATE_MIN_GAMES} latest games"
         current_lr = self.optimizer.param_groups[0]['lr']
         eval_phase_str = f"Vs Gen #{self.eval_vs_gen} ({self.eval_game_curr}/{self.eval_game_total})" if self.is_evaluating else "Idle"
 
@@ -1269,53 +1769,137 @@ class Quoridor:
             self.game_over, winner_id = True, 2
         elif self.state['turns_played'] >= 200:
             self.game_over, winner_id = True, 0
-            
+
         if self.game_over:
             self.winner_id = winner_id
-            if winner_id == 0: self.winner = "Draw"
-            elif getattr(self, 'mode', 'TRAIN') == "TRAIN": self.winner = "Student" if winner_id == self.student_id else "Teacher"
-            else: self.winner = "Human" if winner_id == 1 else "Teacher"
-                
-            print(f"Game #{self.games_played + 1} Winner: {self.winner.upper()} ({self.state['turns_played']} turns)")
+            if winner_id == 0:
+                self.winner = "Draw"
+            elif getattr(self, 'mode', 'TRAIN') == "TRAIN":
+                self.winner = "Student" if winner_id == self.student_id else "Teacher"
+            else:
+                self.winner = "Human" if winner_id == 1 else "Teacher"
+
+            print(
+                f"Game #{self.games_played + 1} Winner: "
+                f"{self.winner.upper()} ({self.state['turns_played']} turns)"
+            )
             self.log_match_result(winner_id)
-            
+
             if self.mode == "TRAIN":
                 self.games_played += 1
-                if self.games_played % 250 == 0: self.save_checkpoint(manual=False)
+                if self.games_played % 250 == 0:
+                    self.save_checkpoint(manual=False)
 
                 student_won = 1 if winner_id == self.student_id else 0
+
+                # Keep the old mixed history only for backwards-compatible
+                # diagnostics. It no longer controls promotion.
                 self.student_eval_history.append(student_won)
-                
-                # Section 3 Requirement
+
                 gen = self.current_opponent_gen
                 if gen not in self.checkpoint_log:
                     self.checkpoint_log[gen] = deque(maxlen=self.LOG_WINDOW_SIZE)
                 self.checkpoint_log[gen].append(student_won)
 
-                wins, games = sum(self.student_eval_history), len(self.student_eval_history)
-                self.student_win_rate_str = f"{wins/games * 100:.1f}% ({wins}/{games})"
-                self.save_meta()
-                
-                if games >= self.GATE_MIN_GAMES:
-                    if (wins / games) >= self.GATE_WIN_RATE_THRESHOLD:
-                        print(f"Student beat Teacher! Upgrading Teacher to Gen #{self.teacher_gen + 1}...")
-                        
-                        # Section 7 Strict Call Order
-                        self.evaluate_and_tune_lr(games_per_model=self.FULL_EVAL_GAMES_PER_MODEL)
-                        self.teacher_gen += 1
-                        self.teacher_net.load_state_dict(self.student_net.state_dict())
-                        self.update_opponent_pool()
-                        self.update_escalation_state()
-                        
-                        old_hw = self.heuristic_weight
-                        self.heuristic_weight = max(0.1, self.heuristic_weight * 0.85)
-                        print(f"Curriculum Update: Heuristic Dependency decayed from {old_hw:.3f} to {self.heuristic_weight:.3f}")
+                # Only games against the current strongest teacher can affect
+                # curriculum progression or AutoLR. Easy older teachers cannot
+                # be farmed to pass the gate.
+                if self.current_opponent_is_latest:
+                    self.latest_teacher_history.append(student_won)
+                    self.latest_teacher_games_seen += 1
 
+                    latest_wins = sum(self.latest_teacher_history)
+                    latest_games = len(self.latest_teacher_history)
+                    latest_wr = latest_wins / latest_games
+                    self.student_win_rate_str = (
+                        f"{latest_wr * 100:.1f}% Latest "
+                        f"({latest_wins}/{latest_games})"
+                    )
+
+                    # Update the actual next-game mix immediately as competence
+                    # changes, without reloading any networks.
+                    self._refresh_opponent_weights()
+                    self._tune_learning_rate_from_latest_teacher(force=False)
+                else:
+                    latest_wr = self._latest_teacher_win_rate()
+                    latest_games = len(self.latest_teacher_history)
+                    if latest_wr is not None:
+                        latest_wins = sum(self.latest_teacher_history)
+                        self.student_win_rate_str = (
+                            f"{latest_wr * 100:.1f}% Latest "
+                            f"({latest_wins}/{latest_games})"
+                        )
+
+                self.save_meta()
+
+                # Promotion is latest-teacher-only. The rolling window naturally
+                # forgets the early catastrophic phase once the student actually
+                # becomes competitive.
+                latest_wr = self._latest_teacher_win_rate()
+                latest_games = len(self.latest_teacher_history)
+                if (
+                    self.current_opponent_is_latest
+                    and latest_wr is not None
+                    and latest_games >= self.GATE_MIN_GAMES
+                ):
+                    if latest_wr >= self.GATE_WIN_RATE_THRESHOLD:
+                        print(
+                            f"Student beat latest Teacher Gen #{self.teacher_gen} "
+                            f"at {latest_wr*100:.1f}% rolling WR! "
+                            f"Upgrading Teacher to Gen #{self.teacher_gen + 1}..."
+                        )
+
+                        # Preserve the old teacher before overwriting the live
+                        # teacher_net, even if no periodic checkpoint happened.
+                        torch.save(
+                            self.teacher_net.state_dict(),
+                            f'quorinet_teacher_gen_{self.teacher_gen}.pth'
+                        )
+
+                        # Historical evaluation remains a regression diagnostic.
+                        # AutoLR itself is controlled only by latest-teacher WR.
+                        self.evaluate_and_tune_lr(
+                            games_per_model=self.FULL_EVAL_GAMES_PER_MODEL
+                        )
+
+                        self.teacher_gen += 1
+                        self.teacher_net.load_state_dict(
+                            self.student_net.state_dict()
+                        )
+
+                        # Everything learned from the just-defeated teacher is
+                        # now anti-forgetting data; the new target starts with a
+                        # clean protected latest replay bucket and metric window.
+                        self._roll_replay_buffers_for_new_teacher()
+                        self.latest_teacher_history.clear()
+                        self._reset_lr_search_for_new_teacher()
+                        self.curriculum_latest_credit = 1.0
+
+                        self.update_escalation_state()
+
+                        old_hw = self.heuristic_weight
+                        self.heuristic_weight = max(
+                            0.1,
+                            self.heuristic_weight * 0.85
+                        )
+                        print(
+                            f"Curriculum Update: Heuristic Dependency decayed "
+                            f"from {old_hw:.3f} to {self.heuristic_weight:.3f}"
+                        )
+
+                        self.update_opponent_pool()
                         self.save_checkpoint(manual=True)
                         self.student_eval_history.clear()
+                        self.student_win_rate_str = "Pending Eval"
                         self.save_meta()
                     else:
-                        print(f"Evaluation threshold not met ({wins}/{games}). Continuing cycle...")
+                        print(
+                            f"Latest-teacher gate not met "
+                            f"({sum(self.latest_teacher_history)}/{latest_games}, "
+                            f"{latest_wr*100:.1f}% < "
+                            f"{self.GATE_WIN_RATE_THRESHOLD*100:.1f}%). "
+                            f"Continuing curriculum..."
+                        )
 
     def run_headless_training(self, num_games):
         print(f"Starting Headless Turbo Training for {num_games} games...")
@@ -1439,7 +2023,7 @@ class Quoridor:
                     pre_action_pid = self.state['turn']
 
                     is_teacher = (active_bot.nn_model != self.student_net)
-                    eps = 0.0 if is_teacher else (0.15 * (0.95 ** self.state['turns_played']))
+                    eps = 0.0 if is_teacher else (0.30 * (0.85 ** self.state['turns_played']))
                     
                     action, _ = active_bot.get_move_and_eval(self.state, epsilon=eps)
                     if action: self.state = active_bot.apply_action(self.state, pre_action_pid, action, is_random=getattr(active_bot, 'was_last_random', False))
