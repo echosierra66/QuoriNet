@@ -305,13 +305,6 @@ class QuoridorBot:
         
         is_repeated = get_state_key(state) in state.get('history', set())
 
-        if self.nn_model is not None:
-            with torch.no_grad():
-                nn_val = self.nn_model(encode_state(state, eval_pid).unsqueeze(0)).item()
-            score = nn_val * 100.0
-            if is_repeated: score -= 8000
-            return score
-
         p1_path = self.get_shortest_path(state, 1)
         p2_path = self.get_shortest_path(state, 2)
         
@@ -326,6 +319,19 @@ class QuoridorBot:
         if state['p1_walls'] == 0 and state['p2_walls'] == 0:
             score = (d2 - d1) * 50.0 + (p1_progress - p2_progress) * 10.0
             if eval_pid == 2: score = -score
+            if is_repeated: score -= 8000
+            return score
+
+        if self.nn_model is not None:
+            with torch.no_grad():
+                nn_val = self.nn_model(encode_state(state, eval_pid).unsqueeze(0)).item()
+            
+            nn_score = nn_val * 100.0
+            
+            heur_score = (d2 - d1) * 5.0
+            if eval_pid == 2: heur_score = -heur_score
+            
+            score = nn_score + heur_score
             if is_repeated: score -= 8000
             return score
 
@@ -494,36 +500,22 @@ class Quoridor:
         self.reset_game()
 
     def update_opponent_pool(self):
-        self.opponent_pool = []
-        self.opponent_weights = []
+        self.opponent_pool = [(self.teacher_net, self.teacher_gen)]
+        self.opponent_weights = [1.0]
         
-        target_gens = set()
-        curr = self.teacher_gen
-        step = 1
-        while curr >= 1:
-            target_gens.add(curr)
-            curr -= step
-            step *= 2
-        target_gens.add(1)
-        
-        for i in sorted(list(target_gens)):
-            if i == self.teacher_gen:
-                self.opponent_pool.append((self.teacher_net, i))
-                self.opponent_weights.append(1.0)
-            else:
-                file_path = f'quorinet_teacher_gen_{i}.pth'
-                if os.path.exists(file_path):
-                    try:
-                        net = SpatialQuoriNet()
-                        net.load_state_dict(torch.load(file_path, weights_only=True))
-                        net.eval()
-                        self.opponent_pool.append((net, i))
-                        self.opponent_weights.append(1.0)
-                    except Exception as e:
-                        print(f"Failed to load pool model {i}: {e}")
-        if not self.opponent_pool:
-            self.opponent_pool = [(self.teacher_net, self.teacher_gen)]
-            self.opponent_weights = [1.0]
+        for i in range(max(1, self.teacher_gen - 10), self.teacher_gen):
+            file_path = f'quorinet_teacher_gen_{i}.pth'
+            if os.path.exists(file_path):
+                try:
+                    net = SpatialQuoriNet()
+                    net.load_state_dict(torch.load(file_path, weights_only=True))
+                    net.eval()
+                    self.opponent_pool.append((net, i))
+                    age = min(self.teacher_gen - i, 10)
+                    weight = 0.85 ** age
+                    self.opponent_weights.append(weight)
+                except Exception as e:
+                    print(f"Failed to load pool model {i}: {e}")
         print(f"Opponent pool updated. Size: {len(self.opponent_pool)}")
 
     def print_headless_metrics(self):
@@ -576,6 +568,7 @@ class Quoridor:
         self.wall_orientation = 'H'
         self.game_over = False
         self.winner = None
+        self.winner_id = 0
         self.game_start_time = time.time()
         
         if getattr(self, 'mode', 'MENU') == 'TRAIN':
@@ -723,20 +716,17 @@ class Quoridor:
             print("No previous historical models available to evaluate against.")
             return 1.0
             
-        eval_gens_set = set()
-        curr = self.teacher_gen
-        step = 1
-        while curr >= 1:
-            eval_gens_set.add(curr)
-            curr -= step
-            step *= 2
-        eval_gens_set.add(1)
-        eval_gens = sorted([g for g in eval_gens_set if g < self.teacher_gen])
+        recent_gens = list(range(max(1, self.teacher_gen - 1), self.teacher_gen + 1))
+        older_gens = list(range(1, max(1, self.teacher_gen - 1)))
         
-        if not eval_gens:
-            print("No previous historical models available to evaluate against.")
-            return 1.0
+        if len(older_gens) > 3:
+            milestone_gens = random.sample(older_gens, 3)
+            milestone_gens.sort()
+        else:
+            milestone_gens = older_gens
             
+        eval_gens = milestone_gens + recent_gens
+        
         print(f"\n--- Starting Historical Pool Evaluation (Candidate Gen #{self.teacher_gen + 1}) ---")
         print(f"Evaluating candidate against sampled generations: {eval_gens}")
 
@@ -746,6 +736,7 @@ class Quoridor:
 
         weighted_wins = 0.0
         weighted_total = 0.0
+        decay_factor = 0.85
         passed_all_tiers = True
         
         try:
@@ -776,8 +767,8 @@ class Quoridor:
                         if res == 2: gen_wins += 1
                 
                 gen_win_rate = gen_wins / games_per_model
-                age = self.teacher_gen - gen_i
-                weight = 1.0
+                age = min(self.teacher_gen - gen_i, 10)
+                weight = decay_factor ** age
                 
                 weighted_wins += gen_win_rate * weight
                 weighted_total += weight
@@ -840,12 +831,12 @@ class Quoridor:
     def log_match_result(self, winner_id):
         duration = round(time.time() - self.game_start_time, 1)
         
-        if winner_id == 1:
-            winner_str = "Red"
-        elif winner_id == 2:
-            winner_str = "Blue"
-        else:
+        if winner_id == 0:
             winner_str = "Draw"
+        elif getattr(self, 'mode', 'TRAIN') == "TRAIN":
+            winner_str = "Student" if winner_id == self.student_id else "Teacher"
+        else:
+            winner_str = "Human" if winner_id == 1 else "Teacher"
             
         self.match_history.appendleft({
             'game': self.games_played + 1,
@@ -949,7 +940,7 @@ class Quoridor:
 
         hy_offset = card2_rect.y + int(48 * SCALE)
         for log in reversed(list(self.match_history)[:4]):
-            w_color = P1_COLOR if log.get('winner_id') == 1 else (P2_COLOR if log.get('winner_id') == 2 else MUTED_TEXT)
+            w_color = MUTED_TEXT if log.get('winner_id') == 0 else TEXT_COLOR
             
             self.virtual_screen.blit(self.tiny_font.render(f"#{log['game']}", True, TEXT_COLOR), (card2_rect.x + int(10 * SCALE), hy_offset))
             self.virtual_screen.blit(self.tiny_font.render(log['winner'], True, w_color), (card2_rect.x + int(60 * SCALE), hy_offset))
@@ -987,8 +978,8 @@ class Quoridor:
         self.virtual_screen.blit(p2_txt, (BOARD_PIXEL_SIZE - p2_txt.get_width() - int(20 * SCALE), int(35 * SCALE)))
 
         if self.game_over:
-            status_text = "Draw" if self.winner == "Draw" else f"{self.winner} wins!"
-            status_color = MUTED_TEXT if self.winner == "Draw" else (P1_COLOR if self.winner == "Red" else P2_COLOR)
+            status_text = "Draw" if self.winner == "Draw" else f"{self.winner} won!"
+            status_color = MUTED_TEXT if self.winner == "Draw" else TEXT_COLOR
         else:
             status_text = "Red's turn" if self.state['turn'] == 1 else "Blue's turn"
             status_color = P1_COLOR if self.state['turn'] == 1 else P2_COLOR
@@ -1125,52 +1116,60 @@ class Quoridor:
         return hover_type, hover_c, hover_r, active_orient
 
     def check_win(self):
+        winner_id = 0
         if self.state['p1_pos'][1] == 0:
             self.game_over = True
-            self.winner = "Red"
-            print(f"Game #{self.games_played + 1} Winner: RED [{self.p1_gen_str}] vs BLUE [{self.p2_gen_str}] ({self.state['turns_played']} turns)")
-            self.log_match_result(1)
+            winner_id = 1
         elif self.state['p2_pos'][1] == 8:
             self.game_over = True
-            self.winner = "Blue"
-            print(f"Game #{self.games_played + 1} Winner: BLUE [{self.p2_gen_str}] vs RED [{self.p1_gen_str}] ({self.state['turns_played']} turns)")
-            self.log_match_result(2)
+            winner_id = 2
         elif self.state['turns_played'] >= 200:
             self.game_over = True
-            self.winner = "Draw"
-            print(f"Game #{self.games_played + 1} Ended in DRAW: RED [{self.p1_gen_str}] vs BLUE [{self.p2_gen_str}] (200 turn limit)")
-            self.log_match_result(0)
+            winner_id = 0
             
-        if self.game_over and self.mode == "TRAIN":
-            self.games_played += 1
-            if self.games_played % 250 == 0:
-                self.save_checkpoint(manual=False)
+        if self.game_over:
+            self.winner_id = winner_id
+            
+            if winner_id == 0:
+                self.winner = "Draw"
+            elif getattr(self, 'mode', 'TRAIN') == "TRAIN":
+                self.winner = "Student" if winner_id == self.student_id else "Teacher"
+            else:
+                self.winner = "Human" if winner_id == 1 else "Teacher"
+                
+            print(f"Game #{self.games_played + 1} Winner: {self.winner.upper()} ({self.state['turns_played']} turns)")
+            self.log_match_result(winner_id)
+            
+            if self.mode == "TRAIN":
+                self.games_played += 1
+                if self.games_played % 250 == 0:
+                    self.save_checkpoint(manual=False)
 
-            student_won = 1 if (self.winner == "Red" and self.student_id == 1) or (self.winner == "Blue" and self.student_id == 2) else 0
-            self.student_eval_history.append(student_won)
-            wins = sum(self.student_eval_history)
-            games = len(self.student_eval_history)
-            self.student_win_rate_str = f"{wins/games * 100:.1f}% ({wins}/{games})"
-            
-            self.save_meta()
-            
-            if games >= 30:
-                if (wins / games) >= 0.57:
-                    print(f"Student beat Teacher! Upgrading Teacher to Gen #{self.teacher_gen + 1}...")
-                    self.evaluate_and_tune_lr(games_per_model=10)
-                    self.teacher_gen += 1
-                    self.teacher_net.load_state_dict(self.student_net.state_dict())
-                    self.update_opponent_pool()
-                    
-                    old_hw = self.heuristic_weight
-                    self.heuristic_weight = self.heuristic_weight * 0.85
-                    print(f"Curriculum Update: Heuristic Dependency decayed from {old_hw:.3f} to {self.heuristic_weight:.3f}")
+                student_won = 1 if winner_id == self.student_id else 0
+                self.student_eval_history.append(student_won)
+                wins = sum(self.student_eval_history)
+                games = len(self.student_eval_history)
+                self.student_win_rate_str = f"{wins/games * 100:.1f}% ({wins}/{games})"
+                
+                self.save_meta()
+                
+                if games >= 30:
+                    if (wins / games) >= 0.57:
+                        print(f"Student beat Teacher! Upgrading Teacher to Gen #{self.teacher_gen + 1}...")
+                        self.evaluate_and_tune_lr(games_per_model=10)
+                        self.teacher_gen += 1
+                        self.teacher_net.load_state_dict(self.student_net.state_dict())
+                        self.update_opponent_pool()
+                        
+                        old_hw = self.heuristic_weight
+                        self.heuristic_weight = max(0.1, self.heuristic_weight * 0.85)
+                        print(f"Curriculum Update: Heuristic Dependency decayed from {old_hw:.3f} to {self.heuristic_weight:.3f}")
 
-                    self.save_checkpoint(manual=True)
-                    self.student_eval_history.clear()
-                    self.save_meta()
-                else:
-                    print(f"Evaluation threshold not met ({wins}/{games}). Continuing cycle...")
+                        self.save_checkpoint(manual=True)
+                        self.student_eval_history.clear()
+                        self.save_meta()
+                    else:
+                        print(f"Evaluation threshold not met ({wins}/{games}). Continuing cycle...")
 
     def run_headless_training(self, num_games):
         print(f"Starting Headless Turbo Training for {num_games} games...")
@@ -1236,8 +1235,7 @@ class Quoridor:
             winner_id = 0
             
             if self.game_over:
-                if getattr(self, 'winner', None) == "Red": winner_id = 1
-                elif getattr(self, 'winner', None) == "Blue": winner_id = 2
+                winner_id = getattr(self, 'winner_id', 0)
                 
             self.train_step(pre_action_state_tensor, pre_action_pid, next_state_tensor, next_pid, self.game_over, winner_id)
                 
@@ -1347,8 +1345,7 @@ class Quoridor:
                     winner_id = 0
                     
                     if self.game_over:
-                        if getattr(self, 'winner', None) == "Red": winner_id = 1
-                        elif getattr(self, 'winner', None) == "Blue": winner_id = 2
+                        winner_id = getattr(self, 'winner_id', 0)
                         
                     self.train_step(pre_action_state_tensor, pre_action_pid, next_state_tensor, next_pid, self.game_over, winner_id)
 
