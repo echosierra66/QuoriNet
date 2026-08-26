@@ -28,44 +28,66 @@ class TerminalLogger:
 
 sys.stdout = TerminalLogger(sys.stdout)
 
-class SpatialQuoriNet(nn.Module):
-    def __init__(self):
+# ==========================================
+# NEW NEURAL NETWORK ARCHITECTURE
+# ==========================================
+class SpatialQuoriNetV2(nn.Module):
+    def __init__(self, in_channels=8):
+        # Channels: P1 pos, P2 pos, H-wall, V-wall, P1 walls-left, P2 walls-left, P1 path-dist, P2 path-dist
         super().__init__()
-        self.conv_layers = nn.Sequential(
-            nn.Conv2d(5, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
         )
-        self.fc_layers = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64 * 9 * 9, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-            nn.Tanh()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.value_head = nn.Sequential(
+            nn.Linear(64, 64), nn.ReLU(),
+            nn.Linear(64, 1), nn.Tanh()
         )
 
     def forward(self, x):
-        x = self.conv_layers(x)
-        return self.fc_layers(x)
+        x = self.conv(x)
+        x = self.pool(x).flatten(1)
+        return self.value_head(x)
+
+# Global Helper for encode_state distance calcs
+def get_adjacent_global(state, c, r):
+    moves = []
+    if r > 0 and (c, r - 1) not in state['walls_h'] and (c - 1, r - 1) not in state['walls_h']: moves.append((c, r - 1))
+    if r < 8 and (c, r) not in state['walls_h'] and (c - 1, r) not in state['walls_h']: moves.append((c, r + 1))
+    if c > 0 and (c - 1, r) not in state['walls_v'] and (c - 1, r - 1) not in state['walls_v']: moves.append((c - 1, r))
+    if c < 8 and (c, r) not in state['walls_v'] and (c, r - 1) not in state['walls_v']: moves.append((c + 1, r))
+    return moves
+
+def get_shortest_path_dist(state, pid):
+    start_pos = state['p1_pos'] if pid == 1 else state['p2_pos']
+    target_row = 8 if pid == 2 else 0
+    queue = deque([(start_pos, 0)])
+    visited = {start_pos}
+    while queue:
+        pos, dist = queue.popleft()
+        if pos[1] == target_row: return dist
+        for nxt in get_adjacent_global(state, *pos):
+            if nxt not in visited:
+                visited.add(nxt)
+                queue.append((nxt, dist + 1))
+    return 999  # Blocked
 
 def encode_state(state, active_pid):
-    tensor = torch.zeros((5, 9, 9), dtype=torch.float32)
+    # 8 Channels exactly as specified
+    tensor = torch.zeros((8, 9, 9), dtype=torch.float32)
     
-    mx, my = state['p1_pos'] if active_pid == 1 else state['p2_pos']
-    ox, oy = state['p2_pos'] if active_pid == 1 else state['p1_pos']
+    my_pos = state['p1_pos'] if active_pid == 1 else state['p2_pos']
+    opp_pos = state['p2_pos'] if active_pid == 1 else state['p1_pos']
     
     if active_pid == 2:
-        mx, my = 8 - mx, 8 - my
-        ox, oy = 8 - ox, 8 - oy
+        my_pos = (8 - my_pos[0], 8 - my_pos[1])
+        opp_pos = (8 - opp_pos[0], 8 - opp_pos[1])
         
-    tensor[0, my, mx] = 1.0
-    tensor[1, oy, ox] = 1.0
+    tensor[0, my_pos[1], my_pos[0]] = 1.0
+    tensor[1, opp_pos[1], opp_pos[0]] = 1.0
     
     for c, r in state['walls_h']:
         if active_pid == 2: c, r = 7 - c, 7 - r
@@ -77,19 +99,18 @@ def encode_state(state, active_pid):
             
     my_walls = state['p1_walls'] if active_pid == 1 else state['p2_walls']
     opp_walls = state['p2_walls'] if active_pid == 1 else state['p1_walls']
+    my_dist = get_shortest_path_dist(state, active_pid)
+    opp_dist = get_shortest_path_dist(state, 2 if active_pid == 1 else 1)
     
-    tensor[4, 0:4, :] = my_walls / 10.0
-    tensor[4, 5:9, :] = opp_walls / 10.0
+    tensor[4, :, :] = my_walls / 10.0
+    tensor[5, :, :] = opp_walls / 10.0
+    tensor[6, :, :] = my_dist / 81.0
+    tensor[7, :, :] = opp_dist / 81.0
     
     return tensor
 
 def get_state_key(state):
-    return (
-        state['p1_pos'], 
-        state['p2_pos'], 
-        tuple(sorted(state['walls_h'])), 
-        tuple(sorted(state['walls_v']))
-    )
+    return (state['p1_pos'], state['p2_pos'], tuple(sorted(state['walls_h'])), tuple(sorted(state['walls_v'])))
 
 class QuoridorBot:
     def __init__(self, bot_id=2, max_depth=3, nn_model=None, heuristic_weight=1.0):
@@ -134,9 +155,7 @@ class QuoridorBot:
 
         while queue:
             pos, path = queue.popleft()
-            if pos[1] == target_row:
-                return path
-                
+            if pos[1] == target_row: return path
             for nxt in self.get_adjacent(state, *pos):
                 if nxt not in visited:
                     visited.add(nxt)
@@ -144,16 +163,7 @@ class QuoridorBot:
         return None
 
     def get_adjacent(self, state, c, r):
-        moves = []
-        if r > 0 and (c, r - 1) not in state['walls_h'] and (c - 1, r - 1) not in state['walls_h']:
-            moves.append((c, r - 1))
-        if r < 8 and (c, r) not in state['walls_h'] and (c - 1, r) not in state['walls_h']:
-            moves.append((c, r + 1))
-        if c > 0 and (c - 1, r) not in state['walls_v'] and (c - 1, r - 1) not in state['walls_v']:
-            moves.append((c - 1, r))
-        if c < 8 and (c, r) not in state['walls_v'] and (c, r - 1) not in state['walls_v']:
-            moves.append((c + 1, r))
-        return moves
+        return get_adjacent_global(state, c, r)
 
     def get_valid_moves(self, state, pid):
         pos = state['p1_pos'] if pid == 1 else state['p2_pos']
@@ -164,8 +174,8 @@ class QuoridorBot:
             moves.remove(other_pos)
             dc, dr = other_pos[0] - pos[0], other_pos[1] - pos[1]
             jump_straight = (other_pos[0] + dc, other_pos[1] + dr)
-            
             other_adj = self.get_adjacent(state, *other_pos)
+            
             if jump_straight in other_adj:
                 moves.append(jump_straight)
             else:
@@ -179,7 +189,6 @@ class QuoridorBot:
 
     def is_valid_wall(self, state, c, r, orient):
         if not (0 <= c <= 7 and 0 <= r <= 7): return False
-        
         if orient == 'H':
             if (c, r) in state['walls_h'] or (c-1, r) in state['walls_h'] or (c+1, r) in state['walls_h']: return False
             if (c, r) in state['walls_v']: return False
@@ -210,8 +219,7 @@ class QuoridorBot:
             return len(path) if path else 999
 
         valid_moves.sort(key=get_path_dist)
-        for move in valid_moves:
-            actions.append(('move', move))
+        for move in valid_moves: actions.append(('move', move))
             
         walls_left = state['p1_walls'] if pid == 1 else state['p2_walls']
         if walls_left <= 0: return actions
@@ -221,30 +229,19 @@ class QuoridorBot:
         my_path = self.get_shortest_path(state, pid)
         if not opp_path or not my_path: return actions
 
-        base_my_dist = len(my_path)
-        base_opp_dist = len(opp_path)
-
+        base_my_dist, base_opp_dist = len(my_path), len(opp_path)
         candidate_walls = set()
         
-        for i in range(len(opp_path) - 1):
-            c1, r1 = opp_path[i]
-            c2, r2 = opp_path[i+1]
-            if c1 == c2: 
-                r_min = min(r1, r2)
-                candidate_walls.update([(c1, r_min, 'H'), (c1-1, r_min, 'H')])
-            else:
-                c_min = min(c1, c2)
-                candidate_walls.update([(c_min, r1, 'V'), (c_min, r1-1, 'V')])
-                
-        for i in range(len(my_path) - 1):
-            c1, r1 = my_path[i]
-            c2, r2 = my_path[i+1]
-            if c1 == c2: 
-                r_min = min(r1, r2)
-                candidate_walls.update([(c1, r_min, 'H'), (c1-1, r_min, 'H')])
-            else:
-                c_min = min(c1, c2)
-                candidate_walls.update([(c_min, r1, 'V'), (c_min, r1-1, 'V')])
+        for p in (opp_path, my_path):
+            for i in range(len(p) - 1):
+                c1, r1 = p[i]
+                c2, r2 = p[i+1]
+                if c1 == c2: 
+                    r_min = min(r1, r2)
+                    candidate_walls.update([(c1, r_min, 'H'), (c1-1, r_min, 'H')])
+                else:
+                    c_min = min(c1, c2)
+                    candidate_walls.update([(c_min, r1, 'V'), (c_min, r1-1, 'V')])
 
         for placed_walls in (state['walls_h'], state['walls_v']):
             for c, r in placed_walls:
@@ -261,7 +258,6 @@ class QuoridorBot:
                 try:
                     if orient == 'H': state['walls_h'].add((c, r))
                     else: state['walls_v'].add((c, r))
-                    
                     new_opp_path = self.get_shortest_path(state, opponent_id)
                     new_my_path = self.get_shortest_path(state, pid)
                 finally:
@@ -273,16 +269,13 @@ class QuoridorBot:
                     scored_walls.append((delay, ('wall', (c, r, orient))))
 
         scored_walls.sort(key=lambda x: x[0], reverse=True)
-        
         quota = int(4 + (1.0 - self.heuristic_weight) * 20)
         
         for i, (delay, wall_action) in enumerate(scored_walls):
             if i < quota:
                 if delay > 0 or random.random() > self.heuristic_weight:
                     actions.append(wall_action)
-            else:
-                break
-            
+            else: break
         return actions
 
     def rank_and_prune(self, state, actions, pid, top_k=5):
@@ -311,10 +304,8 @@ class QuoridorBot:
         if not p1_path: return 10000 if eval_pid == 2 else -10000
         if not p2_path: return -10000 if eval_pid == 2 else 10000
 
-        d1 = len(p1_path) - 1
-        d2 = len(p2_path) - 1
-        p1_progress = 8 - state['p1_pos'][1]
-        p2_progress = state['p2_pos'][1]
+        d1, d2 = len(p1_path) - 1, len(p2_path) - 1
+        p1_progress, p2_progress = 8 - state['p1_pos'][1], state['p2_pos'][1]
 
         if state['p1_walls'] == 0 and state['p2_walls'] == 0:
             score = (d2 - d1) * 50.0 + (p1_progress - p2_progress) * 10.0
@@ -327,7 +318,6 @@ class QuoridorBot:
                 nn_val = self.nn_model(encode_state(state, eval_pid).unsqueeze(0)).item()
             
             nn_score = nn_val * 100.0
-            
             heur_score = (d2 - d1) * 5.0
             if eval_pid == 2: heur_score = -heur_score
             
@@ -428,7 +418,8 @@ PADDING = int(25 * SCALE)
 BOARD_PIXEL_SIZE = (BOARD_SIZE * CELL_SIZE + (BOARD_SIZE - 1) * WALL_THICKNESS + (PADDING * 2))
 
 SIDEBAR_WIDTH = int(380 * SCALE)
-WIDTH = BOARD_PIXEL_SIZE + SIDEBAR_WIDTH
+LEFT_SIDEBAR_WIDTH = int(370 * SCALE)  # Extended transparency UI space
+WIDTH = BOARD_PIXEL_SIZE + SIDEBAR_WIDTH + LEFT_SIDEBAR_WIDTH
 HEIGHT = BOARD_PIXEL_SIZE + int(120 * SCALE)
 
 class Quoridor:
@@ -450,12 +441,33 @@ class Quoridor:
         else:
             self.screen = pygame.Surface((WIDTH, HEIGHT))
             self.virtual_screen = self.screen
-        
-        self.student_net = SpatialQuoriNet()
-        self.teacher_net = SpatialQuoriNet()
+
+        # Constants from Section 1
+        self.RECENT_WINDOW_SIZE = 5
+        self.RECENT_BUCKET_MASS = 0.60
+        self.HISTORIC_BUCKET_MASS = 0.40
+        self.RECENT_DECAY_RATIO = 2.0
+        self.LOG_WINDOW_SIZE = 30
+        self.MIN_SAMPLES_TRUSTED = 15
+        self.GATE_MIN_GAMES = 30
+        self.GATE_WIN_RATE_THRESHOLD = 0.57
+        self.FULL_EVAL_GAMES_PER_MODEL = 20
+        self.ESCALATION_LOSS_THRESHOLD = 0.50
+        self.ESCALATION_RECOVER_THRESHOLD = 0.65
+        self.ESCALATION_STEP_MULTIPLIER = 1.5
+        self.ESCALATION_MAX_MULTIPLIER = 8.0
+        self.ESCALATION_STALL_LIMIT = 5
+        self.ESCALATION_MAX_SHARE_OF_HISTORIC_BUCKET = 0.15
+        self.LR_MIN_FLOOR = 0.0005
+        self.LR_TRIGGER_PLATEAU_CYCLES = 5
+        self.LR_TRIGGER_EPS = 0.01
+        self.LR_TRIGGER_COOLDOWN_CYCLES = 3
+
+        # State vars
+        self.student_net = SpatialQuoriNetV2(in_channels=8)
+        self.teacher_net = SpatialQuoriNetV2(in_channels=8)
         self.student_net.eval()
         self.teacher_net.eval()
-        
         self.optimizer = optim.Adam(self.student_net.parameters(), lr=0.005)
         self.loss_fn = nn.MSELoss()
         
@@ -477,6 +489,13 @@ class Quoridor:
         self.opponent_pool = []
         self.opponent_weights = []
 
+        # New State from Section 2
+        self.checkpoint_log = {}       
+        self.escalation_state = {}     
+        self.wawr_history = []         
+        self.lr_last_reduced_at_gen = 0
+        self.current_opponent_gen = 1
+
         self.is_evaluating = False
         self.eval_vs_gen = 0
         self.eval_game_curr = 0
@@ -490,65 +509,125 @@ class Quoridor:
         self.toast_msg = ""
         self.toast_timer = 0
         
-        self.rect_play = pygame.Rect(0, 0, 0, 0)
-        self.rect_train = pygame.Rect(0, 0, 0, 0)
-        self.rect_new_game = pygame.Rect(0, 0, 0, 0)
-        self.rect_menu = pygame.Rect(0, 0, 0, 0)
-        self.rect_train_toggle = pygame.Rect(0, 0, 0, 0)
-        
+        self.rect_play, self.rect_train, self.rect_new_game, self.rect_menu, self.rect_train_toggle = [pygame.Rect(0, 0, 0, 0) for _ in range(5)]
         self.game_start_time = time.time()
         self.reset_game()
 
+    # ==========================================
+    # SECTION 4: OPPONENT POOL
+    # ==========================================
     def update_opponent_pool(self):
-        self.opponent_pool = [(self.teacher_net, self.teacher_gen)]
-        self.opponent_weights = [1.0]
+        self.opponent_pool = []
+        self.opponent_weights = []
+
+        recent_start = max(1, self.teacher_gen - self.RECENT_WINDOW_SIZE + 1)
+        recent_gens = list(range(recent_start, self.teacher_gen + 1))
+        recent_entries = []
         
-        for i in range(max(1, self.teacher_gen - 10), self.teacher_gen):
-            file_path = f'quorinet_teacher_gen_{i}.pth'
-            if os.path.exists(file_path):
-                try:
-                    net = SpatialQuoriNet()
-                    net.load_state_dict(torch.load(file_path, weights_only=True))
-                    net.eval()
-                    self.opponent_pool.append((net, i))
-                    age = min(self.teacher_gen - i, 10)
-                    weight = 0.85 ** age
-                    self.opponent_weights.append(weight)
-                except Exception as e:
-                    print(f"Failed to load pool model {i}: {e}")
-        print(f"Opponent pool updated. Size: {len(self.opponent_pool)}")
+        for i, gen in enumerate(recent_gens, start=1):
+            net = self._load_net_for_gen(gen)
+            if net is None: continue
+            raw_weight = self.RECENT_DECAY_RATIO ** i
+            recent_entries.append((net, gen, raw_weight))
+
+        raw_sum = sum(e[2] for e in recent_entries) or 1.0
+        for net, gen, raw_weight in recent_entries:
+            self.opponent_pool.append((net, gen))
+            self.opponent_weights.append(raw_weight / raw_sum * self.RECENT_BUCKET_MASS)
+
+        historic_gens = [g for g in range(1, recent_start) if os.path.exists(f'quorinet_teacher_gen_{g}.pth')]
+        if historic_gens:
+            hist_weights = {}
+            for g in historic_gens:
+                mult = self.escalation_state.get(g, {}).get("multiplier", 1.0)
+                hist_weights[g] = 1.0 * mult
+            hist_weights = self._apply_escalation_cap(hist_weights, self.HISTORIC_BUCKET_MASS, self.ESCALATION_MAX_SHARE_OF_HISTORIC_BUCKET)
+            for g in historic_gens:
+                net = self._load_net_for_gen(g)
+                if net is None: continue
+                self.opponent_pool.append((net, g))
+                self.opponent_weights.append(hist_weights[g])
+
+        print(f"Opponent pool updated. Recent: {len(recent_entries)} | Historic: {len(historic_gens)} | Total weight: {sum(self.opponent_weights):.4f}")
+
+    def _load_net_for_gen(self, gen):
+        if gen == self.teacher_gen: return self.teacher_net
+        path = f'quorinet_teacher_gen_{gen}.pth'
+        if not os.path.exists(path): return None
+        try:
+            net = SpatialQuoriNetV2(in_channels=8)
+            net.load_state_dict(torch.load(path, weights_only=True))
+            net.eval()
+            return net
+        except Exception as e:
+            print(f"Failed to load pool model {gen}: {e}")
+            return None
+
+    def _apply_escalation_cap(self, weights: dict, total_mass: float, max_share: float) -> dict:
+        raw_total = sum(weights.values()) or 1.0
+        normed = {g: w / raw_total * total_mass for g, w in weights.items()}
+        for _ in range(len(normed)):
+            over = {g: w for g, w in normed.items() if w > total_mass * max_share}
+            if not over: break
+            for g in over: normed[g] = total_mass * max_share
+            remaining_mass = total_mass - sum(normed[g] for g in over)
+            remaining_gens = [g for g in normed if g not in over]
+            remaining_raw_total = sum(normed[g] for g in remaining_gens) or 1.0
+            for g in remaining_gens:
+                normed[g] = normed[g] / remaining_raw_total * remaining_mass
+        return normed
+
+    # ==========================================
+    # SECTION 5: ESCALATION STATE
+    # ==========================================
+    def update_escalation_state(self):
+        flags = []
+        for gen, log in self.checkpoint_log.items():
+            if gen >= self.teacher_gen - self.RECENT_WINDOW_SIZE + 1: continue
+            if len(log) < self.MIN_SAMPLES_TRUSTED: continue
+            
+            win_rate = sum(log) / len(log)
+            state = self.escalation_state.setdefault(gen, {"multiplier": 1.0, "stall_count": 0})
+
+            if win_rate < self.ESCALATION_LOSS_THRESHOLD:
+                state["multiplier"] = min(state["multiplier"] * self.ESCALATION_STEP_MULTIPLIER, self.ESCALATION_MAX_MULTIPLIER)
+                if state["multiplier"] >= self.ESCALATION_MAX_MULTIPLIER:
+                    state["stall_count"] += 1
+                else:
+                    state["stall_count"] = 0
+                if state["stall_count"] >= self.ESCALATION_STALL_LIMIT:
+                    flags.append(gen)
+            elif win_rate >= self.ESCALATION_RECOVER_THRESHOLD:
+                state["multiplier"] = 1.0
+                state["stall_count"] = 0
+
+        for gen in flags:
+            print(f"REVIEW_NEEDED: checkpoint gen #{gen} has not recovered above "
+                  f"{self.ESCALATION_RECOVER_THRESHOLD*100:.0f}% after {self.ESCALATION_STALL_LIMIT} "
+                  f"escalated intervals. Weight is capped — investigate encode_state() coverage.")
 
     def print_headless_metrics(self):
         if not self.headless: return
         eval_score = round(self.bot1.evaluate(self.state, self.state['turn']), 1)
         current_lr = self.optimizer.param_groups[0]['lr']
-        
         print(f"\n--- MATCH #{self.games_played} TERMINAL METRICS ---")
         print(f"Red Player (P1):  {self.p1_gen_str}")
         print(f"Blue Player (P2): {self.p2_gen_str}")
         print(f"Latest Teacher:   Gen #{self.teacher_gen}")
         print(f"Heuristic Dep:   {self.heuristic_weight:.3f}")
         print(f"Studt Win Rate:  {self.student_win_rate_str}")
-        print(f"Eval Progress:   {len(self.student_eval_history)}/30 min games")
-        print(f"AI Board Eval:   {eval_score}")
-        print(f"Learning Rate:   {current_lr:.6f}")
-        print(f"Training Loss:   {self.last_loss:.5f}")
+        print(f"AI Board Eval:   {eval_score} | LR: {current_lr:.6f} | Loss: {self.last_loss:.5f}")
         print("----------------------------------------\n")
 
     def get_virtual_mouse_pos(self):
         mx, my = pygame.mouse.get_pos()
         sw, sh = self.screen.get_size()
         if sw <= 0 or sh <= 0: return mx, my
-        vx = int(mx * (WIDTH / sw))
-        vy = int(my * (HEIGHT / sh))
-        return vx, vy
+        return int(mx * (WIDTH / sw)), int(my * (HEIGHT / sh))
 
     def toggle_fullscreen(self):
         self.is_fullscreen = not self.is_fullscreen
-        if self.is_fullscreen:
-            self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-        else:
-            self.screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
+        self.screen = pygame.display.set_mode((0, 0) if self.is_fullscreen else (WIDTH, HEIGHT), pygame.FULLSCREEN if self.is_fullscreen else pygame.RESIZABLE)
 
     def render_and_flip(self):
         if self.headless: return
@@ -561,9 +640,7 @@ class Quoridor:
             'p1_pos': (4, 8), 'p2_pos': (4, 0),
             'p1_walls': 10, 'p2_walls': 10,
             'walls_h': set(), 'walls_v': set(),
-            'turn': 1,
-            'turns_played': 0,
-            'history': set()
+            'turn': 1, 'turns_played': 0, 'history': set()
         }
         self.wall_orientation = 'H'
         self.game_over = False
@@ -574,26 +651,25 @@ class Quoridor:
         if getattr(self, 'mode', 'MENU') == 'TRAIN':
             if hasattr(self, 'opponent_pool') and self.opponent_pool:
                 pool_opponent, pool_gen = random.choices(self.opponent_pool, weights=self.opponent_weights, k=1)[0]
+                self.current_opponent_gen = pool_gen
             else:
                 pool_opponent, pool_gen = self.teacher_net, self.teacher_gen
+                self.current_opponent_gen = pool_gen
             
             if self.games_played % 2 == 0:
                 self.bot1 = QuoridorBot(bot_id=1, max_depth=2, nn_model=pool_opponent, heuristic_weight=self.heuristic_weight)
                 self.bot2 = QuoridorBot(bot_id=2, max_depth=2, nn_model=self.student_net, heuristic_weight=self.heuristic_weight)
                 self.student_id = 2
-                self.p1_gen_str = f"Gen #{pool_gen} (Teacher)"
-                self.p2_gen_str = f"Gen #{self.teacher_gen} (Student)"
+                self.p1_gen_str, self.p2_gen_str = f"Gen #{pool_gen} (Teacher)", f"Gen #{self.teacher_gen} (Student)"
             else:
                 self.bot1 = QuoridorBot(bot_id=1, max_depth=2, nn_model=self.student_net, heuristic_weight=self.heuristic_weight) 
                 self.bot2 = QuoridorBot(bot_id=2, max_depth=2, nn_model=pool_opponent, heuristic_weight=self.heuristic_weight) 
                 self.student_id = 1
-                self.p1_gen_str = f"Gen #{self.teacher_gen} (Student)"
-                self.p2_gen_str = f"Gen #{pool_gen} (Teacher)"
+                self.p1_gen_str, self.p2_gen_str = f"Gen #{self.teacher_gen} (Student)", f"Gen #{pool_gen} (Teacher)"
         else:
             self.bot1 = QuoridorBot(bot_id=1, max_depth=4, nn_model=self.teacher_net, heuristic_weight=self.heuristic_weight)
             self.bot2 = QuoridorBot(bot_id=2, max_depth=4, nn_model=self.teacher_net, heuristic_weight=self.heuristic_weight)
-            self.p1_gen_str = "Human"
-            self.p2_gen_str = f"Gen #{self.teacher_gen} (Teacher)"
+            self.p1_gen_str, self.p2_gen_str = "Human", f"Gen #{self.teacher_gen} (Teacher)"
 
         self.p1_draw_x, self.p1_draw_y = self._get_center_pixels(self.state['p1_pos'])
         self.p2_draw_x, self.p2_draw_y = self._get_center_pixels(self.state['p2_pos'])
@@ -603,17 +679,12 @@ class Quoridor:
         if os.path.exists('quorinet_teacher_weights.pth'):
             try:
                 self.teacher_net.load_state_dict(torch.load('quorinet_teacher_weights.pth', weights_only=True))
-                print("Loaded Teacher Checkpoint.")
                 teacher_loaded = True
-            except Exception as e:
-                print(f"Failed teacher checkpoint: {e}")
+            except: pass
                 
         if os.path.exists('quorinet_student_weights.pth'):
-            try:
-                self.student_net.load_state_dict(torch.load('quorinet_student_weights.pth', weights_only=True))
-                print("Loaded Student Checkpoint.")
-            except Exception as e:
-                print(f"Failed student checkpoint: {e}")
+            try: self.student_net.load_state_dict(torch.load('quorinet_student_weights.pth', weights_only=True))
+            except: pass
         elif teacher_loaded:
             self.student_net.load_state_dict(self.teacher_net.state_dict())
 
@@ -625,16 +696,17 @@ class Quoridor:
                     self.games_played = meta.get('games_played', 0)
                     self.teacher_gen = meta.get('teacher_gen', 1)
                     self.heuristic_weight = meta.get('heuristic_weight', 1.0)
-                    
                     eval_hist = meta.get('student_eval_history', [])
                     self.student_eval_history = deque(eval_hist, maxlen=100)
                     if self.student_eval_history:
-                        wins = sum(self.student_eval_history)
-                        games = len(self.student_eval_history)
+                        wins, games = sum(self.student_eval_history), len(self.student_eval_history)
                         self.student_win_rate_str = f"{wins/games * 100:.1f}% ({wins}/{games})"
-            except Exception:
-                pass
-        print(f"Total Games Played: {self.games_played} | Teacher Gen: #{self.teacher_gen} | Heuristic W: {self.heuristic_weight:.3f}")
+                    
+                    self.checkpoint_log = {int(k): deque(v, maxlen=self.LOG_WINDOW_SIZE) for k, v in meta.get('checkpoint_log', {}).items()}
+                    self.escalation_state = {int(k): v for k, v in meta.get('escalation_state', {}).items()}
+                    self.wawr_history = meta.get('wawr_history', [])
+                    self.lr_last_reduced_at_gen = meta.get('lr_last_reduced_at_gen', 0)
+            except Exception: pass
 
     def save_meta(self):
         with open('quorinet_meta.json', 'w') as f:
@@ -642,39 +714,31 @@ class Quoridor:
                 'games_played': self.games_played,
                 'teacher_gen': self.teacher_gen,
                 'heuristic_weight': self.heuristic_weight,
-                'student_eval_history': list(self.student_eval_history)
+                'student_eval_history': list(self.student_eval_history),
+                'checkpoint_log': {k: list(v) for k, v in self.checkpoint_log.items()},
+                'escalation_state': self.escalation_state,
+                'wawr_history': self.wawr_history,
+                'lr_last_reduced_at_gen': self.lr_last_reduced_at_gen
             }, f)
 
     def save_checkpoint(self, manual=False):
         torch.save(self.teacher_net.state_dict(), f'quorinet_teacher_gen_{self.teacher_gen}.pth')
         torch.save(self.teacher_net.state_dict(), 'quorinet_teacher_weights.pth')
         torch.save(self.student_net.state_dict(), 'quorinet_student_weights.pth')
-        
         self.save_meta()
-            
-        tag = "Manual" if manual else "Auto"
-        print(f"[{tag} Saved] Gen #{self.teacher_gen} saved ({self.games_played} games).")
-        
-        self.toast_msg = f"Saved Checkpoint! (Gen #{self.teacher_gen})"
-        self.toast_timer = 120
+        print(f"[{'Manual' if manual else 'Auto'} Saved] Gen #{self.teacher_gen} saved.")
+        self.toast_msg, self.toast_timer = f"Saved Checkpoint! (Gen #{self.teacher_gen})", 120
 
     def play_eval_game(self, bot1, bot2, game_curr, game_total, vs_gen):
         eval_state = {
             'p1_pos': (4, 8), 'p2_pos': (4, 0),
             'p1_walls': 10, 'p2_walls': 10,
             'walls_h': set(), 'walls_v': set(),
-            'turn': 1,
-            'turns_played': 0,
-            'history': set()
+            'turn': 1, 'turns_played': 0, 'history': set()
         }
-        
-        self.eval_game_curr = game_curr
-        self.eval_game_total = game_total
-        self.eval_vs_gen = vs_gen
-
+        self.eval_game_curr, self.eval_game_total, self.eval_vs_gen = game_curr, game_total, vs_gen
         saved_state = self.state
         self.state = eval_state
-
         result = 0
         try:
             for _ in range(200):
@@ -683,20 +747,13 @@ class Quoridor:
                         if event.type == pygame.QUIT:
                             pygame.quit()
                             sys.exit()
-                        if event.type == pygame.KEYDOWN and event.key in (pygame.K_F11, pygame.K_f):
-                            self.toggle_fullscreen()
-
                     self.p1_draw_x, self.p1_draw_y = self._get_center_pixels(eval_state['p1_pos'])
                     self.p2_draw_x, self.p2_draw_y = self._get_center_pixels(eval_state['p2_pos'])
                     self.draw_board((-1, -1))
                     pygame.time.delay(10)
 
-                if eval_state['p1_pos'][1] == 0:
-                    result = 1
-                    break
-                if eval_state['p2_pos'][1] == 8:
-                    result = 2
-                    break
+                if eval_state['p1_pos'][1] == 0: result = 1; break
+                if eval_state['p2_pos'][1] == 8: result = 2; break
                 
                 pid = eval_state['turn']
                 active_bot = bot1 if pid == 1 else bot2
@@ -708,49 +765,36 @@ class Quoridor:
                 self.state = eval_state
         finally:
             self.state = saved_state
-
         return result
 
-    def evaluate_and_tune_lr(self, games_per_model=10):
+    # ==========================================
+    # SECTION 6: EVALUATE AND TUNE LR
+    # ==========================================
+    def evaluate_and_tune_lr(self, games_per_model=20):
         if self.teacher_gen <= 1:
             print("No previous historical models available to evaluate against.")
             return 1.0
-            
-        recent_gens = list(range(max(1, self.teacher_gen - 1), self.teacher_gen + 1))
-        older_gens = list(range(1, max(1, self.teacher_gen - 1)))
-        
-        if len(older_gens) > 3:
-            milestone_gens = random.sample(older_gens, 3)
-            milestone_gens.sort()
-        else:
-            milestone_gens = older_gens
-            
-        eval_gens = milestone_gens + recent_gens
-        
-        print(f"\n--- Starting Historical Pool Evaluation (Candidate Gen #{self.teacher_gen + 1}) ---")
-        print(f"Evaluating candidate against sampled generations: {eval_gens}")
+
+        eval_gens = list(range(1, self.teacher_gen + 1))
+        print(f"\n--- Full Historical Evaluation (Candidate Gen #{self.teacher_gen + 1}) ---")
+        print(f"Evaluating candidate against ALL {len(eval_gens)} generations, {games_per_model} games each.")
 
         self.is_evaluating = True
         total_eval_games = len(eval_gens) * games_per_model
         completed_eval_games = 0
-
-        weighted_wins = 0.0
-        weighted_total = 0.0
+        weighted_wins, weighted_total = 0.0, 0.0
         decay_factor = 0.85
-        passed_all_tiers = True
         
         try:
             for gen_i in eval_gens:
                 file_path = f'quorinet_teacher_gen_{gen_i}.pth'
-                if not os.path.exists(file_path):
-                    continue
+                if not os.path.exists(file_path): continue
                     
-                past_net = SpatialQuoriNet()
+                past_net = SpatialQuoriNetV2(in_channels=8)
                 try:
                     past_net.load_state_dict(torch.load(file_path, weights_only=True))
                     past_net.eval()
-                except Exception as e:
-                    continue
+                except Exception: continue
                     
                 gen_wins = 0
                 for g in range(games_per_model):
@@ -759,97 +803,88 @@ class Quoridor:
                         eval_bot1 = QuoridorBot(bot_id=1, max_depth=2, nn_model=self.student_net, heuristic_weight=self.heuristic_weight)
                         eval_bot2 = QuoridorBot(bot_id=2, max_depth=2, nn_model=past_net, heuristic_weight=self.heuristic_weight)
                         res = self.play_eval_game(eval_bot1, eval_bot2, completed_eval_games, total_eval_games, gen_i)
-                        if res == 1: gen_wins += 1
+                        student_won = 1 if res == 1 else 0
                     else:
                         eval_bot1 = QuoridorBot(bot_id=1, max_depth=2, nn_model=past_net, heuristic_weight=self.heuristic_weight)
                         eval_bot2 = QuoridorBot(bot_id=2, max_depth=2, nn_model=self.student_net, heuristic_weight=self.heuristic_weight)
                         res = self.play_eval_game(eval_bot1, eval_bot2, completed_eval_games, total_eval_games, gen_i)
-                        if res == 2: gen_wins += 1
+                        student_won = 1 if res == 2 else 0
+                    
+                    if student_won: gen_wins += 1
+                    
+                    # Section 3 requirement applied to evaluation loops
+                    if gen_i not in self.checkpoint_log:
+                        self.checkpoint_log[gen_i] = deque(maxlen=self.LOG_WINDOW_SIZE)
+                    self.checkpoint_log[gen_i].append(student_won)
                 
                 gen_win_rate = gen_wins / games_per_model
                 age = min(self.teacher_gen - gen_i, 10)
                 weight = decay_factor ** age
-                
                 weighted_wins += gen_win_rate * weight
                 weighted_total += weight
-                
-                required_threshold = min(0.55 + (0.05 * age), 0.85)
-                tier_status = "PASS" if gen_win_rate >= required_threshold else "FAIL"
-                if tier_status == "FAIL": passed_all_tiers = False
-                    
-                print(f"Vs Gen #{gen_i} (Age {age}): {gen_wins}/{games_per_model} wins | Req: {required_threshold * 100:.1f}% [{tier_status}]")
+                req = min(0.55 + (0.05 * age), 0.85)
+                print(f"Vs Gen #{gen_i} (Age {age}): {gen_wins}/{games_per_model} wins | Req: {req * 100:.1f}% [{'PASS' if gen_win_rate >= req else 'FAIL'}]")
         finally:
             self.is_evaluating = False
 
-        if weighted_total == 0:
-            return 1.0
-            
+        if weighted_total == 0: return 1.0
         final_weighted_win_rate = weighted_wins / weighted_total
         print(f"Overall Weighted Pool Win Rate: {final_weighted_win_rate * 100:.1f}%")
         
-        lr_scale = max(0.5, 1.0 - (0.3 * final_weighted_win_rate))
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] *= lr_scale
-            print(f"Learning Rate adjusted to: {param_group['lr']:.6f} (Scale factor: {lr_scale:.3f} based on win rate)")
-                
+        self.wawr_history.append(final_weighted_win_rate)
+        plateaued = (len(self.wawr_history) >= self.LR_TRIGGER_PLATEAU_CYCLES and 
+                    (max(self.wawr_history[-self.LR_TRIGGER_PLATEAU_CYCLES:]) - min(self.wawr_history[-self.LR_TRIGGER_PLATEAU_CYCLES:])) <= self.LR_TRIGGER_EPS)
+        cooldown_ok = (self.teacher_gen - self.lr_last_reduced_at_gen) >= self.LR_TRIGGER_COOLDOWN_CYCLES
+
+        if final_weighted_win_rate >= 0.75 and plateaued and cooldown_ok:
+            lr_scale = max(0.5, 1.0 - (0.3 * final_weighted_win_rate))
+            for param_group in self.optimizer.param_groups:
+                new_lr = max(param_group['lr'] * lr_scale, self.LR_MIN_FLOOR)
+                param_group['lr'] = new_lr
+                print(f"LR reduced to {new_lr:.6f} (plateau confirmed, WAWR={final_weighted_win_rate:.3f})")
+            self.lr_last_reduced_at_gen = self.teacher_gen
+        else:
+            print(f"LR unchanged. WAWR={final_weighted_win_rate:.3f}, plateaued={plateaued}, cooldown_ok={cooldown_ok}")
+
         return final_weighted_win_rate
 
     def train_step(self, state_tensor, turn_pid, next_state_tensor, next_turn_pid, done, winner_id):
         gamma = 0.99
-        
         if done:
-            if winner_id == 0: 
-                target = 0.0
-            else:
-                target = 1.0 if turn_pid == winner_id else -1.0
+            target = 0.0 if winner_id == 0 else (1.0 if turn_pid == winner_id else -1.0)
         else:
             with torch.no_grad():
                 next_val = self.teacher_net(next_state_tensor.unsqueeze(0)).item()
-            
-            if next_turn_pid == turn_pid:
-                target = gamma * next_val
-            else:
-                target = gamma * (-next_val)
+            target = gamma * next_val if next_turn_pid == turn_pid else gamma * (-next_val)
                 
         self.replay_buffer.append((state_tensor, target))
-        
         if len(self.replay_buffer) >= 256:
             self.student_net.train()
             batch = random.sample(self.replay_buffer, 128)
             states = torch.stack([item[0] for item in batch])
             targets = torch.tensor([[item[1]] for item in batch], dtype=torch.float32)
-
             self.optimizer.zero_grad()
             predictions = self.student_net(states)
             loss = self.loss_fn(predictions, targets)
             loss.backward()
             self.optimizer.step()
-            
             self.last_loss = loss.item()
             self.student_net.eval()
 
     def log_match_result(self, winner_id):
         duration = round(time.time() - self.game_start_time, 1)
-        
-        if winner_id == 0:
-            winner_str = "Draw"
-        elif getattr(self, 'mode', 'TRAIN') == "TRAIN":
-            winner_str = "Student" if winner_id == self.student_id else "Teacher"
-        else:
-            winner_str = "Human" if winner_id == 1 else "Teacher"
+        if winner_id == 0: winner_str = "Draw"
+        elif getattr(self, 'mode', 'TRAIN') == "TRAIN": winner_str = "Student" if winner_id == self.student_id else "Teacher"
+        else: winner_str = "Human" if winner_id == 1 else "Teacher"
             
         self.match_history.appendleft({
-            'game': self.games_played + 1,
-            'winner': winner_str,
-            'winner_id': winner_id,
-            'turns': self.state['turns_played'],
-            'time': duration,
-            'p1_w': self.state['p1_walls'],
-            'p2_w': self.state['p2_walls']
+            'game': self.games_played + 1, 'winner': winner_str, 'winner_id': winner_id,
+            'turns': self.state['turns_played'], 'time': duration,
+            'p1_w': self.state['p1_walls'], 'p2_w': self.state['p2_walls']
         })
 
     def _get_center_pixels(self, pos):
-        offset_x, offset_y = PADDING, int(85 * SCALE) + PADDING
+        offset_x, offset_y = PADDING + LEFT_SIDEBAR_WIDTH, int(85 * SCALE) + PADDING
         x = offset_x + pos[0] * (CELL_SIZE + WALL_THICKNESS) + CELL_SIZE / 2
         y = offset_y + pos[1] * (CELL_SIZE + WALL_THICKNESS) + CELL_SIZE / 2
         return x, y
@@ -857,7 +892,7 @@ class Quoridor:
     def draw_menu(self):
         if self.headless: return
         self.virtual_screen.fill(BG_COLOR)
-        title = self.title_font.render("QuoriNet AI", True, TEXT_COLOR)
+        title = self.title_font.render("QuoriNet AI Engine", True, TEXT_COLOR)
         self.virtual_screen.blit(title, (WIDTH // 2 - title.get_width() // 2, int(100 * SCALE)))
 
         btn_w, btn_h = int(240 * SCALE), int(60 * SCALE)
@@ -873,11 +908,72 @@ class Quoridor:
 
         hint_txt = self.tiny_font.render("[Press F11 or F to toggle Fullscreen]", True, MUTED_TEXT)
         self.virtual_screen.blit(hint_txt, (WIDTH // 2 - hint_txt.get_width() // 2, int(420 * SCALE)))
-
         self.render_and_flip()
 
-    def draw_sidebar(self):
-        sb_x = BOARD_PIXEL_SIZE
+    def draw_left_sidebar(self):
+        sb_x = 0
+        sb_w = LEFT_SIDEBAR_WIDTH
+        sidebar_rect = pygame.Rect(sb_x, 0, sb_w, HEIGHT)
+        pygame.draw.rect(self.virtual_screen, SIDEBAR_BG, sidebar_rect)
+        pygame.draw.line(self.virtual_screen, (215, 220, 228), (sb_w, 0), (sb_w, HEIGHT), int(2 * SCALE))
+
+        padding = int(12 * SCALE)
+        card_w = sb_w - (padding * 2)
+
+        # CARD 1: Opponent Pool Distribution
+        card1_rect = pygame.Rect(padding, int(15 * SCALE), card_w, int(300 * SCALE))
+        pygame.draw.rect(self.virtual_screen, CARD_BG, card1_rect, border_radius=int(10 * SCALE))
+        
+        m_title = self.small_font.render("OPPONENT POOL DIST", True, TEXT_COLOR)
+        self.virtual_screen.blit(m_title, (card1_rect.x + int(10 * SCALE), card1_rect.y + int(8 * SCALE)))
+        pygame.draw.line(self.virtual_screen, (235, 238, 242), (card1_rect.x + int(10 * SCALE), card1_rect.y + int(28 * SCALE)), (card1_rect.right - int(10 * SCALE), card1_rect.y + int(28 * SCALE)))
+
+        headers = [("Gen", 10), ("Prob Weight", 70), ("Bucket Type", 170)]
+        for h_text, h_pos in headers:
+            h_surf = self.tiny_font.render(h_text, True, MUTED_TEXT)
+            self.virtual_screen.blit(h_surf, (card1_rect.x + int(h_pos * SCALE), card1_rect.y + int(31 * SCALE)))
+            
+        y_offset = card1_rect.y + int(48 * SCALE)
+        for i, (net, gen) in enumerate(reversed(self.opponent_pool)):
+            if y_offset > card1_rect.bottom - int(20 * SCALE): break
+            weight = self.opponent_weights[len(self.opponent_pool) - 1 - i]
+            b_type = "Recent" if gen >= self.teacher_gen - self.RECENT_WINDOW_SIZE + 1 else "Historic (Capped)"
+            c1 = P1_COLOR if gen == self.current_opponent_gen else TEXT_COLOR
+            self.virtual_screen.blit(self.tiny_font.render(f"#{gen}", True, c1), (card1_rect.x + int(10 * SCALE), y_offset))
+            self.virtual_screen.blit(self.tiny_font.render(f"{weight*100:.1f}%", True, TEXT_COLOR), (card1_rect.x + int(70 * SCALE), y_offset))
+            self.virtual_screen.blit(self.tiny_font.render(b_type, True, MUTED_TEXT), (card1_rect.x + int(170 * SCALE), y_offset))
+            y_offset += int(16 * SCALE)
+
+        # CARD 2: Escalation & Win Rates
+        card2_y = int(325 * SCALE)
+        card2_rect = pygame.Rect(padding, card2_y, card_w, HEIGHT - card2_y - int(15 * SCALE))
+        pygame.draw.rect(self.virtual_screen, CARD_BG, card2_rect, border_radius=int(10 * SCALE))
+        e_title = self.small_font.render("ESCALATION STATES", True, TEXT_COLOR)
+        self.virtual_screen.blit(e_title, (card2_rect.x + int(10 * SCALE), card2_rect.y + int(8 * SCALE)))
+        pygame.draw.line(self.virtual_screen, (235, 238, 242), (card2_rect.x + int(10 * SCALE), card2_rect.y + int(28 * SCALE)), (card2_rect.right - int(10 * SCALE), card2_rect.y + int(28 * SCALE)))
+
+        headers2 = [("Gen", 10), ("WinRate", 50), ("Samples", 120), ("Multiplier", 180), ("Stalls", 260)]
+        for h_text, h_pos in headers2:
+            self.virtual_screen.blit(self.tiny_font.render(h_text, True, MUTED_TEXT), (card2_rect.x + int(h_pos * SCALE), card2_rect.y + int(31 * SCALE)))
+
+        y_offset = card2_rect.y + int(48 * SCALE)
+        for gen in sorted(self.checkpoint_log.keys(), reverse=True):
+            if y_offset > card2_rect.bottom - int(20 * SCALE): break
+            log = self.checkpoint_log[gen]
+            samples = len(log)
+            wr = (sum(log)/samples*100) if samples > 0 else 0
+            state = self.escalation_state.get(gen, {"multiplier": 1.0, "stall_count": 0})
+            
+            wr_col = (180, 50, 50) if wr < (self.ESCALATION_LOSS_THRESHOLD*100) else TEXT_COLOR
+            self.virtual_screen.blit(self.tiny_font.render(f"#{gen}", True, TEXT_COLOR), (card2_rect.x + int(10 * SCALE), y_offset))
+            self.virtual_screen.blit(self.tiny_font.render(f"{wr:.1f}%", True, wr_col), (card2_rect.x + int(50 * SCALE), y_offset))
+            self.virtual_screen.blit(self.tiny_font.render(str(samples), True, TEXT_COLOR), (card2_rect.x + int(120 * SCALE), y_offset))
+            self.virtual_screen.blit(self.tiny_font.render(f"{state['multiplier']:.1f}x", True, TEXT_COLOR), (card2_rect.x + int(180 * SCALE), y_offset))
+            self.virtual_screen.blit(self.tiny_font.render(str(state['stall_count']), True, TEXT_COLOR), (card2_rect.x + int(260 * SCALE), y_offset))
+            y_offset += int(16 * SCALE)
+
+    def draw_right_sidebar(self):
+        sb_x = BOARD_PIXEL_SIZE + LEFT_SIDEBAR_WIDTH
         sb_w = SIDEBAR_WIDTH
         
         sidebar_rect = pygame.Rect(sb_x, 0, sb_w, HEIGHT)
@@ -898,11 +994,7 @@ class Quoridor:
         eval_score = round(self.bot1.evaluate(self.state, self.state['turn']), 1)
         eval_counter_str = f"{len(self.student_eval_history)}/30 min games"
         current_lr = self.optimizer.param_groups[0]['lr']
-
-        if self.is_evaluating:
-            eval_phase_str = f"Vs Gen #{self.eval_vs_gen} ({self.eval_game_curr}/{self.eval_game_total})"
-        else:
-            eval_phase_str = "Idle"
+        eval_phase_str = f"Vs Gen #{self.eval_vs_gen} ({self.eval_game_curr}/{self.eval_game_total})" if self.is_evaluating else "Idle"
 
         metrics = [
             ("Red Player (P1)", self.p1_gen_str),
@@ -935,18 +1027,15 @@ class Quoridor:
 
         headers = [("Game", 10), ("Winner", 60), ("Turns", 150), ("Time", 210)]
         for h_text, h_pos in headers:
-            h_surf = self.tiny_font.render(h_text, True, MUTED_TEXT)
-            self.virtual_screen.blit(h_surf, (card2_rect.x + int(h_pos * SCALE), card2_rect.y + int(31 * SCALE)))
+            self.virtual_screen.blit(self.tiny_font.render(h_text, True, MUTED_TEXT), (card2_rect.x + int(h_pos * SCALE), card2_rect.y + int(31 * SCALE)))
 
         hy_offset = card2_rect.y + int(48 * SCALE)
         for log in reversed(list(self.match_history)[:4]):
             w_color = MUTED_TEXT if log.get('winner_id') == 0 else TEXT_COLOR
-            
             self.virtual_screen.blit(self.tiny_font.render(f"#{log['game']}", True, TEXT_COLOR), (card2_rect.x + int(10 * SCALE), hy_offset))
             self.virtual_screen.blit(self.tiny_font.render(log['winner'], True, w_color), (card2_rect.x + int(60 * SCALE), hy_offset))
             self.virtual_screen.blit(self.tiny_font.render(str(log['turns']), True, TEXT_COLOR), (card2_rect.x + int(150 * SCALE), hy_offset))
             self.virtual_screen.blit(self.tiny_font.render(f"{log['time']}s", True, TEXT_COLOR), (card2_rect.x + int(210 * SCALE), hy_offset))
-            
             hy_offset += int(18 * SCALE)
 
         term_y = int(388 * SCALE)
@@ -961,47 +1050,41 @@ class Quoridor:
         logs_to_show = list(sys.stdout.logs)[-12:]
         ty_offset = card3_rect.y + int(26 * SCALE)
         for line in logs_to_show:
-            if ty_offset + int(13 * SCALE) > card3_rect.bottom - int(5 * SCALE):
-                break
+            if ty_offset + int(13 * SCALE) > card3_rect.bottom - int(5 * SCALE): break
             line_str = line[:38] + ".." if len(line) > 40 else line
-            log_surf = self.console_font.render(line_str, True, TERMINAL_TEXT)
-            self.virtual_screen.blit(log_surf, (card3_rect.x + int(10 * SCALE), ty_offset))
+            self.virtual_screen.blit(self.console_font.render(line_str, True, TERMINAL_TEXT), (card3_rect.x + int(10 * SCALE), ty_offset))
             ty_offset += int(14 * SCALE)
 
     def draw_board(self, mouse_pos):
         if self.headless: return 'none', -1, -1, self.wall_orientation
         self.virtual_screen.fill(BG_COLOR)
         
-        p1_txt = self.small_font.render(f"Red ({self.p1_gen_str}) · {self.state['p1_walls']}", True, TEXT_COLOR)
-        p2_txt = self.small_font.render(f"{self.state['p2_walls']} · Blue ({self.p2_gen_str})", True, TEXT_COLOR)
-        self.virtual_screen.blit(p1_txt, (int(20 * SCALE), int(35 * SCALE)))
-        self.virtual_screen.blit(p2_txt, (BOARD_PIXEL_SIZE - p2_txt.get_width() - int(20 * SCALE), int(35 * SCALE)))
+        c_p1_w, c_p2_w = self.state['p1_walls'], self.state['p2_walls']
+        p1_txt = self.small_font.render(f"Red ({self.p1_gen_str}) · {c_p1_w}", True, TEXT_COLOR)
+        p2_txt = self.small_font.render(f"{c_p2_w} · Blue ({self.p2_gen_str})", True, TEXT_COLOR)
+        self.virtual_screen.blit(p1_txt, (LEFT_SIDEBAR_WIDTH + int(20 * SCALE), int(35 * SCALE)))
+        self.virtual_screen.blit(p2_txt, (LEFT_SIDEBAR_WIDTH + BOARD_PIXEL_SIZE - p2_txt.get_width() - int(20 * SCALE), int(35 * SCALE)))
 
-        if self.game_over:
-            status_text = "Draw" if self.winner == "Draw" else f"{self.winner} won!"
-            status_color = MUTED_TEXT if self.winner == "Draw" else TEXT_COLOR
-        else:
-            status_text = "Red's turn" if self.state['turn'] == 1 else "Blue's turn"
-            status_color = P1_COLOR if self.state['turn'] == 1 else P2_COLOR
-
+        center_x = LEFT_SIDEBAR_WIDTH + BOARD_PIXEL_SIZE // 2
+        status_text = "Draw" if self.winner == "Draw" else f"{self.winner} won!" if self.game_over else ("Red's turn" if self.state['turn'] == 1 else "Blue's turn")
+        status_color = MUTED_TEXT if self.winner == "Draw" else (TEXT_COLOR if self.game_over else (P1_COLOR if self.state['turn'] == 1 else P2_COLOR))
         status_surf = self.small_font.render(status_text, True, status_color)
-        self.virtual_screen.blit(status_surf, status_surf.get_rect(center=(BOARD_PIXEL_SIZE // 2, int(35 * SCALE))))
+        self.virtual_screen.blit(status_surf, status_surf.get_rect(center=(center_x, int(35 * SCALE))))
         
         if self.mode == "TRAIN":
             if self.is_evaluating:
-                rem_games = self.eval_game_total - self.eval_game_curr
-                status_lbl = f"EVAL: vs Gen #{self.eval_vs_gen} | Game {self.eval_game_curr}/{self.eval_game_total} ({rem_games} left)"
-                games_txt = self.small_font.render(status_lbl, True, (230, 110, 20))
+                rem = self.eval_game_total - self.eval_game_curr
+                games_txt = self.small_font.render(f"EVAL: vs Gen #{self.eval_vs_gen} | {self.eval_game_curr}/{self.eval_game_total} ({rem} left)", True, (230, 110, 20))
             else:
-                status_lbl = "TRAINING PAUSED" if not self.is_training_active else f"Games: {self.games_played} | Turns: {self.state['turns_played']}"
-                games_txt = self.small_font.render(status_lbl, True, (180, 50, 50) if not self.is_training_active else P2_COLOR)
-            self.virtual_screen.blit(games_txt, (BOARD_PIXEL_SIZE // 2 - games_txt.get_width() // 2, int(58 * SCALE)))
+                lbl = "TRAINING PAUSED" if not self.is_training_active else f"Games: {self.games_played} | Turns: {self.state['turns_played']}"
+                games_txt = self.small_font.render(lbl, True, (180, 50, 50) if not self.is_training_active else P2_COLOR)
+            self.virtual_screen.blit(games_txt, (center_x - games_txt.get_width() // 2, int(58 * SCALE)))
 
-        board_rect = pygame.Rect(int(12 * SCALE), int(78 * SCALE), BOARD_PIXEL_SIZE - int(24 * SCALE), BOARD_PIXEL_SIZE - int(12 * SCALE))
+        board_rect = pygame.Rect(LEFT_SIDEBAR_WIDTH + int(12 * SCALE), int(78 * SCALE), BOARD_PIXEL_SIZE - int(24 * SCALE), BOARD_PIXEL_SIZE - int(12 * SCALE))
         pygame.draw.rect(self.virtual_screen, (224, 227, 232), board_rect.move(0, int(4 * SCALE)), border_radius=int(18 * SCALE))
         pygame.draw.rect(self.virtual_screen, BOARD_BG, board_rect, border_radius=int(18 * SCALE))
 
-        offset_x, offset_y = PADDING, int(85 * SCALE) + PADDING
+        offset_x, offset_y = PADDING + LEFT_SIDEBAR_WIDTH, int(85 * SCALE) + PADDING
         valid_moves = []
         if not self.game_over and self.mode == "PLAY":
             valid_moves = self.bot2.get_valid_moves(self.state, self.state['turn'])
@@ -1012,11 +1095,9 @@ class Quoridor:
         hover_type, hover_c, hover_r = 'none', -1, -1
         active_orient = self.wall_orientation
 
-        board_size_px = BOARD_SIZE * CELL_SIZE + (BOARD_SIZE - 1) * WALL_THICKNESS
-        if 0 <= local_x <= board_size_px and 0 <= local_y <= board_size_px and not self.game_over:
+        if 0 <= local_x <= (BOARD_SIZE * CELL_SIZE + (BOARD_SIZE - 1) * WALL_THICKNESS) and 0 <= local_y <= (BOARD_SIZE * CELL_SIZE + (BOARD_SIZE - 1) * WALL_THICKNESS) and not self.game_over:
             c_idx, r_idx = int(local_x // unit), int(local_y // unit)
             rx, ry = local_x % unit, local_y % unit
-
             if c_idx < 9 and r_idx < 9:
                 in_c, in_r = rx < CELL_SIZE, ry < CELL_SIZE
                 if in_c and in_r: hover_type, hover_c, hover_r = 'cell', c_idx, r_idx
@@ -1047,14 +1128,9 @@ class Quoridor:
         if hover_type == 'wall' and not self.game_over and self.mode == "PLAY" and self.state['turn'] == 1:
             if self.bot2.is_valid_wall(self.state, hover_c, hover_r, active_orient) and self.state['p1_walls'] > 0:
                 hx, hy = offset_x + hover_c * unit, offset_y + hover_r * unit
-                overlay = pygame.Surface((BOARD_PIXEL_SIZE, HEIGHT), pygame.SRCALPHA)
-                
-                if active_orient == 'H':
-                    pygame.draw.rect(overlay, (82, 88, 98, 115), 
-                                     (hx, hy + CELL_SIZE, CELL_SIZE * 2 + WALL_THICKNESS, WALL_THICKNESS), border_radius=int(6 * SCALE))
-                else:
-                    pygame.draw.rect(overlay, (82, 88, 98, 115), 
-                                     (hx + CELL_SIZE, hy, WALL_THICKNESS, CELL_SIZE * 2 + WALL_THICKNESS), border_radius=int(6 * SCALE))
+                overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+                if active_orient == 'H': pygame.draw.rect(overlay, (82, 88, 98, 115), (hx, hy + CELL_SIZE, CELL_SIZE * 2 + WALL_THICKNESS, WALL_THICKNESS), border_radius=int(6 * SCALE))
+                else: pygame.draw.rect(overlay, (82, 88, 98, 115), (hx + CELL_SIZE, hy, WALL_THICKNESS, CELL_SIZE * 2 + WALL_THICKNESS), border_radius=int(6 * SCALE))
                 self.virtual_screen.blit(overlay, (0, 0))
 
         t1_x, t1_y = self._get_center_pixels(self.state['p1_pos'])
@@ -1073,23 +1149,22 @@ class Quoridor:
         pygame.draw.circle(self.virtual_screen, P2_COLOR, (int(self.p2_draw_x), int(self.p2_draw_y)), radius)
 
         btn_y = HEIGHT - int(46 * SCALE)
-        btn_h = int(34 * SCALE)
-        btn_w = int(110 * SCALE)
+        btn_h, btn_w = int(34 * SCALE), int(110 * SCALE)
         
-        self.rect_menu = pygame.Rect(BOARD_PIXEL_SIZE - int(125 * SCALE), btn_y, btn_w, btn_h)
+        self.rect_menu = pygame.Rect(LEFT_SIDEBAR_WIDTH + BOARD_PIXEL_SIZE - int(125 * SCALE), btn_y, btn_w, btn_h)
         m_hover = self.rect_menu.collidepoint(mouse_pos)
         pygame.draw.rect(self.virtual_screen, (200, 205, 212) if m_hover else (220, 224, 230), self.rect_menu, border_radius=int(8 * SCALE))
         menu_txt = self.small_font.render("Menu", True, TEXT_COLOR)
         self.virtual_screen.blit(menu_txt, menu_txt.get_rect(center=self.rect_menu.center))
 
-        self.rect_new_game = pygame.Rect(BOARD_PIXEL_SIZE - int(245 * SCALE), btn_y, btn_w, btn_h)
+        self.rect_new_game = pygame.Rect(LEFT_SIDEBAR_WIDTH + BOARD_PIXEL_SIZE - int(245 * SCALE), btn_y, btn_w, btn_h)
         ng_hover = self.rect_new_game.collidepoint(mouse_pos)
         pygame.draw.rect(self.virtual_screen, (200, 205, 212) if ng_hover else (220, 224, 230), self.rect_new_game, border_radius=int(8 * SCALE))
         ng_txt = self.small_font.render("New Game", True, TEXT_COLOR)
         self.virtual_screen.blit(ng_txt, ng_txt.get_rect(center=self.rect_new_game.center))
 
         if self.mode == "TRAIN":
-            self.rect_train_toggle = pygame.Rect(int(15 * SCALE), btn_y, int(160 * SCALE), btn_h)
+            self.rect_train_toggle = pygame.Rect(LEFT_SIDEBAR_WIDTH + int(15 * SCALE), btn_y, int(160 * SCALE), btn_h)
             tt_hover = self.rect_train_toggle.collidepoint(mouse_pos)
             
             if self.is_training_active:
@@ -1107,59 +1182,63 @@ class Quoridor:
             self.toast_timer -= 1
             toast_surf = self.small_font.render(self.toast_msg, True, (255, 255, 255))
             t_w, t_h = toast_surf.get_width() + int(24 * SCALE), int(30 * SCALE)
-            toast_rect = pygame.Rect(BOARD_PIXEL_SIZE // 2 - t_w // 2, int(8 * SCALE), t_w, t_h)
+            toast_rect = pygame.Rect(LEFT_SIDEBAR_WIDTH + BOARD_PIXEL_SIZE // 2 - t_w // 2, int(8 * SCALE), t_w, t_h)
             pygame.draw.rect(self.virtual_screen, (46, 125, 50), toast_rect, border_radius=int(15 * SCALE))
             self.virtual_screen.blit(toast_surf, toast_surf.get_rect(center=toast_rect.center))
 
-        self.draw_sidebar()
+        self.draw_left_sidebar()
+        self.draw_right_sidebar()
         self.render_and_flip()
         return hover_type, hover_c, hover_r, active_orient
 
+    # ==========================================
+    # SECTION 7: CHECK WIN CALL SEQUENCE
+    # ==========================================
     def check_win(self):
         winner_id = 0
         if self.state['p1_pos'][1] == 0:
-            self.game_over = True
-            winner_id = 1
+            self.game_over, winner_id = True, 1
         elif self.state['p2_pos'][1] == 8:
-            self.game_over = True
-            winner_id = 2
+            self.game_over, winner_id = True, 2
         elif self.state['turns_played'] >= 200:
-            self.game_over = True
-            winner_id = 0
+            self.game_over, winner_id = True, 0
             
         if self.game_over:
             self.winner_id = winner_id
-            
-            if winner_id == 0:
-                self.winner = "Draw"
-            elif getattr(self, 'mode', 'TRAIN') == "TRAIN":
-                self.winner = "Student" if winner_id == self.student_id else "Teacher"
-            else:
-                self.winner = "Human" if winner_id == 1 else "Teacher"
+            if winner_id == 0: self.winner = "Draw"
+            elif getattr(self, 'mode', 'TRAIN') == "TRAIN": self.winner = "Student" if winner_id == self.student_id else "Teacher"
+            else: self.winner = "Human" if winner_id == 1 else "Teacher"
                 
             print(f"Game #{self.games_played + 1} Winner: {self.winner.upper()} ({self.state['turns_played']} turns)")
             self.log_match_result(winner_id)
             
             if self.mode == "TRAIN":
                 self.games_played += 1
-                if self.games_played % 250 == 0:
-                    self.save_checkpoint(manual=False)
+                if self.games_played % 250 == 0: self.save_checkpoint(manual=False)
 
                 student_won = 1 if winner_id == self.student_id else 0
                 self.student_eval_history.append(student_won)
-                wins = sum(self.student_eval_history)
-                games = len(self.student_eval_history)
-                self.student_win_rate_str = f"{wins/games * 100:.1f}% ({wins}/{games})"
                 
+                # Section 3 Requirement
+                gen = self.current_opponent_gen
+                if gen not in self.checkpoint_log:
+                    self.checkpoint_log[gen] = deque(maxlen=self.LOG_WINDOW_SIZE)
+                self.checkpoint_log[gen].append(student_won)
+
+                wins, games = sum(self.student_eval_history), len(self.student_eval_history)
+                self.student_win_rate_str = f"{wins/games * 100:.1f}% ({wins}/{games})"
                 self.save_meta()
                 
-                if games >= 30:
-                    if (wins / games) >= 0.57:
+                if games >= self.GATE_MIN_GAMES:
+                    if (wins / games) >= self.GATE_WIN_RATE_THRESHOLD:
                         print(f"Student beat Teacher! Upgrading Teacher to Gen #{self.teacher_gen + 1}...")
-                        self.evaluate_and_tune_lr(games_per_model=10)
+                        
+                        # Section 7 Strict Call Order
+                        self.evaluate_and_tune_lr(games_per_model=self.FULL_EVAL_GAMES_PER_MODEL)
                         self.teacher_gen += 1
                         self.teacher_net.load_state_dict(self.student_net.state_dict())
                         self.update_opponent_pool()
+                        self.update_escalation_state()
                         
                         old_hw = self.heuristic_weight
                         self.heuristic_weight = max(0.1, self.heuristic_weight * 0.85)
@@ -1173,13 +1252,6 @@ class Quoridor:
 
     def run_headless_training(self, num_games):
         print(f"Starting Headless Turbo Training for {num_games} games...")
-        print("=========================================================")
-        print("Headless Controls (Type and press Enter):")
-        print("  'p' -> Pause / Resume training")
-        print("  's' -> Save checkpoint")
-        print("  'q' -> Quit gracefully")
-        print("=========================================================")
-        
         self.mode = "TRAIN"
         self.is_training_active = True
         self.reset_game()
@@ -1187,20 +1259,12 @@ class Quoridor:
         def command_listener():
             while True:
                 cmd = sys.stdin.readline().strip().lower()
-                if cmd == 'p':
-                    self.is_training_active = not self.is_training_active
-                    state = "RESUMED" if self.is_training_active else "PAUSED"
-                    print(f"\n[Command] Training {state}!")
-                elif cmd == 's':
-                    self.save_checkpoint(manual=True)
-                elif cmd == 'q':
-                    print("\n[Command] Quitting...")
-                    os._exit(0)
+                if cmd == 'p': self.is_training_active = not self.is_training_active
+                elif cmd == 's': self.save_checkpoint(manual=True)
+                elif cmd == 'q': os._exit(0)
                     
         threading.Thread(target=command_listener, daemon=True).start()
-        
-        target_games = self.games_played + num_games
-        last_print = self.games_played
+        target_games, last_print = self.games_played + num_games, self.games_played
         
         while self.games_played < target_games:
             if not self.is_training_active:
@@ -1212,7 +1276,6 @@ class Quoridor:
                 if self.games_played - last_print >= 10:
                     print(f"Training Progress: {self.games_played} / {target_games} games")
                     last_print = self.games_played
-                
                 self.reset_game()
                 continue
 
@@ -1220,23 +1283,19 @@ class Quoridor:
             pre_action_state_tensor = encode_state(self.state, self.state['turn'])
             pre_action_pid = self.state['turn']
             
-            eps = 0.15 * (0.95 ** self.state['turns_played'])
-            action, _ = active_bot.get_move_and_eval(self.state, epsilon=eps)
+            # Resolution logic: Disable epsilon entirely for Teacher, enable for Student
+            is_teacher = (active_bot.nn_model != self.student_net)
+            eps = 0.0 if is_teacher else (0.15 * (0.95 ** self.state['turns_played']))
             
-            if action:
-                self.state = active_bot.apply_action(self.state, pre_action_pid, action)
-            else:
-                self.state['turns_played'] = 200
+            action, _ = active_bot.get_move_and_eval(self.state, epsilon=eps)
+            if action: self.state = active_bot.apply_action(self.state, pre_action_pid, action)
+            else: self.state['turns_played'] = 200
                 
             self.check_win()
-            
             next_state_tensor = encode_state(self.state, self.state['turn'])
             next_pid = self.state['turn']
-            winner_id = 0
+            winner_id = getattr(self, 'winner_id', 0) if self.game_over else 0
             
-            if self.game_over:
-                winner_id = getattr(self, 'winner_id', 0)
-                
             self.train_step(pre_action_state_tensor, pre_action_pid, next_state_tensor, next_pid, self.game_over, winner_id)
                 
         print(f"Headless training complete! Total games played: {self.games_played}")
@@ -1246,9 +1305,7 @@ class Quoridor:
 
     def play(self):
         clock = pygame.time.Clock()
-        running = True
-        bot_thinking = False
-        bot_result = None
+        running, bot_thinking, bot_result = True, False, None
 
         def think_bot(current_state):
             nonlocal bot_result, bot_thinking
@@ -1260,8 +1317,7 @@ class Quoridor:
             except Exception:
                 moves = self.bot2.get_valid_moves(current_state, 2)
                 if moves: bot_result = ('move', moves[0])
-            finally:
-                bot_thinking = False
+            finally: bot_thinking = False
 
         while running:
             virtual_mouse_pos = self.get_virtual_mouse_pos()
@@ -1273,54 +1329,39 @@ class Quoridor:
                     sys.exit()
 
                 if event.type == pygame.KEYDOWN:
-                    if event.key in (pygame.K_F11, pygame.K_f):
-                        self.toggle_fullscreen()
-                    elif event.key == pygame.K_c:
-                        self.save_checkpoint(manual=True)
+                    if event.key in (pygame.K_F11, pygame.K_f): self.toggle_fullscreen()
+                    elif event.key == pygame.K_c: self.save_checkpoint(manual=True)
 
-                if self.mode == "MENU":
-                    if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                        if self.rect_play.collidepoint(virtual_mouse_pos):
-                            self.mode = "PLAY"
-                            self.reset_game()
-                        elif self.rect_train.collidepoint(virtual_mouse_pos):
-                            self.mode = "TRAIN"
-                            self.is_training_active = True
-                            self.reset_game()
+                if self.mode == "MENU" and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    if self.rect_play.collidepoint(virtual_mouse_pos):
+                        self.mode, self.is_training_active = "PLAY", False
+                        self.reset_game()
+                    elif self.rect_train.collidepoint(virtual_mouse_pos):
+                        self.mode, self.is_training_active = "TRAIN", True
+                        self.reset_game()
 
-                elif self.mode in ("PLAY", "TRAIN"):
-                    if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                        if self.rect_menu.collidepoint(virtual_mouse_pos):
-                            self.mode = "MENU"
-                            continue
-                        elif self.rect_new_game.collidepoint(virtual_mouse_pos):
-                            self.reset_game()
-                            continue
-                        elif self.mode == "TRAIN" and self.rect_train_toggle.collidepoint(virtual_mouse_pos):
-                            if self.is_training_active:
-                                self.is_training_active = False
-                                self.save_checkpoint(manual=True)
-                            else:
-                                self.is_training_active = True
-                            continue
+                elif self.mode in ("PLAY", "TRAIN") and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    if self.rect_menu.collidepoint(virtual_mouse_pos): self.mode = "MENU"
+                    elif self.rect_new_game.collidepoint(virtual_mouse_pos): self.reset_game()
+                    elif self.mode == "TRAIN" and self.rect_train_toggle.collidepoint(virtual_mouse_pos):
+                        self.is_training_active = not self.is_training_active
+                        if not self.is_training_active: self.save_checkpoint(manual=True)
 
-                    if self.mode == "PLAY" and not self.game_over and not bot_thinking and self.state['turn'] == 1:
-                        if event.type == pygame.KEYDOWN and event.key in (pygame.K_r, pygame.K_SPACE):
-                            self.wall_orientation = 'V' if self.wall_orientation == 'H' else 'H'
-                        elif event.type == pygame.MOUSEBUTTONDOWN:
-                            if event.button == 3:
-                                self.wall_orientation = 'V' if self.wall_orientation == 'H' else 'H'
-                            elif event.button == 1:
-                                hover_type, hover_c, hover_r, active_orient = self.draw_board(virtual_mouse_pos)
-                                if hover_type == 'cell':
-                                    valid_human_moves = self.bot2.get_valid_moves(self.state, 1)
-                                    if (hover_c, hover_r) in valid_human_moves:
-                                        self.state = self.bot2.apply_action(self.state, 1, ('move', (hover_c, hover_r)))
-                                        self.check_win()
-                                elif hover_type == 'wall':
-                                    if self.state['p1_walls'] > 0 and self.bot2.is_valid_wall(self.state, hover_c, hover_r, active_orient):
-                                        self.state = self.bot2.apply_action(self.state, 1, ('wall', (hover_c, hover_r, active_orient)))
-                                        self.check_win()
+                if self.mode == "PLAY" and not self.game_over and not bot_thinking and self.state['turn'] == 1:
+                    if event.type == pygame.KEYDOWN and event.key in (pygame.K_r, pygame.K_SPACE):
+                        self.wall_orientation = 'V' if self.wall_orientation == 'H' else 'H'
+                    elif event.type == pygame.MOUSEBUTTONDOWN:
+                        if event.button == 3: self.wall_orientation = 'V' if self.wall_orientation == 'H' else 'H'
+                        elif event.button == 1:
+                            hover_type, hover_c, hover_r, active_orient = self.draw_board(virtual_mouse_pos)
+                            if hover_type == 'cell':
+                                if (hover_c, hover_r) in self.bot2.get_valid_moves(self.state, 1):
+                                    self.state = self.bot2.apply_action(self.state, 1, ('move', (hover_c, hover_r)))
+                                    self.check_win()
+                            elif hover_type == 'wall':
+                                if self.state['p1_walls'] > 0 and self.bot2.is_valid_wall(self.state, hover_c, hover_r, active_orient):
+                                    self.state = self.bot2.apply_action(self.state, 1, ('wall', (hover_c, hover_r, active_orient)))
+                                    self.check_win()
 
             if self.mode == "TRAIN" and self.is_training_active and not self.is_evaluating:
                 if self.game_over:
@@ -1330,23 +1371,17 @@ class Quoridor:
                     pre_action_state_tensor = encode_state(self.state, self.state['turn'])
                     pre_action_pid = self.state['turn']
 
-                    eps = 0.15 * (0.95 ** self.state['turns_played'])
-                    action, _ = active_bot.get_move_and_eval(self.state, epsilon=eps)
+                    is_teacher = (active_bot.nn_model != self.student_net)
+                    eps = 0.0 if is_teacher else (0.15 * (0.95 ** self.state['turns_played']))
                     
-                    if action:
-                        self.state = active_bot.apply_action(self.state, pre_action_pid, action)
-                    else:
-                        self.state['turns_played'] = 200
+                    action, _ = active_bot.get_move_and_eval(self.state, epsilon=eps)
+                    if action: self.state = active_bot.apply_action(self.state, pre_action_pid, action)
+                    else: self.state['turns_played'] = 200
 
                     self.check_win()
-                    
                     next_state_tensor = encode_state(self.state, self.state['turn'])
                     next_pid = self.state['turn']
-                    winner_id = 0
-                    
-                    if self.game_over:
-                        winner_id = getattr(self, 'winner_id', 0)
-                        
+                    winner_id = getattr(self, 'winner_id', 0) if self.game_over else 0
                     self.train_step(pre_action_state_tensor, pre_action_pid, next_state_tensor, next_pid, self.game_over, winner_id)
 
             elif self.mode == "PLAY" and self.state['turn'] == 2 and not self.game_over:
@@ -1356,9 +1391,7 @@ class Quoridor:
                         'p1_pos': self.state['p1_pos'], 'p2_pos': self.state['p2_pos'],
                         'p1_walls': self.state['p1_walls'], 'p2_walls': self.state['p2_walls'],
                         'walls_h': self.state['walls_h'].copy(), 'walls_v': self.state['walls_v'].copy(),
-                        'turn': 2,
-                        'turns_played': self.state['turns_played'],
-                        'history': self.state['history'].copy()
+                        'turn': 2, 'turns_played': self.state['turns_played'], 'history': self.state['history'].copy()
                     }
                     threading.Thread(target=think_bot, args=(bot_state,), daemon=True).start()
                 
@@ -1367,11 +1400,8 @@ class Quoridor:
                     bot_result = None
                     self.check_win()
 
-            if self.mode == "MENU":
-                self.draw_menu()
-            else:
-                self.draw_board(virtual_mouse_pos if self.mode == "PLAY" else (-1, -1))
-                
+            if self.mode == "MENU": self.draw_menu()
+            else: self.draw_board(virtual_mouse_pos if self.mode == "PLAY" else (-1, -1))
             clock.tick(60 if self.mode == "PLAY" else 1000)
 
 if __name__ == "__main__":
@@ -1384,8 +1414,5 @@ if __name__ == "__main__":
         os.environ["SDL_AUDIODRIVER"] = "dummy"
 
     game = Quoridor(headless=(args.headless > 0))
-    
-    if args.headless > 0:
-        game.run_headless_training(args.headless)
-    else:
-        game.play()
+    if args.headless > 0: game.run_headless_training(args.headless)
+    else: game.play()
