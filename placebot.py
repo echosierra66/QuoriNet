@@ -6,6 +6,7 @@ import random
 import time
 import threading
 import argparse
+import math
 from collections import deque
 import torch
 import torch.nn as nn
@@ -32,6 +33,8 @@ sys.stdout = TerminalLogger(sys.stdout)
 # NEW NEURAL NETWORK ARCHITECTURE
 # ==========================================
 class SpatialQuoriNetV2(nn.Module):
+    ACTION_SIZE = 209  # 81 pawn destinations + 64 H-walls + 64 V-walls
+
     def __init__(self, in_channels=8):
         # Channels: P1 pos, P2 pos, H-wall, V-wall, P1 walls-left, P2 walls-left, P1 path-dist, P2 path-dist
         super().__init__()
@@ -46,11 +49,55 @@ class SpatialQuoriNetV2(nn.Module):
             nn.Linear(64, 64), nn.ReLU(),
             nn.Linear(64, 1), nn.Tanh()
         )
+        self.policy_conv = nn.Sequential(
+            nn.Conv2d(64, 2, 1), nn.BatchNorm2d(2), nn.ReLU()
+        )
+        self.policy_head = nn.Linear(2 * 9 * 9, self.ACTION_SIZE)
 
     def forward(self, x):
-        x = self.conv(x)
-        x = self.pool(x).flatten(1)
-        return self.value_head(x)
+        features = self.conv(x)
+        value = self.value_head(self.pool(features).flatten(1))
+        policy_logits = self.policy_head(
+            self.policy_conv(features).flatten(1)
+        )
+        return policy_logits, value
+
+
+ACTION_SIZE = SpatialQuoriNetV2.ACTION_SIZE
+CHECKPOINT_FORMAT_VERSION = 3
+
+
+def action_to_index(action, active_pid):
+    """Map an action into the canonical current-player policy space."""
+    if action[0] == 'move':
+        c, r = action[1]
+        if active_pid == 2:
+            c, r = 8 - c, 8 - r
+        return r * 9 + c
+
+    c, r, orient = action[1]
+    if active_pid == 2:
+        c, r = 7 - c, 7 - r
+    return 81 + (0 if orient == 'H' else 64) + r * 8 + c
+
+
+class MCTSNode:
+    def __init__(self, prior=0.0):
+        self.prior = float(prior)
+        self.visit_count = 0
+        self.value_sum = 0.0
+        self.children = {}
+
+    @property
+    def expanded(self):
+        return bool(self.children)
+
+    @property
+    def value(self):
+        return (
+            self.value_sum / self.visit_count
+            if self.visit_count > 0 else 0.0
+        )
 
 # Global Helper for encode_state distance calcs
 def get_adjacent_global(state, c, r):
@@ -122,15 +169,32 @@ class QuoridorBot:
     TOP_MOVE_POOL_SIZE = 4
     WIDE_MOVE_POOL_SIZE = 10
     WIDE_MOVE_SAMPLE_CHANCE = 0.10
+    MCTS_C_PUCT = 1.5
+    MCTS_DIRICHLET_ALPHA = 0.15
+    MCTS_DIRICHLET_FRACTION = 0.25
+    MCTS_TEMPERATURE_MOVES = 24
 
-    def __init__(self, bot_id=2, max_depth=3, nn_model=None, heuristic_weight=1.0):
+    def __init__(self, bot_id=2, max_depth=3, nn_model=None,
+                 heuristic_weight=1.0, mcts_simulations=None):
         self.bot_id = bot_id
         self.max_depth = max_depth
         self.nn_model = nn_model
         self.heuristic_weight = heuristic_weight
+        self.mcts_simulations = (
+            int(mcts_simulations)
+            if mcts_simulations is not None
+            else (48 if max_depth >= 4 else 24)
+        )
         self.was_last_random = False
+        self.last_policy_target = None
 
     def get_move_and_eval(self, state, epsilon=0.0):
+        if self.nn_model is not None:
+            return self.run_mcts(
+                state,
+                add_exploration_noise=(epsilon > 0.0)
+            )
+
         if epsilon > 0.0 and random.random() < epsilon:
             raw_actions = self.generate_actions(state, self.bot_id)
             if raw_actions:
@@ -149,6 +213,146 @@ class QuoridorBot:
                     return ranked[0], self.evaluate(state, self.bot_id)
             return None, 0.0
         return best_move, max_eval
+
+    def _winner(self, state):
+        if state['p1_pos'][1] == 0:
+            return 1
+        if state['p2_pos'][1] == 8:
+            return 2
+        if state.get('turns_played', 0) >= 200:
+            return 0
+        return None
+
+    def _terminal_value(self, state):
+        winner = self._winner(state)
+        if winner is None or winner == 0:
+            return 0.0
+        return 1.0 if winner == state['turn'] else -1.0
+
+    def _network_policy_value(self, state):
+        with torch.no_grad():
+            logits, value = self.nn_model(
+                encode_state(state, state['turn']).unsqueeze(0)
+            )
+        return logits.squeeze(0), float(value.item())
+
+    def _expand_mcts_node(self, node, state):
+        pid = state['turn']
+        actions = self.generate_legal_actions(state, pid)
+        if not actions:
+            return -1.0
+
+        logits, value = self._network_policy_value(state)
+        indices = torch.tensor(
+            [action_to_index(action, pid) for action in actions],
+            dtype=torch.long,
+            device=logits.device
+        )
+        legal_priors = torch.softmax(
+            logits.index_select(0, indices), dim=0
+        ).cpu().tolist()
+        for action, prior in zip(actions, legal_priors):
+            node.children[action] = MCTSNode(prior)
+        return value
+
+    def _add_root_noise(self, root):
+        actions = list(root.children)
+        noise = [
+            random.gammavariate(self.MCTS_DIRICHLET_ALPHA, 1.0)
+            for _ in actions
+        ]
+        noise_total = sum(noise)
+        if noise_total <= 0.0:
+            return
+        fraction = self.MCTS_DIRICHLET_FRACTION
+        for action, sample in zip(actions, noise):
+            child = root.children[action]
+            child.prior = (
+                (1.0 - fraction) * child.prior
+                + fraction * sample / noise_total
+            )
+
+    def _select_mcts_child(self, node):
+        parent_scale = math.sqrt(max(1, node.visit_count))
+
+        def puct_score(item):
+            _, child = item
+            q_value = -child.value  # child belongs to the other player
+            u_value = (
+                self.MCTS_C_PUCT * child.prior * parent_scale
+                / (1 + child.visit_count)
+            )
+            return q_value + u_value
+
+        candidates = list(node.children.items())
+        random.shuffle(candidates)
+        return max(candidates, key=puct_score)
+
+    def run_mcts(self, state, add_exploration_noise=False):
+        """Run complete-legal-action PUCT and return a visit policy."""
+        root = MCTSNode(1.0)
+        root_network_value = self._expand_mcts_node(root, state)
+        if not root.children:
+            self.last_policy_target = None
+            return None, root_network_value
+
+        if add_exploration_noise:
+            self._add_root_noise(root)
+
+        for _ in range(max(1, self.mcts_simulations)):
+            node = root
+            sim_state = state
+            search_path = [root]
+
+            while node.expanded:
+                action, node = self._select_mcts_child(node)
+                sim_state = self.apply_action(
+                    sim_state, sim_state['turn'], action
+                )
+                search_path.append(node)
+                if self._winner(sim_state) is not None:
+                    break
+
+            if self._winner(sim_state) is not None:
+                value = self._terminal_value(sim_state)
+            else:
+                value = self._expand_mcts_node(node, sim_state)
+
+            for path_node in reversed(search_path):
+                path_node.visit_count += 1
+                path_node.value_sum += value
+                value = -value
+
+        actions = list(root.children)
+        visits = [root.children[action].visit_count for action in actions]
+        total_visits = sum(visits)
+        probabilities = [count / total_visits for count in visits]
+
+        policy_target = torch.zeros(ACTION_SIZE, dtype=torch.float32)
+        for action, probability in zip(actions, probabilities):
+            policy_target[action_to_index(action, state['turn'])] = probability
+        self.last_policy_target = policy_target
+
+        use_temperature = (
+            add_exploration_noise
+            and state.get('turns_played', 0) < self.MCTS_TEMPERATURE_MOVES
+        )
+        if use_temperature:
+            chosen_action = random.choices(
+                actions, weights=probabilities, k=1
+            )[0]
+        else:
+            max_visits = max(visits)
+            chosen_action = random.choice([
+                action for action, count in zip(actions, visits)
+                if count == max_visits
+            ])
+
+        most_visited = actions[visits.index(max(visits))]
+        self.was_last_random = (
+            use_temperature and chosen_action != most_visited
+        )
+        return chosen_action, root.value
 
     def get_move(self, state):
         action, _ = self.get_move_and_eval(state, epsilon=0.0)
@@ -291,6 +495,20 @@ class QuoridorBot:
             else: break
         return actions
 
+    def generate_legal_actions(self, state, pid):
+        """Generate every legal move and wall placement for MCTS."""
+        actions = [('move', move) for move in self.get_valid_moves(state, pid)]
+        walls_left = state['p1_walls'] if pid == 1 else state['p2_walls']
+        if walls_left <= 0:
+            return actions
+
+        for orient in ('H', 'V'):
+            for r in range(8):
+                for c in range(8):
+                    if self.is_valid_wall(state, c, r, orient):
+                        actions.append(('wall', (c, r, orient)))
+        return actions
+
     def rank_and_prune(self, state, actions, pid, top_k=TOP_MOVE_POOL_SIZE):
         if not actions: return []
         actions_copy = list(actions)
@@ -354,7 +572,10 @@ class QuoridorBot:
 
         if self.nn_model is not None:
             with torch.no_grad():
-                nn_val = self.nn_model(encode_state(state, eval_pid).unsqueeze(0)).item()
+                _, value = self.nn_model(
+                    encode_state(state, eval_pid).unsqueeze(0)
+                )
+                nn_val = value.item()
             
             nn_score = nn_val * 100.0
             heur_score = (d2 - d1) * 5.0
@@ -521,7 +742,15 @@ class Quoridor:
         self.LOG_WINDOW_SIZE = 30
         self.MIN_SAMPLES_TRUSTED = 15
         self.GATE_MIN_GAMES = 30
+        # Qualification is deliberately separate from exploratory training.
+        # Every interval, one opponent receives a six-game frozen evaluation
+        # (three games per side). Five visits fill its 30-game rolling gate.
+        self.GATE_EVAL_INTERVAL_TRAINING_GAMES = 15
+        self.GATE_EVAL_GAMES_PER_CYCLE = 6
         self.GATE_WIN_RATE_THRESHOLD = 0.57
+        self.REQUIRED_WR_CEILING = 0.95
+        self.REQUIRED_WR_SPAN = 0.38
+        self.REQUIRED_WR_DECAY = 0.15
         self.FINAL_TEST_GAMES_PER_MODEL = 10
         self.ESCALATION_LOSS_THRESHOLD = 0.50
         self.ESCALATION_RECOVER_THRESHOLD = 0.65
@@ -541,6 +770,7 @@ class Quoridor:
         self.REPLAY_HISTORIC_CAPACITY = 60000
         self.REPLAY_WARMUP = 256
         self.REPLAY_BATCH_SIZE = 128
+        self.POLICY_LOSS_WEIGHT = 1.0
 
         # Sparse terminal reward is propagated through every gated matchup and
         # blended with the stable teacher bootstrap already used by this model.
@@ -556,14 +786,20 @@ class Quoridor:
         self.LR_MIN_SAMPLES = 15
         self.LR_PLATEAU_EPS = 0.015
         self.LR_REGRESSION_EPS = 0.03
-        self.LR_UP_FACTOR = 1.25
-        self.LR_DOWN_FACTOR = 0.80
+        # These are the widest permitted steps. The actual factors contract
+        # with ladder age using the same exponential as the required-WR curve.
+        self.LR_UP_FACTOR = 1.50
+        self.LR_DOWN_FACTOR = 0.70
         self.LR_CONVERGE_FACTOR = 0.85
+        self.LR_MIN_SEARCH_MARGIN = 0.20
+        self.LR_URGENCY_FLOOR = 0.70
+        self.LR_REVERT_STREAK = 2
         self.GRAD_CLIP_NORM = 1.0
 
         # State vars
         self.student_net = SpatialQuoriNetV2(in_channels=8)
         self.teacher_net = SpatialQuoriNetV2(in_channels=8)
+        self.teacher_net.load_state_dict(self.student_net.state_dict())
         self.student_net.eval()
         self.teacher_net.eval()
         self.optimizer = optim.Adam(self.student_net.parameters(), lr=0.0001)
@@ -588,6 +824,8 @@ class Quoridor:
         self.historic_replay_buffer = deque(maxlen=self.REPLAY_HISTORIC_CAPACITY)
         self.episode_trajectory = []
         self.last_loss = 0.0
+        self.last_value_loss = 0.0
+        self.last_policy_loss = 0.0
 
         self.match_history = deque(maxlen=6)
         self.opponent_pool = []
@@ -596,6 +834,12 @@ class Quoridor:
 
         # New State from Section 2
         self.checkpoint_log = {}
+        self.checkpoint_side_log = {}
+        self.training_result_history = deque(maxlen=100)
+        self.training_next_student_side = {}
+        self.gate_next_student_side = {}
+        self.gate_eval_cursor = 0
+        self.last_gate_eval_training_game = 0
         self.escalation_state = {}
         self.wawr_history = []
         self.lr_last_reduced_at_gen = 0  # legacy metadata compatibility
@@ -703,15 +947,16 @@ class Quoridor:
     def _required_win_rate(self, gen):
         """Promotion threshold for one opponent in the current teacher ladder.
 
-        Generations are indexed from one, so x=gen-1.  There are N-1
-        intervals between Gen #1 (90%) and the latest teacher Gen #N (57%).
-        The latest teacher is handled as a strict-above-57% gate.
+        N is the current ladder age and x is the opponent generation:
+        (95 - 38 * exp(-0.15 * (N - x))) / 100. The latest teacher
+        therefore always has a 57% threshold. It remains a strict-above gate.
         """
-        if gen >= self.teacher_gen:
-            return self.GATE_WIN_RATE_THRESHOLD
-        x = max(0, gen - 1)
-        N = max(1, self.teacher_gen - 1)
-        return 0.90 * ((self.GATE_WIN_RATE_THRESHOLD / 0.90) ** (x / N))
+        N = max(1, int(self.teacher_gen))
+        x = max(1, min(int(gen), N))
+        return self.REQUIRED_WR_CEILING - (
+            self.REQUIRED_WR_SPAN
+            * math.exp(-self.REQUIRED_WR_DECAY * (N - x))
+        )
 
     def _generation_win_rate(self, gen):
         log = self.checkpoint_log.get(gen)
@@ -735,6 +980,143 @@ class Quoridor:
                 return False
             if not self._passes_generation_gate(gen, sum(log) / len(log)):
                 return False
+        return True
+
+    def _select_gate_eval_generation(self):
+        """Choose one opponent for the next frozen qualification cycle.
+
+        Sample-starved gates are filled first and round-robin ordering breaks
+        ties. Once every window is full, evaluation follows the largest live WR
+        deficit so a weak matchup is remeasured sooner.
+        """
+        generations = self._training_generations()
+        if not generations:
+            return None
+
+        start = self.gate_eval_cursor % len(generations)
+        ordered = generations[start:] + generations[:start]
+        sample_counts = {
+            gen: len(self.checkpoint_log.get(gen, ()))
+            for gen in generations
+        }
+        min_samples = min(sample_counts.values())
+
+        if min_samples < self.GATE_MIN_GAMES:
+            chosen = next(
+                gen for gen in ordered
+                if sample_counts[gen] == min_samples
+            )
+        else:
+            def normalized_deficit(gen):
+                log = self.checkpoint_log.get(gen, ())
+                win_rate = sum(log) / len(log) if log else 0.0
+                required = self._required_win_rate(gen)
+                return (required - win_rate) / max(required, 1e-9)
+
+            chosen = max(ordered, key=normalized_deficit)
+
+        self.gate_eval_cursor = (
+            generations.index(chosen) + 1
+        ) % len(generations)
+        return chosen
+
+    def _opponent_net_for_generation(self, gen):
+        for net, pool_gen in self.opponent_pool:
+            if pool_gen == gen:
+                return net
+        return self._load_net_for_gen(gen)
+
+    def _run_gate_evaluation_cycle(self):
+        """Run one frozen, side-balanced qualification batch."""
+        gen = self._select_gate_eval_generation()
+        if gen is None:
+            return False
+
+        opponent_net = self._opponent_net_for_generation(gen)
+        if opponent_net is None:
+            print(f"Gate eval skipped: Gen #{gen} checkpoint is unavailable.")
+            return False
+
+        games = self.GATE_EVAL_GAMES_PER_CYCLE
+        if games < 2 or games % 2 != 0:
+            raise ValueError("GATE_EVAL_GAMES_PER_CYCLE must be a positive even number")
+
+        log = self.checkpoint_log.setdefault(
+            gen, deque(maxlen=self.LOG_WINDOW_SIZE)
+        )
+        side_log = self.checkpoint_side_log.setdefault(
+            gen,
+            {
+                1: deque(maxlen=self.LOG_WINDOW_SIZE // 2),
+                2: deque(maxlen=self.LOG_WINDOW_SIZE // 2)
+            }
+        )
+        next_side = int(self.gate_next_student_side.get(gen, 1))
+
+        print(
+            f"\n--- FROZEN GATE EVAL: Student Gen #{self.teacher_gen + 1} "
+            f"vs Gen #{gen} ({games} games) ---"
+        )
+        self.is_evaluating = True
+        try:
+            for game_index in range(games):
+                student_side = next_side
+                next_side = 2 if student_side == 1 else 1
+
+                if student_side == 1:
+                    eval_bot1 = QuoridorBot(
+                        bot_id=1, max_depth=2, nn_model=self.student_net,
+                        heuristic_weight=self.heuristic_weight
+                    )
+                    eval_bot2 = QuoridorBot(
+                        bot_id=2, max_depth=2, nn_model=opponent_net,
+                        heuristic_weight=self.heuristic_weight
+                    )
+                else:
+                    eval_bot1 = QuoridorBot(
+                        bot_id=1, max_depth=2, nn_model=opponent_net,
+                        heuristic_weight=self.heuristic_weight
+                    )
+                    eval_bot2 = QuoridorBot(
+                        bot_id=2, max_depth=2, nn_model=self.student_net,
+                        heuristic_weight=self.heuristic_weight
+                    )
+
+                result = self.play_eval_game(
+                    eval_bot1,
+                    eval_bot2,
+                    game_index + 1,
+                    games,
+                    gen
+                )
+                student_won = int(result == student_side)
+                log.append(student_won)
+                side_log[student_side].append(student_won)
+                self.student_eval_history.append(student_won)
+                print(
+                    f"Gate eval {game_index + 1}/{games} vs Gen #{gen} "
+                    f"as P{student_side}: "
+                    f"{'WIN' if student_won else 'LOSS/DRAW'}"
+                )
+        finally:
+            self.is_evaluating = False
+
+        self.gate_next_student_side[gen] = next_side
+        self.last_gate_eval_training_game = self.lr_training_games_seen
+
+        if gen == self.teacher_gen:
+            self.latest_teacher_history.clear()
+            self.latest_teacher_history.extend(log)
+            self.latest_teacher_games_seen = len(log)
+
+        wins = sum(log)
+        self.student_win_rate_str = (
+            f"{wins / len(log) * 100:.1f}% Frozen vs Gen #{gen} "
+            f"({wins}/{len(log)})"
+        )
+        self._refresh_opponent_weights()
+        self._tune_learning_rate_from_pool(force=True)
+        print(f"Frozen training gates: {self._format_training_win_rates()}")
         return True
 
     def _format_training_win_rates(self):
@@ -889,8 +1271,13 @@ class Quoridor:
         support_weights = [self.opponent_weights[i] for i in support_indices]
         return random.choices(support_pool, weights=support_weights, k=1)[0]
 
-    def _append_replay_sample(self, state_tensor, target, opponent_gen):
-        item = (state_tensor, float(max(-1.0, min(1.0, target))))
+    def _append_replay_sample(self, state_tensor, policy_target,
+                              target, opponent_gen):
+        item = (
+            state_tensor,
+            policy_target.detach().cpu().to(dtype=torch.float16),
+            float(max(-1.0, min(1.0, target)))
+        )
         if opponent_gen == self.teacher_gen:
             self.latest_replay_buffer.append(item)
         else:
@@ -983,6 +1370,51 @@ class Quoridor:
         self.lr_best_value = self.optimizer.param_groups[0]['lr']
         self.lr_search_direction = 0
 
+    def _lr_age_margin_scale(self):
+        """Return the LR search radius implied by the required-WR curve.
+
+        For the oldest model, the fraction of the 38-point WR span still below
+        the 95% ceiling is exp(-0.15 * (N - 1)). Reusing that term makes early
+        ladders search widely and mature ladders make increasingly fine probes.
+        A small floor keeps AutoLR capable of adapting late in training.
+        """
+        N = max(1, int(self.teacher_gen))
+        remaining_curve = math.exp(-self.REQUIRED_WR_DECAY * (N - 1))
+        return self.LR_MIN_SEARCH_MARGIN + (
+            (1.0 - self.LR_MIN_SEARCH_MARGIN) * remaining_curve
+        )
+
+    def _lr_dynamic_factors(self, metric, target):
+        """Build age- and deficit-aware multiplicative LR adjustments."""
+        age_margin = self._lr_age_margin_scale()
+        deficit = max(0.0, target - metric) / max(target, 1e-9)
+        urgency = max(0.0, min(1.0, deficit))
+
+        # A large WR deficit uses more of the available age-based radius. Near
+        # the target, probes become finer even during early generations.
+        probe_margin = age_margin * (
+            self.LR_URGENCY_FLOOR
+            + (1.0 - self.LR_URGENCY_FLOOR) * urgency
+        )
+        up_factor = math.exp(math.log(self.LR_UP_FACTOR) * probe_margin)
+        down_factor = math.exp(math.log(self.LR_DOWN_FACTOR) * age_margin)
+        converge_factor = math.exp(
+            math.log(self.LR_CONVERGE_FACTOR) * age_margin
+        )
+        return up_factor, down_factor, converge_factor, age_margin
+
+    def _lr_regression_streak(self, metric):
+        """Count consecutive tuning intervals with a meaningful WR decline."""
+        metrics = list(self.lr_metric_history)
+        metrics.append(metric)
+        streak = 0
+        for index in range(len(metrics) - 1, 0, -1):
+            if metrics[index] - metrics[index - 1] < -self.LR_REGRESSION_EPS:
+                streak += 1
+            else:
+                break
+        return streak
+
     def _tune_learning_rate_from_pool(self, force=False):
         pool_metric = self._weighted_pool_metric_and_trend()
         if pool_metric is None:
@@ -1000,6 +1432,10 @@ class Quoridor:
 
         previous_metric = self.lr_metric_history[-1] if self.lr_metric_history else None
         current_lr = self.optimizer.param_groups[0]['lr']
+        up_factor, down_factor, converge_factor, age_margin = (
+            self._lr_dynamic_factors(metric, target)
+        )
+        regression_streak = self._lr_regression_streak(metric)
 
         if metric > self.lr_best_metric + self.LR_PLATEAU_EPS:
             self.lr_best_metric = metric
@@ -1010,14 +1446,15 @@ class Quoridor:
 
         if previous_metric is None:
             if metric < target and trend <= self.LR_PLATEAU_EPS:
-                candidate_lr = current_lr * self.LR_UP_FACTOR
+                candidate_lr = current_lr * up_factor
                 self.lr_search_direction = 1
                 reason = (
                     f"initial pool probe; weighted WR={metric:.3f}, "
-                    f"target={target:.3f}, trend={trend:+.3f}"
+                    f"target={target:.3f}, trend={trend:+.3f}, "
+                    f"age margin={age_margin:.2f}"
                 )
             elif metric >= target:
-                candidate_lr = current_lr * self.LR_CONVERGE_FACTOR
+                candidate_lr = current_lr * converge_factor
                 self.lr_search_direction = -1
                 reason = (
                     f"pool already competitive; weighted WR={metric:.3f}, "
@@ -1043,39 +1480,63 @@ class Quoridor:
                     delta < -self.LR_REGRESSION_EPS
                     or trend < -self.LR_REGRESSION_EPS
                 ):
-                    # If a previous LR performed better, pull back toward it;
-                    # otherwise damp the current LR.
-                    if self.lr_best_metric >= 0.0 and abs(self.lr_best_value - current_lr) > 1e-12:
+                    # One regression pulls toward the best LR. If WR keeps
+                    # falling, revert exactly rather than continuing the probe.
+                    has_better_lr = (
+                        self.lr_best_metric >= 0.0
+                        and abs(self.lr_best_value - current_lr) > 1e-12
+                    )
+                    if regression_streak >= self.LR_REVERT_STREAK and has_better_lr:
+                        candidate_lr = self.lr_best_value
+                        reason = (
+                            f"WR declined {regression_streak} tune intervals; "
+                            f"reverting to best LR {self.lr_best_value:.6f} "
+                            f"(best WR={self.lr_best_metric:.3f})"
+                        )
+                    elif has_better_lr:
                         candidate_lr = (current_lr * self.lr_best_value) ** 0.5
                         reason = (
                             f"weighted-pool regression; returning toward best LR "
                             f"{self.lr_best_value:.6f} (best WR={self.lr_best_metric:.3f})"
                         )
                     else:
-                        candidate_lr = current_lr * self.LR_DOWN_FACTOR
+                        candidate_lr = current_lr * down_factor
                         reason = (
                             f"weighted-pool regression; damping LR at WR={metric:.3f}"
                         )
                     self.lr_search_direction = -1
                 else:
-                    candidate_lr = current_lr * self.LR_UP_FACTOR
+                    candidate_lr = current_lr * up_factor
                     self.lr_search_direction = 1
                     reason = (
                         f"weighted-pool plateau below target; exploration increase "
-                        f"(WR={metric:.3f}, target={target:.3f}, trend={trend:+.3f})"
+                        f"(WR={metric:.3f}, target={target:.3f}, "
+                        f"trend={trend:+.3f}, age margin={age_margin:.2f})"
                     )
             else:
                 if (
                     delta < -self.LR_REGRESSION_EPS
                     or trend < -self.LR_REGRESSION_EPS
                 ):
-                    candidate_lr = current_lr * self.LR_DOWN_FACTOR
-                    reason = (
-                        f"weighted pool competitive but regressing; stabilize "
-                        f"(WR={metric:.3f})"
+                    has_better_lr = (
+                        self.lr_best_metric >= 0.0
+                        and abs(self.lr_best_value - current_lr) > 1e-12
                     )
+                    if regression_streak >= self.LR_REVERT_STREAK and has_better_lr:
+                        candidate_lr = self.lr_best_value
+                        reason = (
+                            f"competitive WR declined {regression_streak} tune "
+                            f"intervals; reverting to best LR "
+                            f"{self.lr_best_value:.6f}"
+                        )
+                    else:
+                        candidate_lr = current_lr * down_factor
+                        reason = (
+                            f"weighted pool competitive but regressing; stabilize "
+                            f"(WR={metric:.3f})"
+                        )
                 else:
-                    candidate_lr = current_lr * self.LR_CONVERGE_FACTOR
+                    candidate_lr = current_lr * converge_factor
                     reason = (
                         f"weighted pool competitive; convergence decay "
                         f"(WR={metric:.3f}, trend={trend:+.3f})"
@@ -1157,7 +1618,11 @@ class Quoridor:
         print(f"Heuristic Dep:   {self.heuristic_weight:.3f}")
         print(f"Studt Win Rate:  {self.student_win_rate_str}")
         print(f"Training WRs:    {self._format_training_win_rates()}")
-        print(f"AI Board Eval:   {eval_score} | LR: {current_lr:.6f} | Loss: {self.last_loss:.5f}")
+        print(
+            f"AI Board Eval:   {eval_score} | LR: {current_lr:.6f} | "
+            f"Loss: {self.last_loss:.5f} "
+            f"(V {self.last_value_loss:.5f} / P {self.last_policy_loss:.5f})"
+        )
         print("----------------------------------------\n")
 
     def get_virtual_mouse_pos(self):
@@ -1202,7 +1667,17 @@ class Quoridor:
 
             self.current_opponent_is_latest = (pool_gen == self.teacher_gen)
 
-            if self.games_played % 2 == 0:
+            # Alternate the student's side independently for each opponent.
+            # Global parity can accidentally lock one generation to one side
+            # when curriculum selection has a repeating cadence.
+            student_side = int(
+                self.training_next_student_side.get(pool_gen, 2)
+            )
+            self.training_next_student_side[pool_gen] = (
+                1 if student_side == 2 else 2
+            )
+
+            if student_side == 2:
                 self.bot1 = QuoridorBot(bot_id=1, max_depth=2, nn_model=pool_opponent, heuristic_weight=self.heuristic_weight)
                 self.bot2 = QuoridorBot(bot_id=2, max_depth=2, nn_model=self.student_net, heuristic_weight=self.heuristic_weight)
                 self.student_id = 2
@@ -1221,6 +1696,23 @@ class Quoridor:
         self.p2_draw_x, self.p2_draw_y = self._get_center_pixels(self.state['p2_pos'])
 
     def load_checkpoint_if_exists(self):
+        # Value-only checkpoints from the pre-MCTS system are intentionally
+        # ignored. Once a format-v3 save exists, normal resume behavior begins.
+        if not os.path.exists('quorinet_meta.json'):
+            return
+        try:
+            with open('quorinet_meta.json', 'r') as f:
+                checkpoint_header = json.load(f)
+        except Exception as e:
+            print(f"Checkpoint header warning: {e}")
+            return
+        if checkpoint_header.get('network_format_version') != CHECKPOINT_FORMAT_VERSION:
+            print(
+                "Ignoring legacy value-only checkpoints; starting fresh "
+                "policy-value MCTS Gen #1."
+            )
+            return
+
         teacher_loaded = False
         if os.path.exists('quorinet_teacher_weights.pth'):
             try:
@@ -1261,6 +1753,59 @@ class Quoridor:
                         int(k): deque(v, maxlen=self.LOG_WINDOW_SIZE)
                         for k, v in meta.get('checkpoint_log', {}).items()
                     }
+                    self.checkpoint_side_log = {}
+                    for raw_gen, raw_sides in meta.get(
+                        'checkpoint_side_log', {}
+                    ).items():
+                        gen = int(raw_gen)
+                        self.checkpoint_side_log[gen] = {
+                            1: deque(
+                                raw_sides.get('1', raw_sides.get(1, [])),
+                                maxlen=self.LOG_WINDOW_SIZE // 2
+                            ),
+                            2: deque(
+                                raw_sides.get('2', raw_sides.get(2, [])),
+                                maxlen=self.LOG_WINDOW_SIZE // 2
+                            )
+                        }
+                    self.training_result_history = deque(
+                        meta.get('training_result_history', []),
+                        maxlen=100
+                    )
+                    self.training_next_student_side = {
+                        int(k): int(v) for k, v in
+                        meta.get('training_next_student_side', {}).items()
+                    }
+                    self.gate_next_student_side = {
+                        int(k): int(v) for k, v in
+                        meta.get('gate_next_student_side', {}).items()
+                    }
+                    self.gate_eval_cursor = int(
+                        meta.get('gate_eval_cursor', 0)
+                    )
+                    self.last_gate_eval_training_game = int(
+                        meta.get('last_gate_eval_training_game', 0)
+                    )
+
+                    # Logs from the pre-separation implementation contain
+                    # exploratory games and are not valid qualification data.
+                    # Richer legacy checkpoints already include per-side logs,
+                    # so those can be migrated without throwing results away.
+                    gate_metrics_version = int(
+                        meta.get('gate_metrics_version', 0)
+                    )
+                    discard_legacy_gate_logs = False
+                    if (
+                        self.checkpoint_log
+                        and not self.checkpoint_side_log
+                        and gate_metrics_version < 1
+                    ):
+                        print(
+                            "Metadata migration: clearing exploratory WR logs; "
+                            "frozen gate evaluation will rebuild them."
+                        )
+                        self.checkpoint_log.clear()
+                        discard_legacy_gate_logs = True
                     self.escalation_state = {
                         int(k): v for k, v in meta.get('escalation_state', {}).items()
                     }
@@ -1271,7 +1816,9 @@ class Quoridor:
                     # loadable. If absent, seed the latest-only metric from the
                     # already generation-tagged checkpoint log.
                     latest_hist = meta.get('latest_teacher_history')
-                    if latest_hist is None:
+                    if discard_legacy_gate_logs:
+                        latest_hist = []
+                    elif latest_hist is None:
                         latest_hist = list(self.checkpoint_log.get(self.teacher_gen, []))
                     self.latest_teacher_history = deque(
                         latest_hist,
@@ -1347,15 +1894,51 @@ class Quoridor:
             except Exception as e:
                 print(f"Metadata load warning: {e}")
 
+        self._load_replay_if_exists()
+
+    def _load_replay_if_exists(self):
+        if not os.path.exists('quorinet_replay.pth'):
+            return
+        try:
+            replay = torch.load('quorinet_replay.pth', weights_only=True)
+            if not (
+                isinstance(replay, dict)
+                and replay.get('format_version') == CHECKPOINT_FORMAT_VERSION
+            ):
+                print("Ignoring legacy value-only replay.")
+                return
+            self.latest_replay_buffer.extend(replay.get('latest', []))
+            self.historic_replay_buffer.extend(replay.get('historic', []))
+            print(
+                f"Replay restored: latest={len(self.latest_replay_buffer)}, "
+                f"historic={len(self.historic_replay_buffer)}"
+            )
+        except Exception as e:
+            print(f"Replay load warning: {e}")
+
     def save_meta(self):
         with open('quorinet_meta.json', 'w') as f:
             json.dump({
+                'network_format_version': CHECKPOINT_FORMAT_VERSION,
                 'games_played': self.games_played,
                 'teacher_gen': self.teacher_gen,
                 'heuristic_weight': self.heuristic_weight,
                 'student_eval_history': list(self.student_eval_history),
                 'latest_teacher_history': list(self.latest_teacher_history),
                 'checkpoint_log': {k: list(v) for k, v in self.checkpoint_log.items()},
+                'checkpoint_side_log': {
+                    gen: {
+                        side: list(results)
+                        for side, results in sides.items()
+                    }
+                    for gen, sides in self.checkpoint_side_log.items()
+                },
+                'gate_metrics_version': 1,
+                'training_result_history': list(self.training_result_history),
+                'training_next_student_side': self.training_next_student_side,
+                'gate_next_student_side': self.gate_next_student_side,
+                'gate_eval_cursor': self.gate_eval_cursor,
+                'last_gate_eval_training_game': self.last_gate_eval_training_game,
                 'escalation_state': self.escalation_state,
                 'wawr_history': self.wawr_history,
                 'lr_last_reduced_at_gen': self.lr_last_reduced_at_gen,
@@ -1376,6 +1959,12 @@ class Quoridor:
         torch.save(self.teacher_net.state_dict(), 'quorinet_teacher_weights.pth')
         torch.save(self.student_net.state_dict(), 'quorinet_student_weights.pth')
         torch.save(self.optimizer.state_dict(), 'quorinet_optimizer.pth')
+        torch.save({
+            'format_version': CHECKPOINT_FORMAT_VERSION,
+            'teacher_gen': self.teacher_gen,
+            'latest': list(self.latest_replay_buffer),
+            'historic': list(self.historic_replay_buffer)
+        }, 'quorinet_replay.pth')
         self.save_meta()
         print(f"[{'Manual' if manual else 'Auto'} Saved] Gen #{self.teacher_gen} saved.")
         self.toast_msg, self.toast_timer = f"Saved Checkpoint! (Gen #{self.teacher_gen})", 120
@@ -1535,30 +2124,36 @@ class Quoridor:
 
         return all_passed
 
-    def train_step(self, state_tensor, turn_pid, next_state_tensor, next_turn_pid, done, winner_id):
+    def train_step(self, state_tensor, policy_target, turn_pid,
+                   next_state_tensor, next_turn_pid, done, winner_id):
         gamma = 0.99
         if done:
             target = 0.0 if winner_id == 0 else (1.0 if turn_pid == winner_id else -1.0)
         else:
             with torch.no_grad():
-                next_val = self.teacher_net(next_state_tensor.unsqueeze(0)).item()
+                _, next_value = self.teacher_net(
+                    next_state_tensor.unsqueeze(0)
+                )
+                next_val = next_value.item()
             target = gamma * next_val if next_turn_pid == turn_pid else gamma * (-next_val)
 
         opponent_gen = self.current_opponent_gen
-        # Keep the original stable one-step teacher target.
-        self._append_replay_sample(state_tensor, target, opponent_gen)
-
-        # Retain the episode long enough to propagate the real terminal outcome
-        # through every matchup that participates in the promotion gate.
-        self.episode_trajectory.append(
-            (state_tensor, turn_pid, target, opponent_gen)
-        )
+        # Retain the episode until its outcome is known. Each position is added
+        # to replay exactly once below with the configured outcome/bootstrap
+        # blend. Adding a bootstrap sample here and a blended sample at the end
+        # would halve the intended outcome influence and anchor the student too
+        # strongly to the teacher it is supposed to surpass.
+        if policy_target is not None:
+            self.episode_trajectory.append(
+                (state_tensor, policy_target, turn_pid, target, opponent_gen)
+            )
 
         if done:
             if self.episode_trajectory:
                 final_index = len(self.episode_trajectory) - 1
                 for i, (
                     episode_state,
+                    episode_policy,
                     episode_pid,
                     bootstrap_target,
                     episode_gen
@@ -1578,6 +2173,7 @@ class Quoridor:
                     )
                     self._append_replay_sample(
                         episode_state,
+                        episode_policy,
                         mixed_target,
                         episode_gen
                     )
@@ -1588,13 +2184,20 @@ class Quoridor:
         if batch is not None:
             self.student_net.train()
             states = torch.stack([item[0] for item in batch])
-            targets = torch.tensor(
-                [[item[1]] for item in batch],
+            policy_targets = torch.stack([
+                item[1].to(dtype=torch.float32) for item in batch
+            ])
+            value_targets = torch.tensor(
+                [[item[2]] for item in batch],
                 dtype=torch.float32
             )
             self.optimizer.zero_grad()
-            predictions = self.student_net(states)
-            loss = self.loss_fn(predictions, targets)
+            policy_logits, value_predictions = self.student_net(states)
+            value_loss = self.loss_fn(value_predictions, value_targets)
+            policy_loss = -(
+                policy_targets * torch.log_softmax(policy_logits, dim=1)
+            ).sum(dim=1).mean()
+            loss = value_loss + self.POLICY_LOSS_WEIGHT * policy_loss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 self.student_net.parameters(),
@@ -1602,6 +2205,8 @@ class Quoridor:
             )
             self.optimizer.step()
             self.last_loss = loss.item()
+            self.last_value_loss = value_loss.item()
+            self.last_policy_loss = policy_loss.item()
             self.student_net.eval()
 
     def log_match_result(self, winner_id):
@@ -1976,36 +2581,24 @@ class Quoridor:
                     self.save_checkpoint(manual=False)
 
                 student_won = 1 if winner_id == self.student_id else 0
-                self.student_eval_history.append(student_won)
-
-                gen = self.current_opponent_gen
-                if gen not in self.checkpoint_log:
-                    self.checkpoint_log[gen] = deque(maxlen=self.LOG_WINDOW_SIZE)
-                self.checkpoint_log[gen].append(student_won)
+                self.training_result_history.append(student_won)
                 self.lr_training_games_seen += 1
 
-                if self.current_opponent_is_latest:
-                    self.latest_teacher_history.append(student_won)
-                    self.latest_teacher_games_seen += 1
+                # Exploratory games train the value network but never count as
+                # promotion evidence. Periodic frozen games update every gate,
+                # opponent weight, and the AutoLR metric without epsilon bias.
+                gate_ran = False
+                if (
+                    self.lr_training_games_seen
+                    - self.last_gate_eval_training_game
+                    >= self.GATE_EVAL_INTERVAL_TRAINING_GAMES
+                ):
+                    gate_ran = self._run_gate_evaluation_cycle()
 
-                # Keep the displayed and next-game sampling weights current
-                # after every result, including historical opponents.
-                self._refresh_opponent_weights()
-
-                latest_log = self.checkpoint_log.get(self.teacher_gen)
-                if latest_log:
-                    latest_wins = sum(latest_log)
-                    latest_games = len(latest_log)
-                    self.student_win_rate_str = (
-                        f"{latest_wins / latest_games * 100:.1f}% Latest "
-                        f"({latest_wins}/{latest_games})"
-                    )
-
-                self._tune_learning_rate_from_pool(force=False)
-                print(f"Current training WRs: {self._format_training_win_rates()}")
+                print(f"Frozen gate WRs: {self._format_training_win_rates()}")
                 self.save_meta()
 
-                if self._all_training_gates_met():
+                if gate_ran and self._all_training_gates_met():
                     print(
                         f"Candidate Gen #{self.teacher_gen + 1} cleared every "
                         f"live training gate. Starting final frozen test."
@@ -2032,6 +2625,12 @@ class Quoridor:
                         self._roll_replay_buffers_for_new_teacher()
                         self.latest_teacher_history.clear()
                         self.checkpoint_log.clear()
+                        self.checkpoint_side_log.clear()
+                        self.training_result_history.clear()
+                        self.training_next_student_side.clear()
+                        self.gate_next_student_side.clear()
+                        self.gate_eval_cursor = 0
+                        self.last_gate_eval_training_game = 0
                         self._reset_lr_search_for_new_teacher()
                         self.curriculum_latest_credit = 1.0
 
@@ -2048,19 +2647,34 @@ class Quoridor:
         print(f"Starting Headless Turbo Training for {num_games} games...")
         self.mode = "TRAIN"
         self.is_training_active = True
+        self.manual_save_requested = False
+        self.shutdown_requested = False
         self.reset_game()
         
         def command_listener():
             while True:
-                cmd = sys.stdin.readline().strip().lower()
+                line = sys.stdin.readline()
+                if line == '':
+                    return
+                cmd = line.strip().lower()
                 if cmd == 'p': self.is_training_active = not self.is_training_active
-                elif cmd == 's': self.save_checkpoint(manual=True)
-                elif cmd == 'q': os._exit(0)
+                elif cmd == 's': self.manual_save_requested = True
+                elif cmd == 'q': self.shutdown_requested = True
                     
         threading.Thread(target=command_listener, daemon=True).start()
         target_games, last_print = self.games_played + num_games, self.games_played
         
         while self.games_played < target_games:
+            if self.shutdown_requested:
+                print("Safe shutdown requested; saving full checkpoint...")
+                self.save_checkpoint(manual=True)
+                pygame.quit()
+                return
+
+            if self.manual_save_requested:
+                self.manual_save_requested = False
+                self.save_checkpoint(manual=True)
+
             if not self.is_training_active:
                 time.sleep(0.5)
                 continue
@@ -2082,6 +2696,7 @@ class Quoridor:
             eps = 0.0 if is_teacher else (0.30 * (0.85 ** self.state['turns_played']))
             
             action, _ = active_bot.get_move_and_eval(self.state, epsilon=eps)
+            policy_target = active_bot.last_policy_target
             if action: self.state = active_bot.apply_action(self.state, pre_action_pid, action, is_random=getattr(active_bot, 'was_last_random', False))
             else: self.state['turns_played'] = 200
                 
@@ -2090,7 +2705,10 @@ class Quoridor:
             next_pid = self.state['turn']
             winner_id = getattr(self, 'winner_id', 0) if self.game_over else 0
             
-            self.train_step(pre_action_state_tensor, pre_action_pid, next_state_tensor, next_pid, self.game_over, winner_id)
+            self.train_step(
+                pre_action_state_tensor, policy_target, pre_action_pid,
+                next_state_tensor, next_pid, self.game_over, winner_id
+            )
                 
         print(f"Headless training complete! Total games played: {self.games_played}")
         self.save_checkpoint(manual=True)
@@ -2169,6 +2787,7 @@ class Quoridor:
                     eps = 0.0 if is_teacher else (0.30 * (0.85 ** self.state['turns_played']))
                     
                     action, _ = active_bot.get_move_and_eval(self.state, epsilon=eps)
+                    policy_target = active_bot.last_policy_target
                     if action: self.state = active_bot.apply_action(self.state, pre_action_pid, action, is_random=getattr(active_bot, 'was_last_random', False))
                     else: self.state['turns_played'] = 200
 
@@ -2176,7 +2795,10 @@ class Quoridor:
                     next_state_tensor = encode_state(self.state, self.state['turn'])
                     next_pid = self.state['turn']
                     winner_id = getattr(self, 'winner_id', 0) if self.game_over else 0
-                    self.train_step(pre_action_state_tensor, pre_action_pid, next_state_tensor, next_pid, self.game_over, winner_id)
+                    self.train_step(
+                        pre_action_state_tensor, policy_target, pre_action_pid,
+                        next_state_tensor, next_pid, self.game_over, winner_id
+                    )
 
             elif self.mode == "PLAY" and self.state['turn'] == 2 and not self.game_over:
                 if not bot_thinking and bot_result is None:
