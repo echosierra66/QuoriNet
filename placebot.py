@@ -32,26 +32,65 @@ sys.stdout = TerminalLogger(sys.stdout)
 # ==========================================
 # NEURAL NETWORK ARCHITECTURE
 # ==========================================
-class SpatialQuoriNetV2(nn.Module):
-    def __init__(self, in_channels=8):
-        # Channels: P1 pos, P2 pos, H-wall, V-wall, P1 walls-left, P2 walls-left, P1 path-dist, P2 path-dist
+BOARD_SIZE = 9
+WALL_GRID_SIZE = 8
+PAWN_ACTIONS = BOARD_SIZE * BOARD_SIZE
+WALL_ACTIONS_PER_ORIENTATION = WALL_GRID_SIZE * WALL_GRID_SIZE
+ACTION_SIZE = PAWN_ACTIONS + 2 * WALL_ACTIONS_PER_ORIENTATION
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
-            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
-            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
-            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        residual = x
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.bn2(self.conv2(x))
+        return self.relu(x + residual)
+
+
+class SpatialQuoriNetV3(nn.Module):
+    """AlphaZero-style shared trunk with policy and value heads."""
+
+    def __init__(self, in_channels=8, channels=64, residual_blocks=4):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
         )
-        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.residual_tower = nn.Sequential(
+            *[ResidualBlock(channels) for _ in range(residual_blocks)]
+        )
+        self.policy_head = nn.Sequential(
+            nn.Conv2d(channels, 4, 1, bias=False),
+            nn.BatchNorm2d(4),
+            nn.ReLU(inplace=True),
+            nn.Flatten(),
+            nn.Linear(4 * BOARD_SIZE * BOARD_SIZE, ACTION_SIZE),
+        )
+        self.value_conv = nn.Sequential(
+            nn.Conv2d(channels, 2, 1, bias=False),
+            nn.BatchNorm2d(2),
+            nn.ReLU(inplace=True),
+            nn.Flatten(),
+        )
         self.value_head = nn.Sequential(
-            nn.Linear(64, 64), nn.ReLU(),
-            nn.Linear(64, 1), nn.Tanh()
+            nn.Linear(2 * BOARD_SIZE * BOARD_SIZE, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1),
+            nn.Tanh(),
         )
 
     def forward(self, x):
-        x = self.conv(x)
-        x = self.pool(x).flatten(1)
-        return self.value_head(x)
+        features = self.residual_tower(self.stem(x))
+        return self.policy_head(features), self.value_head(self.value_conv(features))
 
 # Global Helper for encode_state distance calcs
 def get_adjacent_global(state, c, r):
@@ -76,8 +115,34 @@ def get_shortest_path_dist(state, pid):
                 queue.append((nxt, dist + 1))
     return 999  # Blocked
 
+
+def get_goal_distance_map(state, pid):
+    """Return topology-only shortest distance from every cell to pid's goal."""
+    target_row = 0 if pid == 1 else 8
+    distances = [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+    queue = deque()
+    for c in range(BOARD_SIZE):
+        distances[target_row][c] = 0
+        queue.append((c, target_row))
+
+    while queue:
+        c, r = queue.popleft()
+        next_distance = distances[r][c] + 1
+        for nc, nr in get_adjacent_global(state, c, r):
+            if distances[nr][nc] is None:
+                distances[nr][nc] = next_distance
+                queue.append((nc, nr))
+
+    result = torch.ones((BOARD_SIZE, BOARD_SIZE), dtype=torch.float32)
+    normalizer = float(BOARD_SIZE * BOARD_SIZE - 1)
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if distances[r][c] is not None:
+                result[r, c] = distances[r][c] / normalizer
+    return result
+
 def encode_state(state, active_pid):
-    # 8 Channels exactly as specified
+    """Encode from the active player's canonical, upward-moving perspective."""
     tensor = torch.zeros((8, 9, 9), dtype=torch.float32)
     
     my_pos = state['p1_pos'] if active_pid == 1 else state['p2_pos']
@@ -100,20 +165,89 @@ def encode_state(state, active_pid):
             
     my_walls = state['p1_walls'] if active_pid == 1 else state['p2_walls']
     opp_walls = state['p2_walls'] if active_pid == 1 else state['p1_walls']
-    my_dist = get_shortest_path_dist(state, active_pid)
-    opp_dist = get_shortest_path_dist(state, 2 if active_pid == 1 else 1)
+    opponent_pid = 2 if active_pid == 1 else 1
+    my_distances = get_goal_distance_map(state, active_pid)
+    opp_distances = get_goal_distance_map(state, opponent_pid)
     
     tensor[4, :, :] = my_walls / 10.0
     tensor[5, :, :] = opp_walls / 10.0
-    tensor[6, :, :] = my_dist / 81.0
-    tensor[7, :, :] = opp_dist / 81.0
+    if active_pid == 2:
+        my_distances = torch.flip(my_distances, dims=(0, 1))
+        opp_distances = torch.flip(opp_distances, dims=(0, 1))
+    tensor[6] = my_distances
+    tensor[7] = opp_distances
     
     return tensor
+
+
+def action_to_index(action, active_pid):
+    """Map a global-coordinate action into the active player's canonical index."""
+    kind, payload = action
+    if kind == 'move':
+        c, r = payload
+        if active_pid == 2:
+            c, r = 8 - c, 8 - r
+        return r * BOARD_SIZE + c
+
+    c, r, orient = payload
+    if active_pid == 2:
+        c, r = 7 - c, 7 - r
+    offset = PAWN_ACTIONS if orient == 'H' else PAWN_ACTIONS + WALL_ACTIONS_PER_ORIENTATION
+    return offset + r * WALL_GRID_SIZE + c
+
+
+def index_to_action(index, active_pid):
+    """Map a canonical policy index back to a global-coordinate action."""
+    if index < PAWN_ACTIONS:
+        c, r = index % BOARD_SIZE, index // BOARD_SIZE
+        if active_pid == 2:
+            c, r = 8 - c, 8 - r
+        return ('move', (c, r))
+
+    wall_index = index - PAWN_ACTIONS
+    orient = 'H' if wall_index < WALL_ACTIONS_PER_ORIENTATION else 'V'
+    if orient == 'V':
+        wall_index -= WALL_ACTIONS_PER_ORIENTATION
+    c, r = wall_index % WALL_GRID_SIZE, wall_index // WALL_GRID_SIZE
+    if active_pid == 2:
+        c, r = 7 - c, 7 - r
+    return ('wall', (c, r, orient))
+
+
+def mirror_state_tensor(tensor):
+    """Reflect a canonical tensor across the board's vertical centre line."""
+    mirrored = tensor.clone()
+    for channel in (0, 1, 6, 7):
+        mirrored[channel] = torch.flip(tensor[channel], dims=(1,))
+    for channel in (2, 3):
+        mirrored[channel].zero_()
+        mirrored[channel, :, :WALL_GRID_SIZE] = torch.flip(
+            tensor[channel, :, :WALL_GRID_SIZE], dims=(1,)
+        )
+    return mirrored
+
+
+def mirror_policy(policy):
+    """Reflect a canonical policy vector across the vertical centre line."""
+    mirrored = torch.zeros_like(policy)
+    for index in range(ACTION_SIZE):
+        if index < PAWN_ACTIONS:
+            c, r = index % BOARD_SIZE, index // BOARD_SIZE
+            mirrored[r * BOARD_SIZE + (8 - c)] = policy[index]
+        else:
+            wall_index = index - PAWN_ACTIONS
+            orient_offset = 0
+            if wall_index >= WALL_ACTIONS_PER_ORIENTATION:
+                wall_index -= WALL_ACTIONS_PER_ORIENTATION
+                orient_offset = WALL_ACTIONS_PER_ORIENTATION
+            c, r = wall_index % WALL_GRID_SIZE, wall_index // WALL_GRID_SIZE
+            mirrored[PAWN_ACTIONS + orient_offset + r * WALL_GRID_SIZE + (7 - c)] = policy[index]
+    return mirrored
 
 def get_state_key(state):
     return (state['p1_pos'], state['p2_pos'], tuple(sorted(state['walls_h'])), tuple(sorted(state['walls_v'])))
 
-class QuoridorBot:
+class LegacyQuoridorBot:
     RECENT_MEMORY_LEN = 8
     OSCILLATION_PENALTY = 45.0
     TOP_MOVE_POOL_SIZE = 4
@@ -340,7 +474,10 @@ class QuoridorBot:
 
         if self.nn_model is not None:
             with torch.no_grad():
-                nn_val = self.nn_model(encode_state(state, eval_pid).unsqueeze(0)).item()
+                _, nn_val = self.nn_model(
+                    encode_state(state, eval_pid).unsqueeze(0)
+                )
+                nn_val = nn_val.item()
             
             nn_score = nn_val * 100.0
             heur_score = (d2 - d1) * 5.0
@@ -452,6 +589,280 @@ class QuoridorBot:
                 if beta <= alpha: break
             return best_action, min_eval
 
+
+class MCTSNode:
+    def __init__(self, prior=0.0, state=None):
+        self.prior = float(prior)
+        self.state = state
+        self.visit_count = 0
+        self.value_sum = 0.0
+        self.children = {}
+
+    @property
+    def expanded(self):
+        return bool(self.children)
+
+    @property
+    def value(self):
+        return self.value_sum / self.visit_count if self.visit_count else 0.0
+
+
+class QuoridorBot(LegacyQuoridorBot):
+    """Quoridor rules plus AlphaZero-style PUCT Monte Carlo tree search."""
+
+    C_PUCT = 1.5
+    DIRICHLET_ALPHA = 0.30
+    DIRICHLET_FRACTION = 0.25
+    EARLY_TEMPERATURE_PLIES = 15
+    VALUE_PRUNE_LIMIT = 32
+    VALUE_PRUNE_PREFILTER = 56
+
+    def __init__(self, bot_id=2, max_depth=3, nn_model=None,
+                 heuristic_weight=1.0, num_simulations=None):
+        super().__init__(bot_id, max_depth, nn_model, heuristic_weight)
+        self.num_simulations = num_simulations or max(24, max_depth * 16)
+
+    def generate_actions(self, state, pid):
+        """Enumerate the complete legal action set used by the MCTS mask."""
+        actions = [('move', move) for move in self.get_valid_moves(state, pid)]
+        walls_left = state['p1_walls'] if pid == 1 else state['p2_walls']
+        if walls_left <= 0:
+            return actions
+        for orient in ('H', 'V'):
+            for r in range(WALL_GRID_SIZE):
+                for c in range(WALL_GRID_SIZE):
+                    if self.is_valid_wall(state, c, r, orient):
+                        actions.append(('wall', (c, r, orient)))
+        return actions
+
+    def get_move_and_eval(self, state, epsilon=0.0, self_play=False):
+        """Return action, root value, and full canonical visit distribution."""
+        if self.nn_model is None:
+            actions = self.generate_actions(state, self.bot_id)
+            if not actions:
+                return None, 0.0, torch.zeros(ACTION_SIZE)
+            action = random.choice(actions)
+            policy = torch.zeros(ACTION_SIZE)
+            policy[action_to_index(action, self.bot_id)] = 1.0
+            return action, 0.0, policy
+
+        root = MCTSNode(prior=1.0, state=state)
+        self._expand(root)
+        if not root.children:
+            return None, 0.0, torch.zeros(ACTION_SIZE)
+        if self_play:
+            self._add_root_noise(root)
+
+        for _ in range(self.num_simulations):
+            node = root
+            search_path = [node]
+            while node.expanded:
+                _, node = self._select_child(node)
+                search_path.append(node)
+                if self._terminal_value(node.state) is not None:
+                    break
+
+            terminal_value = self._terminal_value(node.state)
+            leaf_value = terminal_value if terminal_value is not None else self._expand(node)
+            self._backpropagate(search_path, leaf_value)
+
+        temperature = 1.0 if (
+            self_play
+            and state.get('turns_played', 0) < self.EARLY_TEMPERATURE_PLIES
+        ) else 0.0
+        policy = self._visit_policy(root, temperature)
+        legal_indices = [action_to_index(action, self.bot_id) for action in root.children]
+        if temperature > 0.0:
+            weights = [float(policy[index]) for index in legal_indices]
+            chosen_index = random.choices(legal_indices, weights=weights, k=1)[0]
+        else:
+            chosen_index = max(legal_indices, key=lambda index: float(policy[index]))
+
+        chosen_action = index_to_action(chosen_index, self.bot_id)
+        most_visited = max(
+            root.children,
+            key=lambda action: root.children[action].visit_count,
+        )
+        self.was_last_random = self_play and chosen_action != most_visited
+        return chosen_action, root.value, policy
+
+    def get_move(self, state):
+        action, _, _ = self.get_move_and_eval(state, self_play=False)
+        return action
+
+    def evaluate(self, state, eval_pid):
+        if state['p1_pos'][1] == 0:
+            return 100.0 if eval_pid == 1 else -100.0
+        if state['p2_pos'][1] == 8:
+            return 100.0 if eval_pid == 2 else -100.0
+        if self.nn_model is None:
+            my_path = self.get_shortest_path(state, eval_pid)
+            opp_path = self.get_shortest_path(state, self.get_opponent(eval_pid))
+            return float(
+                (len(opp_path) if opp_path else 99)
+                - (len(my_path) if my_path else 99)
+            )
+        with torch.no_grad():
+            _, value = self.nn_model(encode_state(state, eval_pid).unsqueeze(0))
+        return value.item() * 100.0
+
+    def _terminal_value(self, state):
+        winner = 0
+        if state['p1_pos'][1] == 0:
+            winner = 1
+        elif state['p2_pos'][1] == 8:
+            winner = 2
+        elif state.get('turns_played', 0) >= 200:
+            return 0.0
+        if not winner:
+            return None
+        return 1.0 if state['turn'] == winner else -1.0
+
+    def _network_prediction(self, state):
+        with torch.no_grad():
+            logits, value = self.nn_model(
+                encode_state(state, state['turn']).unsqueeze(0)
+            )
+        return logits.squeeze(0), float(value.item())
+
+    def _value_guided_prune(self, state, actions, logits):
+        """Use the current value head to prune large wall branches."""
+        if len(actions) <= self.VALUE_PRUNE_LIMIT:
+            return actions
+
+        pid = state['turn']
+        pawn_actions = [action for action in actions if action[0] == 'move']
+        wall_actions = [action for action in actions if action[0] == 'wall']
+        wall_actions.sort(
+            key=lambda action: float(logits[action_to_index(action, pid)]),
+            reverse=True,
+        )
+        prefiltered = wall_actions[:self.VALUE_PRUNE_PREFILTER]
+        next_states = [self.apply_action(state, pid, action) for action in prefiltered]
+        if not next_states:
+            return pawn_actions
+
+        batch = torch.stack([
+            encode_state(next_state, next_state['turn']) for next_state in next_states
+        ])
+        with torch.no_grad():
+            _, child_values = self.nn_model(batch)
+        parent_values = -child_values.flatten()
+        scored = []
+        for action, value in zip(prefiltered, parent_values):
+            prior_logit = float(logits[action_to_index(action, pid)])
+            scored.append((float(value) + 0.05 * prior_logit, action))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        wall_slots = max(0, self.VALUE_PRUNE_LIMIT - len(pawn_actions))
+        return pawn_actions + [action for _, action in scored[:wall_slots]]
+
+    def _search_candidate_actions(self, state, pid, logits):
+        """Policy-prefilter walls before expensive path-legality validation."""
+        actions = [('move', move) for move in self.get_valid_moves(state, pid)]
+        walls_left = state['p1_walls'] if pid == 1 else state['p2_walls']
+        if walls_left <= 0:
+            return actions
+
+        candidates = []
+        for orient in ('H', 'V'):
+            for r in range(WALL_GRID_SIZE):
+                for c in range(WALL_GRID_SIZE):
+                    if orient == 'H':
+                        blocked = (
+                            (c, r) in state['walls_h']
+                            or (c - 1, r) in state['walls_h']
+                            or (c + 1, r) in state['walls_h']
+                            or (c, r) in state['walls_v']
+                        )
+                    else:
+                        blocked = (
+                            (c, r) in state['walls_v']
+                            or (c, r - 1) in state['walls_v']
+                            or (c, r + 1) in state['walls_v']
+                            or (c, r) in state['walls_h']
+                        )
+                    if not blocked:
+                        action = ('wall', (c, r, orient))
+                        candidates.append((
+                            float(logits[action_to_index(action, pid)]), action
+                        ))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        for _, action in candidates[:self.VALUE_PRUNE_PREFILTER]:
+            c, r, orient = action[1]
+            if self.is_valid_wall(state, c, r, orient):
+                actions.append(action)
+        return actions
+
+    def _expand(self, node):
+        logits, value = self._network_prediction(node.state)
+        pid = node.state['turn']
+        actions = self._search_candidate_actions(node.state, pid, logits)
+        actions = self._value_guided_prune(node.state, actions, logits)
+        if not actions:
+            return value
+
+        indices = torch.tensor([action_to_index(action, pid) for action in actions])
+        priors = torch.softmax(logits[indices], dim=0)
+        for action, prior in zip(actions, priors):
+            child_state = self.apply_action(node.state, pid, action)
+            node.children[action] = MCTSNode(float(prior), child_state)
+        return value
+
+    def _select_child(self, node):
+        sqrt_parent = math.sqrt(node.visit_count + 1)
+        best_score = float('-inf')
+        best = None
+        for action, child in node.children.items():
+            q_value = -child.value
+            exploration = (
+                self.C_PUCT * child.prior * sqrt_parent
+                / (1 + child.visit_count)
+            )
+            score = q_value + exploration + random.random() * 1e-10
+            if score > best_score:
+                best_score = score
+                best = (action, child)
+        return best
+
+    def _backpropagate(self, search_path, value):
+        for node in reversed(search_path):
+            node.visit_count += 1
+            node.value_sum += value
+            value = -value
+
+    def _add_root_noise(self, root):
+        children = list(root.children.values())
+        noise = [
+            random.gammavariate(self.DIRICHLET_ALPHA, 1.0)
+            for _ in children
+        ]
+        total = sum(noise) or 1.0
+        for child, sample in zip(children, noise):
+            child.prior = (
+                (1.0 - self.DIRICHLET_FRACTION) * child.prior
+                + self.DIRICHLET_FRACTION * (sample / total)
+            )
+
+    def _visit_policy(self, root, temperature):
+        policy = torch.zeros(ACTION_SIZE, dtype=torch.float32)
+        if temperature <= 1e-8:
+            best_action = max(
+                root.children,
+                key=lambda action: root.children[action].visit_count,
+            )
+            policy[action_to_index(best_action, self.bot_id)] = 1.0
+            return policy
+
+        exponent = 1.0 / temperature
+        weighted = {
+            action: float(child.visit_count) ** exponent
+            for action, child in root.children.items()
+        }
+        total = sum(weighted.values()) or 1.0
+        for action, weight in weighted.items():
+            policy[action_to_index(action, self.bot_id)] = weight / total
+        return policy
+
 SCALE = 0.92
 
 BG_COLOR, BOARD_BG = (242, 244, 247), (231, 234, 238)
@@ -518,9 +929,14 @@ class Quoridor:
         self.REPLAY_HISTORIC_CAPACITY = 60000
         self.REPLAY_WARMUP = 256
         self.REPLAY_BATCH_SIZE = 128
+        self.PER_ALPHA = 0.60
+        self.PER_BETA = 0.40
+        self.PER_EPSILON = 1e-4
+        self.OPENING_PRUNE_PLIES = 3
 
-        self.OUTCOME_BACKFILL_MIX = 0.70
-        self.OUTCOME_BACKFILL_DISCOUNT = 0.995
+        self.SEARCH_VALUE_MIX = 0.30
+        self.POLICY_LOSS_WEIGHT = 1.0
+        self.VALUE_LOSS_WEIGHT = 1.0
 
         self.LR_MIN = 0.00001
         self.LR_MAX = 0.0008
@@ -533,12 +949,13 @@ class Quoridor:
         self.LR_CONVERGE_FACTOR = 0.85
         self.GRAD_CLIP_NORM = 1.0
 
-        self.student_net = SpatialQuoriNetV2(in_channels=8)
-        self.teacher_net = SpatialQuoriNetV2(in_channels=8)
+        self.student_net = SpatialQuoriNetV3(in_channels=8)
+        self.teacher_net = SpatialQuoriNetV3(in_channels=8)
         self.student_net.eval()
         self.teacher_net.eval()
-        self.optimizer = optim.Adam(self.student_net.parameters(), lr=0.0001)
-        self.loss_fn = nn.MSELoss()
+        self.optimizer = optim.AdamW(
+            self.student_net.parameters(), lr=0.0001, weight_decay=1e-4
+        )
 
         self.games_played = 0
         self.teacher_gen = 1
@@ -556,6 +973,7 @@ class Quoridor:
         self.latest_replay_buffer = deque(maxlen=self.REPLAY_LATEST_CAPACITY)
         self.historic_replay_buffer = deque(maxlen=self.REPLAY_HISTORIC_CAPACITY)
         self.episode_trajectory = []
+        self.max_replay_priority = 1.0
         self.last_loss = 0.0
 
         self.match_history = deque(maxlen=6)
@@ -624,7 +1042,7 @@ class Quoridor:
 
         historic_gens = [
             g for g in range(1, recent_start)
-            if os.path.exists(f'quorinet_teacher_gen_{g}.pth')
+            if os.path.exists(f'quorinet_v3_teacher_gen_{g}.pth')
         ]
         if historic_gens:
             hist_weights = {}
@@ -865,12 +1283,37 @@ class Quoridor:
         support_weights = [self.opponent_weights[i] for i in support_indices]
         return random.choices(support_pool, weights=support_weights, k=1)[0]
 
-    def _append_replay_sample(self, state_tensor, target, opponent_gen):
-        item = (state_tensor, float(max(-1.0, min(1.0, target))))
+    def _append_replay_sample(self, state_tensor, policy_target, value_target,
+                              opponent_gen):
+        item = {
+            'state': state_tensor.detach().cpu().to(torch.float16),
+            'policy': policy_target.detach().cpu().to(torch.float16),
+            'value': float(max(-1.0, min(1.0, value_target))),
+            'priority': self.max_replay_priority,
+        }
         if opponent_gen == self.teacher_gen:
             self.latest_replay_buffer.append(item)
         else:
             self.historic_replay_buffer.append(item)
+
+    def _prioritized_sample(self, buffer, count):
+        if not count:
+            return []
+        population = list(buffer)
+        weights = [
+            max(self.PER_EPSILON, item['priority']) ** self.PER_ALPHA
+            for item in population
+        ]
+        weight_sum = sum(weights) or 1.0
+        selected = random.choices(population, weights=weights, k=count)
+        probability_by_id = {
+            id(item): weight / weight_sum
+            for item, weight in zip(population, weights)
+        }
+        return [
+            (item, probability_by_id[id(item)], len(population))
+            for item in selected
+        ]
 
     def _sample_replay_batch(self):
         total_samples = (
@@ -909,10 +1352,8 @@ class Quoridor:
             return None
 
         batch = []
-        if n_latest:
-            batch.extend(random.sample(self.latest_replay_buffer, n_latest))
-        if n_historic:
-            batch.extend(random.sample(self.historic_replay_buffer, n_historic))
+        batch.extend(self._prioritized_sample(self.latest_replay_buffer, n_latest))
+        batch.extend(self._prioritized_sample(self.historic_replay_buffer, n_historic))
         random.shuffle(batch)
         return batch
 
@@ -1072,10 +1513,10 @@ class Quoridor:
 
     def _load_net_for_gen(self, gen):
         if gen == self.teacher_gen: return self.teacher_net
-        path = f'quorinet_teacher_gen_{gen}.pth'
+        path = f'quorinet_v3_teacher_gen_{gen}.pth'
         if not os.path.exists(path): return None
         try:
-            net = SpatialQuoriNetV2(in_channels=8)
+            net = SpatialQuoriNetV3(in_channels=8)
             net.load_state_dict(torch.load(path, weights_only=True))
             net.eval()
             return net
@@ -1199,9 +1640,9 @@ class Quoridor:
 
     def load_checkpoint_if_exists(self):
         teacher_loaded = False
-        if os.path.exists('quorinet_teacher_weights.pth'):
+        if os.path.exists('quorinet_v3_teacher_weights.pth'):
             try:
-                self.teacher_net.load_state_dict(torch.load('quorinet_teacher_weights.pth', weights_only=True))
+                self.teacher_net.load_state_dict(torch.load('quorinet_v3_teacher_weights.pth', weights_only=True))
                 teacher_loaded = True
             except Exception as e:
                 raise RuntimeError(
@@ -1209,28 +1650,28 @@ class Quoridor:
                     "refusing to continue with random teacher weights."
                 ) from e
 
-        if os.path.exists('quorinet_student_weights.pth'):
+        if os.path.exists('quorinet_v3_student_weights.pth'):
             try:
-                self.student_net.load_state_dict(torch.load('quorinet_student_weights.pth', weights_only=True))
+                self.student_net.load_state_dict(torch.load('quorinet_v3_student_weights.pth', weights_only=True))
             except Exception as e:
                 print(f"Student checkpoint load warning: {e}")
                 if teacher_loaded:
                     self.student_net.load_state_dict(self.teacher_net.state_dict())
-        elif teacher_loaded:
+        else:
             self.student_net.load_state_dict(self.teacher_net.state_dict())
 
-        if os.path.exists('quorinet_optimizer.pth'):
+        if os.path.exists('quorinet_v3_optimizer.pth'):
             try:
                 self.optimizer.load_state_dict(
-                    torch.load('quorinet_optimizer.pth', weights_only=True)
+                    torch.load('quorinet_v3_optimizer.pth', weights_only=True)
                 )
             except Exception as e:
                 print(f"Optimizer checkpoint load warning: {e}")
 
         self.heuristic_weight = 1.0
-        if os.path.exists('quorinet_meta.json'):
+        if os.path.exists('quorinet_v3_meta.json'):
             try:
-                with open('quorinet_meta.json', 'r') as f:
+                with open('quorinet_v3_meta.json', 'r') as f:
                     meta = json.load(f)
                     self.games_played = meta.get('games_played', 0)
                     self.teacher_gen = meta.get('teacher_gen', 1)
@@ -1324,7 +1765,7 @@ class Quoridor:
                 print(f"Metadata load warning: {e}")
 
     def save_meta(self):
-        with open('quorinet_meta.json', 'w') as f:
+        with open('quorinet_v3_meta.json', 'w') as f:
             json.dump({
                 'games_played': self.games_played,
                 'teacher_gen': self.teacher_gen,
@@ -1348,10 +1789,10 @@ class Quoridor:
             }, f)
 
     def save_checkpoint(self, manual=False):
-        torch.save(self.teacher_net.state_dict(), f'quorinet_teacher_gen_{self.teacher_gen}.pth')
-        torch.save(self.teacher_net.state_dict(), 'quorinet_teacher_weights.pth')
-        torch.save(self.student_net.state_dict(), 'quorinet_student_weights.pth')
-        torch.save(self.optimizer.state_dict(), 'quorinet_optimizer.pth')
+        torch.save(self.teacher_net.state_dict(), f'quorinet_v3_teacher_gen_{self.teacher_gen}.pth')
+        torch.save(self.teacher_net.state_dict(), 'quorinet_v3_teacher_weights.pth')
+        torch.save(self.student_net.state_dict(), 'quorinet_v3_student_weights.pth')
+        torch.save(self.optimizer.state_dict(), 'quorinet_v3_optimizer.pth')
         self.save_meta()
         print(f"[{'Manual' if manual else 'Auto'} Saved] Gen #{self.teacher_gen} saved.")
         self.toast_msg, self.toast_timer = f"Saved Checkpoint! (Gen #{self.teacher_gen})", 120
@@ -1386,7 +1827,9 @@ class Quoridor:
                 
                 pid = eval_state['turn']
                 active_bot = bot1 if pid == 1 else bot2
-                action, _ = active_bot.get_move_and_eval(eval_state, epsilon=0.0)
+                action, _, _ = active_bot.get_move_and_eval(
+                    eval_state, self_play=False
+                )
                 if not action:
                     result = 2 if pid == 1 else 1
                     break
@@ -1482,71 +1925,115 @@ class Quoridor:
 
         return all_passed
 
-    def train_step(self, state_tensor, turn_pid, next_state_tensor, next_turn_pid, done, winner_id):
-        gamma = 0.99
-        if done:
-            target = 0.0 if winner_id == 0 else (1.0 if turn_pid == winner_id else -1.0)
-        else:
-            with torch.no_grad():
-                next_val = self.teacher_net(next_state_tensor.unsqueeze(0)).item()
-            target = gamma * next_val if next_turn_pid == turn_pid else gamma * (-next_val)
-
-        opponent_gen = self.current_opponent_gen
-        self._append_replay_sample(state_tensor, target, opponent_gen)
-
-        self.episode_trajectory.append(
-            (state_tensor, turn_pid, target, opponent_gen)
-        )
+    def train_step(self, state_tensor, turn_pid, policy_target, search_value,
+                   ply, done, winner_id):
+        """Collect one search triplet and optimize a decorrelated replay batch."""
+        self.episode_trajectory.append((
+            state_tensor.detach().cpu(),
+            policy_target.detach().cpu(),
+            turn_pid,
+            float(max(-1.0, min(1.0, search_value))),
+            self.current_opponent_gen,
+            ply,
+        ))
 
         if done:
-            if self.episode_trajectory:
-                final_index = len(self.episode_trajectory) - 1
-                for i, (
+            for (
+                episode_state,
+                episode_policy,
+                episode_pid,
+                episode_search_value,
+                episode_gen,
+                episode_ply,
+            ) in self.episode_trajectory:
+                has_walls = bool(
+                    episode_state[2].sum().item()
+                    or episode_state[3].sum().item()
+                )
+                if episode_ply < self.OPENING_PRUNE_PLIES and not has_walls:
+                    continue
+                outcome = (
+                    0.0 if winner_id == 0
+                    else (1.0 if episode_pid == winner_id else -1.0)
+                )
+                value_target = (
+                    (1.0 - self.SEARCH_VALUE_MIX) * outcome
+                    + self.SEARCH_VALUE_MIX * episode_search_value
+                )
+                self._append_replay_sample(
                     episode_state,
-                    episode_pid,
-                    bootstrap_target,
-                    episode_gen
-                ) in enumerate(self.episode_trajectory):
-                    if winner_id == 0:
-                        outcome = 0.0
-                    else:
-                        outcome = 1.0 if episode_pid == winner_id else -1.0
-
-                    horizon = final_index - i
-                    discounted_outcome = (
-                        outcome * (self.OUTCOME_BACKFILL_DISCOUNT ** horizon)
-                    )
-                    mixed_target = (
-                        self.OUTCOME_BACKFILL_MIX * discounted_outcome
-                        + (1.0 - self.OUTCOME_BACKFILL_MIX) * bootstrap_target
-                    )
-                    self._append_replay_sample(
-                        episode_state,
-                        mixed_target,
-                        episode_gen
-                    )
-
+                    episode_policy,
+                    value_target,
+                    episode_gen,
+                )
             self.episode_trajectory.clear()
 
         batch = self._sample_replay_batch()
-        if batch is not None:
-            self.student_net.train()
-            states = torch.stack([item[0] for item in batch])
-            targets = torch.tensor(
-                [[item[1]] for item in batch],
-                dtype=torch.float32
-            )
-            self.optimizer.zero_grad()
-            predictions = self.student_net(states)
-            loss = self.loss_fn(predictions, targets)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                self.student_net.parameters(),
-                self.GRAD_CLIP_NORM
-            )
-            self.optimizer.step()
-            self.last_loss = loss.item()
-            self.student_net.eval()
+        if batch is None:
+            return
+
+        items = [entry[0] for entry in batch]
+        states = []
+        policies = []
+        for item in items:
+            state = item['state']
+            policy = item['policy']
+            if random.random() < 0.5:
+                state = mirror_state_tensor(state)
+                policy = mirror_policy(policy)
+            states.append(state)
+            policies.append(policy)
+
+        states = torch.stack(states).float()
+        policy_targets = torch.stack(policies).float()
+        value_targets = torch.tensor(
+            [[item['value']] for item in items], dtype=torch.float32
+        )
+        importance_weights = torch.tensor([
+            (max(1, population) * max(probability, 1e-12)) ** (-self.PER_BETA)
+            for _, probability, population in batch
+        ], dtype=torch.float32)
+        importance_weights /= importance_weights.max().clamp_min(1e-8)
+
+        self.student_net.train()
+        policy_logits, value_predictions = self.student_net(states)
+        log_probabilities = torch.log_softmax(policy_logits, dim=1)
+        policy_losses = -(policy_targets * log_probabilities).sum(dim=1)
+        value_losses = (value_predictions.flatten() - value_targets.flatten()).pow(2)
+        sample_losses = (
+            self.POLICY_LOSS_WEIGHT * policy_losses
+            + self.VALUE_LOSS_WEIGHT * value_losses
+        )
+        loss = (importance_weights * sample_losses).mean()
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            self.student_net.parameters(), self.GRAD_CLIP_NORM
+        )
+        self.optimizer.step()
+
+        with torch.no_grad():
+            predicted_probabilities = torch.softmax(policy_logits, dim=1)
+            policy_errors = (
+                policy_targets
+                * (
+                    torch.log(policy_targets.clamp_min(1e-8))
+                    - torch.log(predicted_probabilities.clamp_min(1e-8))
+                )
+            ).sum(dim=1).clamp_min(0.0)
+            value_errors = (
+                value_predictions.flatten() - value_targets.flatten()
+            ).abs()
+            priorities = value_errors + 0.25 * policy_errors + self.PER_EPSILON
+            for item, priority in zip(items, priorities):
+                item['priority'] = float(priority)
+                self.max_replay_priority = max(
+                    self.max_replay_priority, item['priority']
+                )
+
+        self.last_loss = loss.item()
+        self.student_net.eval()
 
     def log_match_result(self, winner_id):
         duration = round(time.time() - self.game_start_time, 1)
@@ -1957,7 +2444,7 @@ class Quoridor:
 
                 torch.save(
                     self.teacher_net.state_dict(),
-                    f'quorinet_teacher_gen_{self.teacher_gen}.pth'
+                    f'quorinet_v3_teacher_gen_{self.teacher_gen}.pth'
                 )
 
                 self.update_escalation_state()
@@ -2020,22 +2507,22 @@ class Quoridor:
                 continue
 
             active_bot = self.bot1 if self.state['turn'] == 1 else self.bot2
-            pre_action_state_tensor = encode_state(self.state, self.state['turn'])
             pre_action_pid = self.state['turn']
-            
-            is_teacher = (active_bot.nn_model != self.student_net)
-            eps = 0.0 if is_teacher else (0.30 * (0.85 ** self.state['turns_played']))
-            
-            action, _ = active_bot.get_move_and_eval(self.state, epsilon=eps)
+            pre_action_ply = self.state['turns_played']
+            pre_action_state_tensor = encode_state(self.state, pre_action_pid)
+            action, search_value, policy_target = active_bot.get_move_and_eval(
+                self.state, self_play=True
+            )
             if action: self.state = active_bot.apply_action(self.state, pre_action_pid, action, is_random=getattr(active_bot, 'was_last_random', False))
             else: self.state['turns_played'] = 200
                 
             self.check_win()
-            next_state_tensor = encode_state(self.state, self.state['turn'])
-            next_pid = self.state['turn']
             winner_id = getattr(self, 'winner_id', 0) if self.game_over else 0
             
-            self.train_step(pre_action_state_tensor, pre_action_pid, next_state_tensor, next_pid, self.game_over, winner_id)
+            self.train_step(
+                pre_action_state_tensor, pre_action_pid, policy_target,
+                search_value, pre_action_ply, self.game_over, winner_id
+            )
             if self.game_over:
                 self.finalize_training_game(winner_id)
                 
@@ -2094,27 +2581,30 @@ class Quoridor:
                     if self.mode == "TRAIN":
                         if self.is_training_active:
                             active_bot = self.bot1 if self.state['turn'] == 1 else self.bot2
-                            pre_action_state_tensor = encode_state(self.state, self.state['turn'])
                             pre_action_pid = self.state['turn']
-                            
-                            is_teacher = (active_bot.nn_model != self.student_net)
-                            eps = 0.0 if is_teacher else (0.30 * (0.85 ** self.state['turns_played']))
-                            
-                            action, _ = active_bot.get_move_and_eval(self.state, epsilon=eps)
+                            pre_action_ply = self.state['turns_played']
+                            pre_action_state_tensor = encode_state(self.state, pre_action_pid)
+                            action, search_value, policy_target = active_bot.get_move_and_eval(
+                                self.state, self_play=True
+                            )
                             if action: self.state = active_bot.apply_action(self.state, pre_action_pid, action, is_random=getattr(active_bot, 'was_last_random', False))
                             else: self.state['turns_played'] = 200
                                 
                             self.check_win()
-                            next_state_tensor = encode_state(self.state, self.state['turn'])
-                            next_pid = self.state['turn']
                             winner_id = getattr(self, 'winner_id', 0) if self.game_over else 0
                             
-                            self.train_step(pre_action_state_tensor, pre_action_pid, next_state_tensor, next_pid, self.game_over, winner_id)
+                            self.train_step(
+                                pre_action_state_tensor, pre_action_pid,
+                                policy_target, search_value, pre_action_ply,
+                                self.game_over, winner_id
+                            )
                             if self.game_over:
                                 self.finalize_training_game(winner_id)
                                 self.reset_game()
                     elif self.mode == "PLAY" and self.state['turn'] == 2:
-                        action, _ = self.bot2.get_move_and_eval(self.state, epsilon=0.0)
+                        action, _, _ = self.bot2.get_move_and_eval(
+                            self.state, self_play=False
+                        )
                         if action: self.state = self.bot2.apply_action(self.state, 2, action, is_random=getattr(self.bot2, 'was_last_random', False))
                         else: self.state['turns_played'] = 200
                         self.check_win()
