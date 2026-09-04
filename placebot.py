@@ -1114,6 +1114,49 @@ class Quoridor:
         random.shuffle(batch)
         return batch
 
+    def _optimize_student_from_replay(self):
+        """Run exactly one checked optimizer step, or return False during warmup."""
+        batch = self._sample_replay_batch()
+        if batch is None:
+            return False
+
+        self.student_net.train()
+        try:
+            device = model_device(self.student_net)
+            states = make_state_batch(
+                [item[0] for item in batch],
+                device=device,
+                name="replay states"
+            )
+            targets = make_value_batch(
+                [item[1] for item in batch],
+                device=device,
+                name="replay targets"
+            )
+            self.optimizer.zero_grad()
+            predictions = self.student_net(states)
+            loss = checked_value_loss(
+                self.loss_fn,
+                predictions,
+                targets,
+                name="student replay MSE"
+            )
+            loss.backward()
+            for name, parameter in self.student_net.named_parameters():
+                if parameter.grad is not None and not torch.isfinite(parameter.grad).all().item():
+                    raise FloatingPointError(f"non-finite gradient in {name}")
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.student_net.parameters(),
+                self.GRAD_CLIP_NORM
+            )
+            if not torch.isfinite(grad_norm).item():
+                raise FloatingPointError("student gradient norm is NaN or infinite")
+            self.optimizer.step()
+            self.last_loss = loss.item()
+            return True
+        finally:
+            self.student_net.eval()
+
     def _roll_replay_buffers_for_new_teacher(self):
         # The old "latest" data is still useful for anti-forgetting, but after
         # promotion it must no longer occupy the protected current-target bucket.
@@ -1769,29 +1812,50 @@ class Quoridor:
             target = gamma * next_val if next_turn_pid == turn_pid else gamma * (-next_val)
 
         opponent_gen = self.current_opponent_gen
-        # Keep the original stable one-step teacher target.
-        self._append_replay_sample(state_tensor, target, opponent_gen)
+        is_latest_game = self.current_opponent_is_latest
 
-        # Retain the episode long enough to propagate the real terminal outcome
-        # through every matchup that participates in the promotion gate.
+        # Latest-teacher games keep the original online behavior and update for
+        # every outcome. Historical games are transactional because their final
+        # result decides whether any data or optimizer steps are allowed.
+        if is_latest_game:
+            self._append_replay_sample(state_tensor, target, opponent_gen)
+
         self.episode_trajectory.append(
             (state_tensor, turn_pid, target, opponent_gen)
         )
 
+        optimizer_steps = 1 if is_latest_game else 0
         if done:
-            if self.episode_trajectory:
-                final_index = len(self.episode_trajectory) - 1
+            trajectory_length = len(self.episode_trajectory)
+            historical_student_loss = (
+                not is_latest_game
+                and winner_id in (1, 2)
+                and winner_id != self.student_id
+            )
+            commit_episode = is_latest_game or historical_student_loss
+
+            if commit_episode and self.episode_trajectory:
+                final_index = trajectory_length - 1
                 for i, (
                     episode_state,
                     episode_pid,
                     bootstrap_target,
                     episode_gen
                 ) in enumerate(self.episode_trajectory):
-                    if winner_id == 0:
-                        outcome = 0.0
-                    else:
-                        outcome = 1.0 if episode_pid == winner_id else -1.0
+                    # Historical samples were held outside replay until the loss
+                    # was known. Commit their stable bootstrap targets now.
+                    if historical_student_loss:
+                        self._append_replay_sample(
+                            episode_state,
+                            bootstrap_target,
+                            episode_gen
+                        )
 
+                    outcome = (
+                        0.0
+                        if winner_id == 0
+                        else (1.0 if episode_pid == winner_id else -1.0)
+                    )
                     horizon = final_index - i
                     discounted_outcome = (
                         outcome * (self.OUTCOME_BACKFILL_DISCOUNT ** horizon)
@@ -1806,45 +1870,33 @@ class Quoridor:
                         episode_gen
                     )
 
+            if historical_student_loss:
+                # Reproduce the optimizer capacity that this many online plies
+                # would have received, but only after the loss authorizes it.
+                optimizer_steps = trajectory_length
+                print(
+                    f"Historical Gen #{opponent_gen} loss: committed "
+                    f"{trajectory_length} plies for deferred training."
+                )
+            elif not is_latest_game:
+                result = "win" if winner_id == self.student_id else "draw"
+                print(
+                    f"Historical Gen #{opponent_gen} {result}: discarded "
+                    f"{trajectory_length} plies; student weights unchanged."
+                )
+
             self.episode_trajectory.clear()
 
-        batch = self._sample_replay_batch()
-        if batch is not None:
-            self.student_net.train()
-            try:
-                device = model_device(self.student_net)
-                states = make_state_batch(
-                    [item[0] for item in batch],
-                    device=device,
-                    name="replay states"
-                )
-                targets = make_value_batch(
-                    [item[1] for item in batch],
-                    device=device,
-                    name="replay targets"
-                )
-                self.optimizer.zero_grad()
-                predictions = self.student_net(states)
-                loss = checked_value_loss(
-                    self.loss_fn,
-                    predictions,
-                    targets,
-                    name="student replay MSE"
-                )
-                loss.backward()
-                for name, parameter in self.student_net.named_parameters():
-                    if parameter.grad is not None and not torch.isfinite(parameter.grad).all().item():
-                        raise FloatingPointError(f"non-finite gradient in {name}")
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.student_net.parameters(),
-                    self.GRAD_CLIP_NORM
-                )
-                if not torch.isfinite(grad_norm).item():
-                    raise FloatingPointError("student gradient norm is NaN or infinite")
-                self.optimizer.step()
-                self.last_loss = loss.item()
-            finally:
-                self.student_net.eval()
+        completed_steps = 0
+        for _ in range(optimizer_steps):
+            if not self._optimize_student_from_replay():
+                break
+            completed_steps += 1
+        if done and optimizer_steps > 1:
+            print(
+                f"Historical deferred optimizer steps: "
+                f"{completed_steps}/{optimizer_steps}."
+            )
 
     def log_match_result(self, winner_id):
         duration = round(time.time() - self.game_start_time, 1)
