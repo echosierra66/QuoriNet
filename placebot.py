@@ -694,8 +694,9 @@ class Quoridor:
         self.ESCALATION_STALL_LIMIT = 5
         self.ESCALATION_MAX_SHARE_OF_HISTORIC_BUCKET = 0.15
 
-        # Gate-deficit curriculum. A uniform floor prevents total forgetting;
-        # the remaining mass follows whichever required WR is furthest behind.
+        # Gate-deficit curriculum. Every loaded teacher uses the same required
+        # win rate; a uniform floor prevents total forgetting, and the remaining
+        # mass follows whichever teacher is furthest behind that shared target.
         self.LATEST_TEACHER_LOG_WINDOW = 60
         self.CURRICULUM_UNIFORM_MASS = 0.25
 
@@ -865,17 +866,8 @@ class Quoridor:
         return sorted({gen for _, gen in self.opponent_pool})
 
     def _required_win_rate(self, gen):
-        """Promotion threshold for one opponent in the current teacher ladder.
-
-        Generations are indexed from one, so x=gen-1.  There are N-1
-        intervals between Gen #1 (90%) and the latest teacher Gen #N (57%).
-        The latest teacher is handled as a strict-above-57% gate.
-        """
-        if gen >= self.teacher_gen:
-            return self.GATE_WIN_RATE_THRESHOLD
-        x = max(0, gen - 1)
-        N = max(1, self.teacher_gen - 1)
-        return 0.90 * ((self.GATE_WIN_RATE_THRESHOLD / 0.90) ** (x / N))
+        """Return the same target win rate for every loaded teacher."""
+        return self.GATE_WIN_RATE_THRESHOLD
 
     def _generation_win_rate(self, gen):
         log = self.checkpoint_log.get(gen)
@@ -885,8 +877,6 @@ class Quoridor:
 
     def _passes_generation_gate(self, gen, win_rate):
         required = self._required_win_rate(gen)
-        if gen == self.teacher_gen:
-            return win_rate > required
         return win_rate >= required
 
     def _all_training_gates_met(self):
@@ -1422,8 +1412,8 @@ class Quoridor:
                 self.student_id = 2
                 self.p1_gen_str, self.p2_gen_str = f"Gen #{pool_gen} (Teacher)", f"Gen #{self.teacher_gen + 1} (Student)"
             else:
-                self.bot1 = QuoridorBot(bot_id=1, max_depth=2, nn_model=self.student_net, heuristic_weight=self.heuristic_weight) 
-                self.bot2 = QuoridorBot(bot_id=2, max_depth=2, nn_model=pool_opponent, heuristic_weight=self.heuristic_weight) 
+                self.bot1 = QuoridorBot(bot_id=1, max_depth=2, nn_model=self.student_net, heuristic_weight=self.heuristic_weight)
+                self.bot2 = QuoridorBot(bot_id=2, max_depth=2, nn_model=pool_opponent, heuristic_weight=self.heuristic_weight)
                 self.student_id = 1
                 self.p1_gen_str, self.p2_gen_str = f"Gen #{self.teacher_gen + 1} (Student)", f"Gen #{pool_gen} (Teacher)"
         else:
@@ -1752,8 +1742,7 @@ class Quoridor:
             print(
                 f"Final vs Gen #{gen}: {sum(gen_results)}/{len(gen_results)} "
                 f"({win_rate * 100:.1f}%) | Required "
-                f"{'>' if gen == self.teacher_gen else '>='} "
-                f"{self._required_win_rate(gen) * 100:.1f}% "
+                f">= {self._required_win_rate(gen) * 100:.1f}% "
                 f"[{'PASS' if passed else 'FAIL'}]"
             )
 
@@ -2543,6 +2532,12 @@ class Quoridor:
         print("Production student, optimizer, replay, and checkpoints were not modified.")
         return passed
 
+    def _training_epsilon(self, active_bot):
+        is_teacher = (active_bot.nn_model is not self.student_net)
+        if not self.current_opponent_is_latest or is_teacher:
+            return 0.0
+        return 0.30 * (0.85 ** self.state['turns_played'])
+
     def run_headless_training(self, num_games):
         print(f"Starting Headless Turbo Training for {num_games} games...")
         self.mode = "TRAIN"
@@ -2576,9 +2571,8 @@ class Quoridor:
             pre_action_state_tensor = encode_state(self.state, self.state['turn'])
             pre_action_pid = self.state['turn']
             
-            # Resolution logic: Disable epsilon entirely for Teacher, enable for Student
-            is_teacher = (active_bot.nn_model != self.student_net)
-            eps = 0.0 if is_teacher else (0.30 * (0.85 ** self.state['turns_played']))
+            # Explore only when the student is facing the latest champion.
+            eps = self._training_epsilon(active_bot)
             
             action, _ = active_bot.get_move_and_eval(self.state, epsilon=eps)
             if action: self.state = active_bot.apply_action(self.state, pre_action_pid, action, is_random=getattr(active_bot, 'was_last_random', False))
@@ -2664,8 +2658,7 @@ class Quoridor:
                     pre_action_state_tensor = encode_state(self.state, self.state['turn'])
                     pre_action_pid = self.state['turn']
 
-                    is_teacher = (active_bot.nn_model != self.student_net)
-                    eps = 0.0 if is_teacher else (0.30 * (0.85 ** self.state['turns_played']))
+                    eps = self._training_epsilon(active_bot)
                     
                     action, _ = active_bot.get_move_and_eval(self.state, epsilon=eps)
                     if action: self.state = active_bot.apply_action(self.state, pre_action_pid, action, is_random=getattr(active_bot, 'was_last_random', False))
