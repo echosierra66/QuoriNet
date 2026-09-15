@@ -522,11 +522,7 @@ class QuoridorBot:
                     name="bot evaluation state"
                 )
             
-            nn_score = nn_val * 100.0
-            heur_score = (d2 - d1) * 5.0
-            if eval_pid == 2: heur_score = -heur_score
-            
-            score = nn_score + heur_score
+            score = nn_val * 100.0
             if is_repeated: score -= 8000
             score -= osc_penalty
             return score
