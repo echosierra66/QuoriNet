@@ -9,6 +9,7 @@ import argparse
 import math
 import io
 from collections import deque
+from functools import lru_cache
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -17,6 +18,14 @@ BOARD_SIZE = 9
 STATE_CHANNELS = 8
 STATE_SHAPE = (STATE_CHANNELS, BOARD_SIZE, BOARD_SIZE)
 VALUE_WIDTH = 1
+
+
+def mirror_state_batch(states):
+    """Reflect columns while preserving the 8x8 wall-anchor geometry."""
+    mirrored = states.flip(-1).clone()
+    mirrored[:, 2:4] = 0
+    mirrored[:, 2:4, :8, :8] = states[:, 2:4, :8, :8].flip(-1)
+    return mirrored
 
 
 def validate_state_tensor(tensor, name="state"):
@@ -221,19 +230,36 @@ def get_adjacent_global(state, c, r):
     if c < 8 and (c, r) not in state['walls_v'] and (c, r - 1) not in state['walls_v']: moves.append((c + 1, r))
     return moves
 
-def get_shortest_path_dist(state, pid):
-    start_pos = state['p1_pos'] if pid == 1 else state['p2_pos']
-    target_row = 8 if pid == 2 else 0
-    queue = deque([(start_pos, 0)])
-    visited = {start_pos}
+@lru_cache(maxsize=8192)
+def _goal_distances(walls_h, walls_v, target_row):
+    """One reverse BFS supplies every square's distance for a wall layout."""
+    state = {'walls_h': frozenset(walls_h), 'walls_v': frozenset(walls_v)}
+    distances = [999] * (BOARD_SIZE * BOARD_SIZE)
+    queue = deque((c, target_row) for c in range(BOARD_SIZE))
+    for c in range(BOARD_SIZE):
+        distances[target_row * BOARD_SIZE + c] = 0
     while queue:
-        pos, dist = queue.popleft()
-        if pos[1] == target_row: return dist
+        pos = queue.popleft()
+        dist = distances[pos[1] * BOARD_SIZE + pos[0]]
         for nxt in get_adjacent_global(state, *pos):
-            if nxt not in visited:
-                visited.add(nxt)
-                queue.append((nxt, dist + 1))
-    return 999  # Blocked
+            index = nxt[1] * BOARD_SIZE + nxt[0]
+            if distances[index] == 999:
+                distances[index] = dist + 1
+                queue.append(nxt)
+    return tuple(distances)
+
+
+def get_distance_field(state, pid):
+    return _goal_distances(
+        frozenset(state['walls_h']),
+        frozenset(state['walls_v']),
+        0 if pid == 1 else 8
+    )
+
+
+def get_shortest_path_dist(state, pid):
+    c, r = state[f'p{pid}_pos']
+    return get_distance_field(state, pid)[r * BOARD_SIZE + c]
 
 def encode_state(state, active_pid):
     if active_pid not in (1, 2):
@@ -291,8 +317,15 @@ class QuoridorBot:
         self.nn_model = nn_model
         self.heuristic_weight = heuristic_weight
         self.was_last_random = False
+        self._value_cache = {}
 
     def get_move_and_eval(self, state, epsilon=0.0):
+        # Parameters can change between moves, but not during one search.
+        self._value_cache.clear()
+        for move in self.get_valid_moves(state, self.bot_id):
+            if move[1] == self.get_target_row(self.bot_id):
+                self.was_last_random = False
+                return ('move', move), 10000.0
         if epsilon > 0.0 and random.random() < epsilon:
             raw_actions = self.generate_actions(state, self.bot_id)
             if raw_actions:
@@ -323,19 +356,20 @@ class QuoridorBot:
         return 8 if pid == 2 else 0
 
     def get_shortest_path(self, state, pid):
-        start_pos = state['p1_pos'] if pid == 1 else state['p2_pos']
-        target_row = self.get_target_row(pid)
-        queue = deque([(start_pos, [start_pos])])
-        visited = {start_pos}
-
-        while queue:
-            pos, path = queue.popleft()
-            if pos[1] == target_row: return path
-            for nxt in self.get_adjacent(state, *pos):
-                if nxt not in visited:
-                    visited.add(nxt)
-                    queue.append((nxt, path + [nxt]))
-        return None
+        pos = state[f'p{pid}_pos']
+        distances = get_distance_field(state, pid)
+        distance = distances[pos[1] * BOARD_SIZE + pos[0]]
+        if distance == 999:
+            return None
+        path = [pos]
+        while distance:
+            pos = next(
+                nxt for nxt in self.get_adjacent(state, *pos)
+                if distances[nxt[1] * BOARD_SIZE + nxt[0]] == distance - 1
+            )
+            path.append(pos)
+            distance -= 1
+        return path
 
     def get_adjacent(self, state, c, r):
         return get_adjacent_global(state, c, r)
@@ -364,23 +398,20 @@ class QuoridorBot:
 
     def is_valid_wall(self, state, c, r, orient):
         if not (0 <= c <= 7 and 0 <= r <= 7): return False
+        if orient not in ('H', 'V'): return False
         if orient == 'H':
             if (c, r) in state['walls_h'] or (c-1, r) in state['walls_h'] or (c+1, r) in state['walls_h']: return False
             if (c, r) in state['walls_v']: return False
-            state['walls_h'].add((c, r))
         else:
             if (c, r) in state['walls_v'] or (c, r-1) in state['walls_v'] or (c, r+1) in state['walls_v']: return False
             if (c, r) in state['walls_h']: return False
-            state['walls_v'].add((c, r))
-            
-        try:
-            p1_safe = self.get_shortest_path(state, 1) is not None
-            p2_safe = self.get_shortest_path(state, 2) is not None
-        finally:
-            if orient == 'H': state['walls_h'].remove((c, r))
-            else: state['walls_v'].remove((c, r))
-        
-        return p1_safe and p2_safe
+        candidate = state.copy()
+        key = 'walls_h' if orient == 'H' else 'walls_v'
+        candidate[key] = state[key] | {(c, r)}
+        return (
+            get_shortest_path_dist(candidate, 1) < 999
+            and get_shortest_path_dist(candidate, 2) < 999
+        )
 
     def generate_actions(self, state, pid):
         actions = []
@@ -390,8 +421,7 @@ class QuoridorBot:
             sim_state = state.copy()
             if pid == 1: sim_state['p1_pos'] = m
             else: sim_state['p2_pos'] = m
-            path = self.get_shortest_path(sim_state, pid)
-            return len(path) if path else 999
+            return get_shortest_path_dist(sim_state, pid)
 
         valid_moves.sort(key=get_path_dist)
         for move in valid_moves: actions.append(('move', move))
@@ -404,7 +434,7 @@ class QuoridorBot:
         my_path = self.get_shortest_path(state, pid)
         if not opp_path or not my_path: return actions
 
-        base_my_dist, base_opp_dist = len(my_path), len(opp_path)
+        base_my_dist, base_opp_dist = len(my_path) - 1, len(opp_path) - 1
         candidate_walls = set()
         
         for p in (opp_path, my_path):
@@ -428,20 +458,16 @@ class QuoridorBot:
                             candidate_walls.add((nc, nr, 'V'))
                 
         scored_walls = []
-        for c, r, orient in candidate_walls:
+        for c, r, orient in sorted(candidate_walls):
             if self.is_valid_wall(state, c, r, orient):
-                try:
-                    if orient == 'H': state['walls_h'].add((c, r))
-                    else: state['walls_v'].add((c, r))
-                    new_opp_path = self.get_shortest_path(state, opponent_id)
-                    new_my_path = self.get_shortest_path(state, pid)
-                finally:
-                    if orient == 'H': state['walls_h'].remove((c, r))
-                    else: state['walls_v'].remove((c, r))
-                
-                if new_opp_path is not None and new_my_path is not None:
-                    delay = (len(new_opp_path) - base_opp_dist) - (len(new_my_path) - base_my_dist)
-                    scored_walls.append((delay, ('wall', (c, r, orient))))
+                candidate = state.copy()
+                key = 'walls_h' if orient == 'H' else 'walls_v'
+                candidate[key] = state[key] | {(c, r)}
+                delay = (
+                    get_shortest_path_dist(candidate, opponent_id) - base_opp_dist
+                    - (get_shortest_path_dist(candidate, pid) - base_my_dist)
+                )
+                scored_walls.append((delay, ('wall', (c, r, orient))))
 
         scored_walls.sort(key=lambda x: x[0], reverse=True)
         quota = int(4 + (1.0 - self.heuristic_weight) * 20)
@@ -458,11 +484,18 @@ class QuoridorBot:
         actions_copy = list(actions)
         random.shuffle(actions_copy)
 
-        scored_actions = []
-        for action in actions_copy:
-            next_state = self.apply_action(state, pid, action)
-            val = self.evaluate(next_state, pid)
-            scored_actions.append((val, action))
+        next_states = [self.apply_action(state, pid, action) for action in actions_copy]
+        values = self.evaluate_batch(next_states, pid)
+        opponent = self.get_opponent(pid)
+        for index, candidate in enumerate(next_states):
+            if candidate[f'p{pid}_pos'][1] == self.get_target_row(pid):
+                continue
+            if any(
+                move[1] == self.get_target_row(opponent)
+                for move in self.get_valid_moves(candidate, opponent)
+            ):
+                values[index] = -10000.0
+        scored_actions = list(zip(values, actions_copy))
 
         scored_actions.sort(key=lambda x: x[0], reverse=True)
         return [act for _, act in scored_actions[:top_k]]
@@ -492,49 +525,75 @@ class QuoridorBot:
         return penalty
 
     def evaluate(self, state, eval_pid):
-        if state['p1_pos'][1] == 0: return 10000 if eval_pid == 1 else -10000
-        if state['p2_pos'][1] == 8: return -10000 if eval_pid == 1 else 10000
-        
-        is_repeated = get_state_key(state) in state.get('history', set())
-        osc_penalty = self._oscillation_penalty(state, eval_pid)
+        return self.evaluate_batch([state], eval_pid)[0]
 
-        p1_path = self.get_shortest_path(state, 1)
-        p2_path = self.get_shortest_path(state, 2)
-        
-        if not p1_path: return 10000 if eval_pid == 2 else -10000
-        if not p2_path: return -10000 if eval_pid == 2 else 10000
+    def evaluate_batch(self, states, eval_pid):
+        """Score candidates in one forward pass using the side-to-move contract."""
+        scores = []
+        neural_requests = []
+        missing = {}
+        for index, state in enumerate(states):
+            if state['p1_pos'][1] == 0 or state['p2_pos'][1] == 8:
+                winner = 1 if state['p1_pos'][1] == 0 else 2
+                scores.append(10000.0 if eval_pid == winner else -10000.0)
+                continue
 
-        d1, d2 = len(p1_path) - 1, len(p2_path) - 1
-        p1_progress, p2_progress = 8 - state['p1_pos'][1], state['p2_pos'][1]
+            d1 = get_shortest_path_dist(state, 1)
+            d2 = get_shortest_path_dist(state, 2)
+            if d1 == 999 or d2 == 999:
+                winner = 2 if d1 == 999 else 1
+                scores.append(10000.0 if eval_pid == winner else -10000.0)
+                continue
 
-        if state['p1_walls'] == 0 and state['p2_walls'] == 0:
-            score = (d2 - d1) * 50.0 + (p1_progress - p2_progress) * 10.0
-            if eval_pid == 2: score = -score
-            if is_repeated: score -= 8000
-            score -= osc_penalty
-            return score
+            progress = (8 - state['p1_pos'][1]) - state['p2_pos'][1]
+            heuristic = (d2 - d1) * 25.0 + progress * 5.0
+            if eval_pid == 2:
+                heuristic = -heuristic
+            penalty = self._oscillation_penalty(state, eval_pid)
+            if get_state_key(state) in state.get('history', set()):
+                penalty += 8000.0
 
-        if self.nn_model is not None:
-            with torch.no_grad():
-                nn_val = predict_value_scalar(
-                    self.nn_model,
-                    encode_state(state, eval_pid),
-                    name="bot evaluation state"
+            if self.nn_model is None:
+                scores.append(heuristic - penalty)
+                continue
+            if not (state['p1_walls'] or state['p2_walls']):
+                scores.append(2.0 * heuristic - penalty)
+                continue
+
+            # Training encodes the active player. Convert that value back to
+            # the caller's perspective instead of feeding an off-contract view.
+            scores.append(-penalty)
+            active_pid = state['turn']
+            key = (
+                get_state_key(state),
+                state['p1_walls'],
+                state['p2_walls'],
+                active_pid
+            )
+            sign = 1.0 if active_pid == eval_pid else -1.0
+            neural_requests.append((index, key, sign))
+            if key not in self._value_cache and key not in missing:
+                missing[key] = encode_state(state, active_pid)
+
+        if missing:
+            batch = make_state_batch(
+                list(missing.values()),
+                model_device(self.nn_model),
+                name="bot evaluation states"
+            )
+            with torch.inference_mode():
+                output = self.nn_model(batch)
+            if tuple(output.shape) != (len(missing), 1):
+                raise ValueError(
+                    f"bot network must return [B, 1], got {tuple(output.shape)}"
                 )
-            
-            score = nn_val * 100.0
-            if is_repeated: score -= 8000
-            score -= osc_penalty
-            return score
+            if not torch.isfinite(output).all().item():
+                raise ValueError("bot network returned NaN or infinite values")
+            self._value_cache.update(zip(missing, output[:, 0].cpu().tolist()))
 
-        if eval_pid == 1:
-            score = (d2 - d1) * 25.0 + (p1_progress - p2_progress) * 5.0
-        else:
-            score = (d1 - d2) * 25.0 + (p2_progress - p1_progress) * 5.0
-
-        if is_repeated: score -= 8000
-        score -= osc_penalty
-        return score
+        for index, key, sign in neural_requests:
+            scores[index] += 100.0 * sign * self._value_cache[key]
+        return scores
 
     def apply_action(self, state, pid, action, is_random=False):
         new_state = {
@@ -653,9 +712,11 @@ WIDTH = BOARD_PIXEL_SIZE + SIDEBAR_WIDTH + LEFT_SIDEBAR_WIDTH
 HEIGHT = BOARD_PIXEL_SIZE + int(120 * SCALE)
 
 class Quoridor:
-    def __init__(self, headless=False):
+    def __init__(self, headless=False, train_depth=2, play_depth=4, train_updates=16):
         pygame.init()
         self.headless = headless
+        self.train_depth = train_depth
+        self.play_depth = play_depth
         self.is_fullscreen = False
         
         if not self.headless:
@@ -707,6 +768,7 @@ class Quoridor:
         self.TACTICAL_REPLAY_CAPACITY = 50000
         self.TACTICAL_REPLAY_SHARE = 0.25
         self.TACTICAL_LEAD_PLIES = 8
+        self.TRAIN_UPDATES_PER_GAME = train_updates
 
         # Sparse terminal reward is propagated through every gated matchup and
         # blended with the stable teacher bootstrap already used by this model.
@@ -729,6 +791,7 @@ class Quoridor:
         # State vars
         self.student_net = SpatialQuoriNetV2(in_channels=STATE_CHANNELS)
         self.teacher_net = SpatialQuoriNetV2(in_channels=STATE_CHANNELS)
+        self.teacher_net.load_state_dict(self.student_net.state_dict())
         self.student_net.eval()
         self.teacher_net.eval()
         self.optimizer = optim.Adam(self.student_net.parameters(), lr=0.0001)
@@ -1191,7 +1254,9 @@ class Quoridor:
                 device=device,
                 name="replay targets"
             )
-            self.optimizer.zero_grad()
+            reflect = torch.rand(states.shape[0], device=device) < 0.5
+            states[reflect] = mirror_state_batch(states[reflect])
+            self.optimizer.zero_grad(set_to_none=True)
             predictions = self.student_net(states)
             loss = checked_value_loss(
                 self.loss_fn,
@@ -1374,18 +1439,18 @@ class Quoridor:
             self.current_opponent_is_latest = (pool_gen == self.teacher_gen)
 
             if self.games_played % 2 == 0:
-                self.bot1 = QuoridorBot(bot_id=1, max_depth=2, nn_model=pool_opponent, heuristic_weight=self.heuristic_weight)
-                self.bot2 = QuoridorBot(bot_id=2, max_depth=2, nn_model=self.student_net, heuristic_weight=self.heuristic_weight)
+                self.bot1 = QuoridorBot(bot_id=1, max_depth=self.train_depth, nn_model=pool_opponent, heuristic_weight=self.heuristic_weight)
+                self.bot2 = QuoridorBot(bot_id=2, max_depth=self.train_depth, nn_model=self.student_net, heuristic_weight=self.heuristic_weight)
                 self.student_id = 2
                 self.p1_gen_str, self.p2_gen_str = f"Gen #{pool_gen} (Teacher)", f"Gen #{self.teacher_gen + 1} (Student)"
             else:
-                self.bot1 = QuoridorBot(bot_id=1, max_depth=2, nn_model=self.student_net, heuristic_weight=self.heuristic_weight)
-                self.bot2 = QuoridorBot(bot_id=2, max_depth=2, nn_model=pool_opponent, heuristic_weight=self.heuristic_weight)
+                self.bot1 = QuoridorBot(bot_id=1, max_depth=self.train_depth, nn_model=self.student_net, heuristic_weight=self.heuristic_weight)
+                self.bot2 = QuoridorBot(bot_id=2, max_depth=self.train_depth, nn_model=pool_opponent, heuristic_weight=self.heuristic_weight)
                 self.student_id = 1
                 self.p1_gen_str, self.p2_gen_str = f"Gen #{self.teacher_gen + 1} (Student)", f"Gen #{pool_gen} (Teacher)"
         else:
-            self.bot1 = QuoridorBot(bot_id=1, max_depth=4, nn_model=self.teacher_net, heuristic_weight=self.heuristic_weight)
-            self.bot2 = QuoridorBot(bot_id=2, max_depth=4, nn_model=self.teacher_net, heuristic_weight=self.heuristic_weight)
+            self.bot1 = QuoridorBot(bot_id=1, max_depth=self.play_depth, nn_model=self.teacher_net, heuristic_weight=self.heuristic_weight)
+            self.bot2 = QuoridorBot(bot_id=2, max_depth=self.play_depth, nn_model=self.teacher_net, heuristic_weight=self.heuristic_weight)
             self.p1_gen_str, self.p2_gen_str = "Human", f"Gen #{self.teacher_gen} (Teacher)"
 
         self.p1_draw_x, self.p1_draw_y = self._get_center_pixels(self.state['p1_pos'])
@@ -1797,110 +1862,97 @@ class Quoridor:
         if winner_id not in (0, 1, 2):
             raise ValueError(f"winner_id must be 0, 1, or 2, got {winner_id}")
 
-        gamma = 0.99
-        if done:
-            target = 0.0 if winner_id == 0 else (1.0 if turn_pid == winner_id else -1.0)
-        else:
-            with torch.no_grad():
-                next_val = predict_value_scalar(
-                    self.teacher_net,
-                    next_state_tensor,
-                    name="teacher bootstrap next_state"
-                )
-            target = gamma * next_val if next_turn_pid == turn_pid else gamma * (-next_val)
+        # Keep the student fixed throughout the game. Each state receives one
+        # target only after the result is known.
+        self.episode_trajectory.append((
+            state_tensor.detach().cpu().clone(),
+            turn_pid,
+            next_state_tensor.detach().cpu().clone(),
+            next_turn_pid
+        ))
+        if not done:
+            return
 
+        trajectory = self.episode_trajectory
+        trajectory_length = len(trajectory)
         opponent_gen = self.current_opponent_gen
         is_latest_game = self.current_opponent_is_latest
-
-        # Latest-teacher games keep the original online behavior and update for
-        # every outcome. Historical games are transactional because their final
-        # result decides whether any data or optimizer steps are allowed.
-        if is_latest_game:
-            self._append_replay_sample(state_tensor, target, opponent_gen)
-
-        self.episode_trajectory.append(
-            (state_tensor, turn_pid, target, opponent_gen)
+        historical_student_loss = (
+            not is_latest_game
+            and winner_id in (1, 2)
+            and winner_id != self.student_id
         )
+        commit_episode = is_latest_game or historical_student_loss
+        optimizer_steps = 0
 
-        optimizer_steps = 1 if is_latest_game else 0
-        if done:
-            trajectory_length = len(self.episode_trajectory)
-            historical_student_loss = (
-                not is_latest_game
-                and winner_id in (1, 2)
-                and winner_id != self.student_id
+        if commit_episode:
+            bootstrap_values = [0.0] * trajectory_length
+            if winner_id and trajectory_length > 1:
+                next_states = make_state_batch(
+                    [entry[2] for entry in trajectory[:-1]],
+                    model_device(self.teacher_net),
+                    name="episode bootstrap states"
+                )
+                with torch.inference_mode():
+                    values = self.teacher_net(next_states)
+                expected = (trajectory_length - 1, VALUE_WIDTH)
+                if tuple(values.shape) != expected:
+                    raise ValueError(
+                        f"teacher bootstrap must return {expected}, "
+                        f"got {tuple(values.shape)}"
+                    )
+                if not torch.isfinite(values).all().item():
+                    raise ValueError("teacher bootstrap returned NaN or infinite values")
+                bootstrap_values[:-1] = values[:, 0].cpu().tolist()
+
+            tactical_indices = self._tactical_replay_indices(winner_id)
+            for index, (episode_state, episode_pid, _, episode_next_pid) in enumerate(trajectory):
+                outcome = (
+                    0.0
+                    if winner_id == 0
+                    else (1.0 if episode_pid == winner_id else -1.0)
+                )
+                horizon = trajectory_length - 1 - index
+                if horizon == 0 or winner_id == 0:
+                    target = outcome
+                else:
+                    bootstrap = 0.99 * bootstrap_values[index]
+                    if episode_next_pid != episode_pid:
+                        bootstrap = -bootstrap
+                    target = (
+                        self.OUTCOME_BACKFILL_MIX
+                        * outcome
+                        * (self.OUTCOME_BACKFILL_DISCOUNT ** horizon)
+                        + (1.0 - self.OUTCOME_BACKFILL_MIX) * bootstrap
+                    )
+                if index in tactical_indices:
+                    self._append_tactical_replay_sample(episode_state, target)
+                else:
+                    self._append_replay_sample(episode_state, target, opponent_gen)
+
+            optimizer_steps = min(
+                self.TRAIN_UPDATES_PER_GAME,
+                max(4, math.ceil(trajectory_length / 4))
             )
-            commit_episode = is_latest_game or historical_student_loss
-            tactical_indices = (
-                self._tactical_replay_indices(winner_id)
-                if commit_episode else set()
-            )
-
-            if commit_episode and self.episode_trajectory:
-                final_index = trajectory_length - 1
-                for i, (
-                    episode_state,
-                    episode_pid,
-                    bootstrap_target,
-                    episode_gen
-                ) in enumerate(self.episode_trajectory):
-                    # Historical samples were held outside replay until the loss
-                    # was known. Commit their stable bootstrap targets now.
-                    if historical_student_loss:
-                        self._append_replay_sample(
-                            episode_state,
-                            bootstrap_target,
-                            episode_gen
-                        )
-
-                    outcome = (
-                        0.0
-                        if winner_id == 0
-                        else (1.0 if episode_pid == winner_id else -1.0)
-                    )
-                    horizon = final_index - i
-                    discounted_outcome = (
-                        outcome * (self.OUTCOME_BACKFILL_DISCOUNT ** horizon)
-                    )
-                    mixed_target = (
-                        self.OUTCOME_BACKFILL_MIX * discounted_outcome
-                        + (1.0 - self.OUTCOME_BACKFILL_MIX) * bootstrap_target
-                    )
-                    if i in tactical_indices:
-                        self._append_tactical_replay_sample(
-                            episode_state,
-                            mixed_target
-                        )
-                    else:
-                        self._append_replay_sample(
-                            episode_state,
-                            mixed_target,
-                            episode_gen
-                        )
-
             if historical_student_loss:
-                # Reproduce the optimizer capacity that this many online plies
-                # would have received, but only after the loss authorizes it.
-                optimizer_steps = trajectory_length
                 print(
                     f"Historical Gen #{opponent_gen} loss: committed "
-                    f"{trajectory_length} plies for deferred training."
+                    f"{trajectory_length} terminal-labeled plies."
                 )
-            elif not is_latest_game:
-                result = "win" if winner_id == self.student_id else "draw"
-                print(
-                    f"Historical Gen #{opponent_gen} {result}: discarded "
-                    f"{trajectory_length} plies; student weights unchanged."
-                )
+        else:
+            result = "win" if winner_id == self.student_id else "draw"
+            print(
+                f"Historical Gen #{opponent_gen} {result}: discarded "
+                f"{trajectory_length} plies; student weights unchanged."
+            )
 
-            self.episode_trajectory.clear()
-
+        self.episode_trajectory.clear()
         completed_steps = 0
         for _ in range(optimizer_steps):
             if not self._optimize_student_from_replay():
                 break
             completed_steps += 1
-        if done and optimizer_steps > 1:
+        if historical_student_loss and optimizer_steps > 1:
             print(
                 f"Historical deferred optimizer steps: "
                 f"{completed_steps}/{optimizer_steps}."
@@ -2732,6 +2784,18 @@ class Quoridor:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument('--seed', type=int, default=None,
+                        help='random seed for a fresh run (resumes restore saved RNG state)')
+    parser.add_argument('--threads', type=int, default=min(4, os.cpu_count() or 1),
+                        help='PyTorch CPU threads; small boards often benefit from 1-4')
+    parser.add_argument('--train-depth', type=int, default=2,
+                        help='search depth during self-play (default: 2)')
+    parser.add_argument('--play-depth', type=int, default=4,
+                        help='search depth against a human (default: 4)')
+    parser.add_argument('--train-updates', type=int, default=16,
+                        help='maximum optimizer batches per completed game (default: 16)')
+    parser.add_argument('--checkpoint-dir', default=None,
+                        help='directory for all training saves; defaults to the working directory')
     parser.add_argument(
         "--headless",
         type=int,
@@ -2763,6 +2827,16 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    if min(args.threads, args.train_depth, args.play_depth, args.train_updates) < 1:
+        parser.error('threads, search depths and train-updates must be positive')
+    torch.set_num_threads(args.threads)
+    if args.seed is not None:
+        random.seed(args.seed)
+        torch.manual_seed(args.seed)
+    if args.checkpoint_dir:
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
+        os.chdir(args.checkpoint_dir)
+
     if args.headless < 0:
         parser.error("--headless GAMES cannot be negative")
     if args.overfit_epochs < 1:
@@ -2774,7 +2848,12 @@ if __name__ == "__main__":
         os.environ["SDL_VIDEODRIVER"] = "dummy"
         os.environ["SDL_AUDIODRIVER"] = "dummy"
 
-    game = Quoridor(headless=headless_mode)
+    game = Quoridor(
+        headless=headless_mode,
+        train_depth=args.train_depth,
+        play_depth=args.play_depth,
+        train_updates=args.train_updates
+    )
     if args.overfit_one_game:
         passed = game.run_headless_single_game_overfit_check(
             epochs=args.overfit_epochs,
