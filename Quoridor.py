@@ -976,9 +976,8 @@ class Quoridor:
         self.ESCALATION_STALL_LIMIT = 5
         self.ESCALATION_MAX_SHARE_OF_HISTORIC_BUCKET = 0.15
 
-        # Gate-deficit curriculum. Every loaded teacher uses the same required
-        # win rate; a uniform floor prevents total forgetting, and the remaining
-        # mass follows whichever teacher is furthest behind that shared target.
+        # Performance curriculum. A uniform floor prevents total forgetting,
+        # and the remaining mass follows lower win rates even above the gate.
         self.LATEST_TEACHER_LOG_WINDOW = 60
         self.CURRICULUM_UNIFORM_MASS = 0.25
 
@@ -1074,6 +1073,7 @@ class Quoridor:
         self.eval_vs_gen = 0
         self.eval_game_curr = 0
         self.eval_game_total = 0
+        self._manual_promotion_test_requested = False
 
         self._archive_groups = {}
         self._archived_official = {}
@@ -1689,8 +1689,15 @@ class Quoridor:
         uniform_weight = self.CURRICULUM_UNIFORM_MASS / count
         deficit_mass = 1.0 - self.CURRICULUM_UNIFORM_MASS
         deficit_scores = []
+        win_rates = [
+            self._generation_win_rate(gen) for _, gen in self.opponent_pool
+        ]
+        performance_target = max(
+            (win_rate for win_rate in win_rates if win_rate is not None),
+            default=0.0,
+        )
 
-        for _, gen in self.opponent_pool:
+        for (_, gen), win_rate in zip(self.opponent_pool, win_rates):
             log = self.checkpoint_log.get(gen)
             samples = len(log) if log else 0
             sample_deficit = max(
@@ -1698,11 +1705,9 @@ class Quoridor:
                 1.0 - (samples / self.GATE_MIN_GAMES)
             )
             if samples:
-                win_rate = sum(log) / samples
-                required = self._required_win_rate(gen)
                 performance_deficit = max(
                     0.0,
-                    (required - win_rate) / max(required, 1e-9)
+                    (performance_target - win_rate) / max(performance_target, 1e-9)
                 )
             else:
                 performance_deficit = 1.0
@@ -2635,6 +2640,39 @@ class Quoridor:
 
         return all_passed
 
+    def request_manual_promotion_test(self):
+        if self._manual_promotion_test_requested:
+            return
+        self._manual_promotion_test_requested = True
+        self.toast_msg = "Promotion test queued after this game"
+        self.toast_timer = 180
+        print("Manual promotion test queued after the current training game.")
+
+    def _install_promoted_student(self):
+        # Preserve the teacher that was actually trained against before the
+        # live teacher network is overwritten.
+        torch.save(
+            _model_state_dict(self.teacher_net),
+            f'quorinet_teacher_gen_{self.teacher_gen}.pth'
+        )
+
+        self.update_escalation_state()
+        self.teacher_gen += 1
+        self.teacher_net = copy.deepcopy(self.student_net)
+        self.teacher_net.eval()
+
+        self._roll_replay_buffers_for_new_teacher()
+        self.latest_teacher_history.clear()
+        self.checkpoint_log.clear()
+        self._reset_lr_search_for_new_teacher()
+        self.curriculum_latest_credit = 1.0
+
+        self._sync_model_archives()
+        self.update_opponent_pool()
+        self.student_eval_history.clear()
+        self.student_win_rate_str = "Pending live WR"
+        self.save_checkpoint(manual=True)
+
     def train_step(self, state_tensor, turn_pid, next_state_tensor, next_turn_pid, done, winner_id):
         validate_state_tensor(state_tensor, "train_step state")
         validate_state_tensor(next_state_tensor, "train_step next_state")
@@ -3099,6 +3137,27 @@ class Quoridor:
             tt_txt = self.small_font.render(lbl, True, (255, 255, 255))
             self.virtual_screen.blit(tt_txt, tt_txt.get_rect(center=self.rect_train_toggle.center))
 
+            self.rect_test_promotion = pygame.Rect(
+                LEFT_SIDEBAR_WIDTH + int(185 * SCALE), btn_y,
+                int(190 * SCALE), btn_h
+            )
+            test_hover = self.rect_test_promotion.collidepoint(mouse_pos)
+            test_color = (230, 125, 20) if test_hover else ORANGE_COLOR
+            if self._manual_promotion_test_requested:
+                test_color = (145, 151, 160)
+            pygame.draw.rect(
+                self.virtual_screen, test_color, self.rect_test_promotion,
+                border_radius=int(8 * SCALE)
+            )
+            test_label = (
+                "Promotion Test Queued" if self._manual_promotion_test_requested
+                else "Test Promotion"
+            )
+            test_txt = self.small_font.render(test_label, True, (255, 255, 255))
+            self.virtual_screen.blit(
+                test_txt, test_txt.get_rect(center=self.rect_test_promotion.center)
+            )
+
         if self.toast_timer > 0:
             self.toast_timer -= 1
             toast_surf = self.small_font.render(self.toast_msg, True, (255, 255, 255))
@@ -3195,40 +3254,25 @@ class Quoridor:
                 print(f"Current training WRs: {self._format_training_win_rates()}")
                 self.save_meta()
 
-                if self._all_training_gates_met():
-                    print(
-                        f"Candidate Gen #{self.teacher_gen + 1} cleared every "
-                        f"live training gate. Starting final frozen test."
-                    )
+                manual_test = self._manual_promotion_test_requested
+                if manual_test or self._all_training_gates_met():
+                    self._manual_promotion_test_requested = False
+                    if manual_test:
+                        print(
+                            f"Starting manually requested frozen promotion test "
+                            f"for Candidate Gen #{self.teacher_gen + 1}."
+                        )
+                    else:
+                        print(
+                            f"Candidate Gen #{self.teacher_gen + 1} cleared every "
+                            f"live training gate. Starting final frozen test."
+                        )
                     if self.run_final_promotion_test():
                         print(
                             f"Candidate Gen #{self.teacher_gen + 1} passed every "
                             f"final gate. Installing new teacher."
                         )
-
-                        # Preserve the teacher that was actually trained against
-                        # before the live teacher network is overwritten.
-                        torch.save(
-                            _model_state_dict(self.teacher_net),
-                            f'quorinet_teacher_gen_{self.teacher_gen}.pth'
-                        )
-
-                        self.update_escalation_state()
-                        self.teacher_gen += 1
-                        self.teacher_net = copy.deepcopy(self.student_net)
-                        self.teacher_net.eval()
-
-                        self._roll_replay_buffers_for_new_teacher()
-                        self.latest_teacher_history.clear()
-                        self.checkpoint_log.clear()
-                        self._reset_lr_search_for_new_teacher()
-                        self.curriculum_latest_credit = 1.0
-
-                        self._sync_model_archives()
-                        self.update_opponent_pool()
-                        self.student_eval_history.clear()
-                        self.student_win_rate_str = "Pending live WR"
-                        self.save_checkpoint(manual=True)
+                        self._install_promoted_student()
                     else:
                         print(f"Current training WRs: {self._format_training_win_rates()}")
                         self.save_meta()
@@ -3551,6 +3595,8 @@ class Quoridor:
                 elif self.mode in ("PLAY", "TRAIN") and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     if self.rect_menu.collidepoint(virtual_mouse_pos): self.mode = "MENU"
                     elif self.rect_new_game.collidepoint(virtual_mouse_pos): self.reset_game()
+                    elif self.mode == "TRAIN" and self.rect_test_promotion.collidepoint(virtual_mouse_pos):
+                        self.request_manual_promotion_test()
                     elif self.mode == "TRAIN" and self.rect_train_toggle.collidepoint(virtual_mouse_pos):
                         self.is_training_active = not self.is_training_active
                         if not self.is_training_active: self.save_checkpoint(manual=True)
