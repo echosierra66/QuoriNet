@@ -1,6 +1,9 @@
 import pygame
 import sys
 import os
+import copy
+import hashlib
+import inspect
 import json
 import random
 import time
@@ -9,6 +12,9 @@ import argparse
 import math
 import io
 import re
+import shutil
+import textwrap
+import warnings
 from collections import deque
 from functools import lru_cache
 import torch
@@ -22,6 +28,37 @@ VALUE_WIDTH = 1
 MANUAL_WEIGHTS_PATTERN = re.compile(
     r"^quorinet_gen_(\d+)_manual_(\d+)\.pth$"
 )
+OFFICIAL_WEIGHTS_PATTERN = re.compile(r"^quorinet_teacher_gen_(\d+)\.pth$")
+PACKED_MODEL_ARCHIVE_PATTERN = re.compile(
+    r"^quorinet_gen_(\d+)-(\d+)(?:_([0-9a-f]{8}))?\.pth$"
+)
+MODEL_ARCHIVE_PATTERN = re.compile(
+    r"^gen (\d+)-(\d+)(?: ([0-9a-f]{8}))?$"
+)
+ARCHIVED_OFFICIAL_PATTERN = re.compile(r"^gen (\d+)\.pth$")
+ARCHIVED_MANUAL_PATTERN = re.compile(r"^gen (\d+) manual (\d+)\.pth$")
+ARCHITECTURE_MANIFEST = "NN architecture.json"
+ARCHITECTURE_SOURCE = "NN architecture.py"
+ARCHITECTURE_EXECUTABLE = "NN architecture.pt"
+MODEL_ARCHIVE_FORMAT = "quorinet_architecture_archive"
+MODEL_ARCHIVE_VERSION = 1
+CURRENT_ENCODER_SPEC = {
+    "id": "relative_8ch_path_v1",
+    "shape": [STATE_CHANNELS, BOARD_SIZE, BOARD_SIZE],
+    "dtype": "float32",
+    "perspective": "active_player_rotated_180_for_player_2",
+    "channels": [
+        "active_player_position",
+        "opponent_position",
+        "horizontal_walls",
+        "vertical_walls",
+        "active_player_walls_remaining_div_10",
+        "opponent_walls_remaining_div_10",
+        "active_player_shortest_path_div_81",
+        "opponent_shortest_path_div_81",
+    ],
+}
+_ARCHITECTURE_CACHE = {}
 
 
 def mirror_state_batch(states):
@@ -265,7 +302,7 @@ def get_shortest_path_dist(state, pid):
     c, r = state[f'p{pid}_pos']
     return get_distance_field(state, pid)[r * BOARD_SIZE + c]
 
-def encode_state(state, active_pid):
+def encode_relative_8ch_path_v1(state, active_pid):
     if active_pid not in (1, 2):
         raise ValueError(f"active_pid must be 1 or 2, got {active_pid}")
     # 8 Channels exactly as specified
@@ -300,6 +337,186 @@ def encode_state(state, active_pid):
     tensor[7, :, :] = opp_dist / 81.0
     
     return validate_state_tensor(tensor, "encoded state")
+
+
+def encode_state(state, active_pid):
+    return encode_relative_8ch_path_v1(state, active_pid)
+
+
+def _state_dict_schema(state_dict):
+    return {
+        key: {"shape": list(value.shape), "dtype": str(value.dtype)}
+        for key, value in state_dict.items()
+    }
+
+
+def _cpu_state_dict(state_dict):
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in state_dict.items()
+    }
+
+
+def _encoder_implementation_source():
+    return textwrap.dedent(inspect.getsource(encode_relative_8ch_path_v1))
+
+
+def _current_encoder_spec():
+    spec = copy.deepcopy(CURRENT_ENCODER_SPEC)
+    source = _encoder_implementation_source()
+    spec["implementation_source"] = source
+    spec["implementation_sha256"] = hashlib.sha256(
+        source.encode("utf-8")
+    ).hexdigest()
+    return spec
+
+
+def _architecture_descriptor(architecture):
+    return {
+        "torchscript_code": architecture["torchscript_code"],
+        "state_schema": architecture["state_schema"],
+        "input_encoder": architecture["input_encoder"],
+        "value_output": architecture["value_output"],
+    }
+
+
+def _architecture_id(descriptor):
+    return hashlib.sha256(
+        json.dumps(descriptor, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _model_architecture(model):
+    archived = getattr(model, "archived_architecture", None)
+    return copy.deepcopy(archived) if archived else capture_model_architecture(model)
+
+
+def _model_state_dict(model):
+    archived = getattr(model, "archived_state_dict", None)
+    return archived() if archived else model.state_dict()
+
+
+def capture_model_architecture(model):
+    """Return a weight-independent, self-contained inference definition."""
+    state_schema = _state_dict_schema(model.state_dict())
+    encoder_spec = _current_encoder_spec()
+    cache_key = (
+        model.__class__.__module__, model.__class__.__qualname__,
+        json.dumps(state_schema, sort_keys=True),
+        json.dumps(encoder_spec, sort_keys=True),
+    )
+    if cache_key in _ARCHITECTURE_CACHE:
+        return copy.deepcopy(_ARCHITECTURE_CACHE[cache_key])
+
+    template = copy.deepcopy(model).cpu().eval()
+    sample = torch.zeros(
+        (1, *encoder_spec["shape"]), dtype=torch.float32
+    )
+    with torch.inference_mode():
+        output = template(sample)
+    if isinstance(output, torch.Tensor) and tuple(output.shape) == (1, 1):
+        value_output = {"kind": "tensor"}
+    elif isinstance(output, (tuple, list)):
+        candidates = [
+            index for index, value in enumerate(output)
+            if isinstance(value, torch.Tensor) and tuple(value.shape) == (1, 1)
+        ]
+        if len(candidates) != 1:
+            raise ValueError("model archive needs exactly one [B, 1] value output")
+        value_output = {"kind": "sequence", "index": candidates[0]}
+    else:
+        raise ValueError("model archive cannot identify the value output")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        scripted = torch.jit.trace(template, sample, check_trace=False)
+    script_buffer = io.BytesIO()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        torch.jit.save(scripted, script_buffer)
+    script_code = scripted.code
+    descriptor = {
+        "torchscript_code": script_code,
+        "state_schema": state_schema,
+        "input_encoder": encoder_spec,
+        "value_output": value_output,
+    }
+    architecture_id = _architecture_id(descriptor)
+    architecture = {
+        "id": architecture_id,
+        "class_name": f"{model.__class__.__module__}.{model.__class__.__qualname__}",
+        "class_source": inspect.getsource(model.__class__),
+        "torchscript": script_buffer.getvalue(),
+        **descriptor,
+    }
+    _ARCHITECTURE_CACHE[cache_key] = architecture
+    return copy.deepcopy(architecture)
+
+
+class ArchivedValueNet(nn.Module):
+    """Value opponent reconstructed entirely from one architecture archive."""
+
+    def __init__(self, architecture, state_dict):
+        super().__init__()
+        self.archived_architecture = copy.deepcopy(architecture)
+        self._archived_weights = _cpu_state_dict(state_dict)
+        self.architecture_id = architecture["id"]
+        self.encoder_spec = architecture["input_encoder"]
+        self.input_shape = tuple(self.encoder_spec["shape"])
+        self.value_output = architecture["value_output"]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.module = torch.jit.load(
+                io.BytesIO(architecture["torchscript"]), map_location="cpu"
+            )
+        self.module.load_state_dict(state_dict, strict=True)
+        self.module.eval()
+
+        source = self.encoder_spec.get("implementation_source")
+        if not source:
+            raise ValueError("archived input encoder has no preserved implementation")
+        namespace = dict(globals())
+        exec(source, namespace)
+        self._archived_encoder = namespace["encode_relative_8ch_path_v1"]
+
+    def archived_state_dict(self):
+        return _cpu_state_dict(self._archived_weights)
+
+    def encode_game_state(self, state, active_pid):
+        encoder_id = self.encoder_spec.get("id")
+        if encoder_id == "relative_8ch_path_v1":
+            return self._archived_encoder(state, active_pid)
+        raise ValueError(f"unsupported archived input encoder: {encoder_id}")
+
+    def forward(self, states):
+        output = self.module(states)
+        if self.value_output["kind"] == "sequence":
+            output = output[self.value_output["index"]]
+        return output
+
+
+def encode_state_for_model(model, state, active_pid):
+    encoder = getattr(model, "encode_game_state", None)
+    return encoder(state, active_pid) if encoder else encode_state(state, active_pid)
+
+
+def make_model_state_batch(model, state_tensors, name="states"):
+    expected_shape = tuple(getattr(model, "input_shape", STATE_SHAPE))
+    if not state_tensors:
+        raise ValueError(f"{name} cannot be empty")
+    for index, tensor in enumerate(state_tensors):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name}[{index}] must be a torch.Tensor")
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(
+                f"{name}[{index}] must have shape {expected_shape}, "
+                f"got {tuple(tensor.shape)}"
+            )
+        if tensor.dtype != torch.float32 or not torch.isfinite(tensor).all().item():
+            raise ValueError(f"{name}[{index}] must be finite float32")
+    return torch.stack(state_tensors).to(
+        device=model_device(model), dtype=torch.float32
+    ).contiguous()
 
 def get_state_key(state):
     return (state['p1_pos'], state['p2_pos'], tuple(sorted(state['walls_h'])), tuple(sorted(state['walls_v'])))
@@ -577,12 +794,14 @@ class QuoridorBot:
             sign = 1.0 if active_pid == eval_pid else -1.0
             neural_requests.append((index, key, sign))
             if key not in self._value_cache and key not in missing:
-                missing[key] = encode_state(state, active_pid)
+                missing[key] = encode_state_for_model(
+                    self.nn_model, state, active_pid
+                )
 
         if missing:
-            batch = make_state_batch(
+            batch = make_model_state_batch(
+                self.nn_model,
                 list(missing.values()),
-                model_device(self.nn_model),
                 name="bot evaluation states"
             )
             with torch.inference_mode():
@@ -744,11 +963,11 @@ class Quoridor:
         self.RECENT_BUCKET_MASS = 0.60
         self.HISTORIC_BUCKET_MASS = 0.40
         self.RECENT_DECAY_RATIO = 2.0
-        self.LOG_WINDOW_SIZE = 30
+        self.LOG_WINDOW_SIZE = 50
         self.MIN_SAMPLES_TRUSTED = 15
         self.GATE_MIN_GAMES = 30
         self.GATE_WIN_RATE_THRESHOLD = 0.57
-        self.GATE_TREND_WINDOW_SIZE = 15
+        self.GATE_TREND_WINDOW_SIZE = 25
         self.FINAL_TEST_GAMES_PER_MODEL = 10
         self.ESCALATION_LOSS_THRESHOLD = 0.50
         self.ESCALATION_RECOVER_THRESHOLD = 0.65
@@ -855,8 +1074,14 @@ class Quoridor:
         self.eval_vs_gen = 0
         self.eval_game_curr = 0
         self.eval_game_total = 0
-        
+
+        self._archive_groups = {}
+        self._archived_official = {}
+        self._archived_manual = {}
+        self.architecture_transition_status = "same_architecture"
+        self._discover_model_archives()
         self.load_checkpoint_if_exists()
+        self._sync_model_archives()
         self.update_opponent_pool()
 
         self.mode = "MENU"
@@ -888,6 +1113,392 @@ class Quoridor:
     # ==========================================
     # SECTION 4: OPPONENT POOL
     # ==========================================
+    def _validate_model_archive_payload(self, payload):
+        if (
+            payload.get("format") != MODEL_ARCHIVE_FORMAT
+            or payload.get("format_version") != MODEL_ARCHIVE_VERSION
+        ):
+            raise ValueError("unsupported model archive format")
+        architecture = payload.get("architecture", {})
+        required = {
+            "id", "class_name", "class_source", "torchscript",
+            "torchscript_code", "state_schema", "input_encoder",
+            "value_output",
+        }
+        if not required.issubset(architecture):
+            raise ValueError("model archive is missing its architecture definition")
+        descriptor = _architecture_descriptor(architecture)
+        if architecture["id"] != _architecture_id(descriptor):
+            raise ValueError("model archive architecture fingerprint changed")
+        encoder = architecture["input_encoder"]
+        if "implementation_source" not in encoder:
+            # Upgrade the immediately preceding archive format while its exact
+            # encoder implementation is still the live implementation.
+            encoder = copy.deepcopy(encoder)
+            source = _encoder_implementation_source()
+            encoder["implementation_source"] = source
+            encoder["implementation_sha256"] = hashlib.sha256(
+                source.encode("utf-8")
+            ).hexdigest()
+            architecture["input_encoder"] = encoder
+            architecture["id"] = _architecture_id(
+                _architecture_descriptor(architecture)
+            )
+        source = encoder["implementation_source"]
+        if encoder.get("implementation_sha256") != hashlib.sha256(
+            source.encode("utf-8")
+        ).hexdigest():
+            raise ValueError("model archive encoder fingerprint changed")
+        state_dicts = list(payload.get("official", {}).values())
+        state_dicts.extend(
+            entry["weights"] for entry in payload.get("manual", {}).values()
+        )
+        if any(
+            _state_dict_schema(state_dict) != architecture["state_schema"]
+            for state_dict in state_dicts
+        ):
+            raise ValueError("model archive contains weights for another architecture")
+        return payload
+
+    def _discover_model_archives(self):
+        """Read existing folders before any checkpoint tensors are loaded."""
+        groups = {}
+        for filename in os.listdir('.'):
+            if not MODEL_ARCHIVE_PATTERN.fullmatch(filename) or not os.path.isdir(filename):
+                continue
+            payload = self._read_model_archive(filename)
+            architecture = payload["architecture"]
+            group = groups.setdefault(architecture["id"], {
+                "architecture": architecture,
+                "official": {}, "manual": {}, "paths": set(),
+            })
+            group["official"].update(payload.get("official", {}))
+            group["manual"].update(payload.get("manual", {}))
+            group["paths"].add(filename)
+        self._archive_groups = groups
+        self._rebuild_archive_indexes()
+
+    def _read_packed_model_archive(self, filename):
+        payload = torch.load(filename, map_location="cpu", weights_only=True)
+        return self._validate_model_archive_payload(payload)
+
+    def _read_model_archive(self, directory):
+        manifest_path = os.path.join(directory, ARCHITECTURE_MANIFEST)
+        source_path = os.path.join(directory, ARCHITECTURE_SOURCE)
+        executable_path = os.path.join(directory, ARCHITECTURE_EXECUTABLE)
+        with open(manifest_path, encoding="utf-8") as f:
+            manifest = json.load(f)
+        with open(source_path, encoding="utf-8") as f:
+            class_source = f.read()
+        with open(executable_path, "rb") as f:
+            torchscript = f.read()
+
+        architecture = dict(manifest["architecture"])
+        architecture["class_source"] = class_source
+        architecture["torchscript"] = torchscript
+        official = {}
+        manual = {}
+        for filename in os.listdir(directory):
+            official_match = ARCHIVED_OFFICIAL_PATTERN.fullmatch(filename)
+            manual_match = ARCHIVED_MANUAL_PATTERN.fullmatch(filename)
+            if not official_match and not manual_match:
+                continue
+            path = os.path.join(directory, filename)
+            state_dict = torch.load(path, map_location="cpu", weights_only=True)
+            if official_match:
+                official[int(official_match.group(1))] = state_dict
+            else:
+                generation = int(manual_match.group(1))
+                iteration = int(manual_match.group(2))
+                name = f"gen_{generation}_manual_{iteration}"
+                manual[name] = {
+                    "generation": generation,
+                    "iteration": iteration,
+                    "weights": state_dict,
+                }
+        payload = {
+            "format": manifest.get("format"),
+            "format_version": manifest.get("format_version"),
+            "title": manifest.get("title"),
+            "generation_range": manifest.get("generation_range"),
+            "architecture": architecture,
+            "official": official,
+            "manual": manual,
+        }
+        return self._validate_model_archive_payload(payload)
+
+    def _write_model_archives(self):
+        ranges = {}
+        for architecture_id, group in self._archive_groups.items():
+            generations = list(group["official"])
+            generations.extend(
+                entry["generation"] for entry in group["manual"].values()
+            )
+            if not generations:
+                continue
+            ranges[architecture_id] = (min(generations), max(generations))
+        range_counts = {
+            generation_range: list(ranges.values()).count(generation_range)
+            for generation_range in set(ranges.values())
+        }
+
+        for architecture_id, group in self._archive_groups.items():
+            if architecture_id not in ranges:
+                continue
+            first_gen, last_gen = ranges[architecture_id]
+            suffix = (
+                f" {architecture_id[:8]}"
+                if range_counts[(first_gen, last_gen)] > 1 else ""
+            )
+            directory = f"gen {first_gen}-{last_gen}{suffix}"
+            old_directories = {
+                path for path in group.get("paths", set())
+                if os.path.isdir(path)
+            }
+            if not os.path.isdir(directory):
+                source_directory = next(iter(old_directories), None)
+                if source_directory is not None:
+                    os.replace(source_directory, directory)
+                    old_directories.remove(source_directory)
+                else:
+                    os.makedirs(directory)
+
+            architecture = group["architecture"]
+            manifest_architecture = {
+                key: value for key, value in architecture.items()
+                if key not in ("class_source", "torchscript")
+            }
+            manifest_architecture.update({
+                "source_file": ARCHITECTURE_SOURCE,
+                "executable_file": ARCHITECTURE_EXECUTABLE,
+            })
+            manifest = {
+                "format": MODEL_ARCHIVE_FORMAT,
+                "format_version": MODEL_ARCHIVE_VERSION,
+                "title": f"gen {first_gen}-{last_gen}",
+                "generation_range": [first_gen, last_gen],
+                "architecture": manifest_architecture,
+                "official_generations": sorted(group["official"]),
+                "manual_snapshots": sorted(group["manual"]),
+            }
+
+            def atomic_write(path, writer, binary=False):
+                temporary = f"{path}.tmp"
+                try:
+                    mode = "wb" if binary else "w"
+                    kwargs = {} if binary else {"encoding": "utf-8"}
+                    with open(temporary, mode, **kwargs) as f:
+                        writer(f)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(temporary, path)
+                finally:
+                    if os.path.exists(temporary):
+                        os.remove(temporary)
+
+            atomic_write(
+                os.path.join(directory, ARCHITECTURE_MANIFEST),
+                lambda f: json.dump(manifest, f, indent=2, sort_keys=True),
+            )
+            atomic_write(
+                os.path.join(directory, ARCHITECTURE_SOURCE),
+                lambda f: f.write(architecture["class_source"]),
+            )
+            atomic_write(
+                os.path.join(directory, ARCHITECTURE_EXECUTABLE),
+                lambda f: f.write(architecture["torchscript"]),
+                binary=True,
+            )
+            for generation, state_dict in group["official"].items():
+                atomic_write(
+                    os.path.join(directory, f"gen {generation}.pth"),
+                    lambda f, state_dict=state_dict: torch.save(state_dict, f),
+                    binary=True,
+                )
+            for entry in group["manual"].values():
+                filename = (
+                    f"gen {entry['generation']} manual {entry['iteration']}.pth"
+                )
+                atomic_write(
+                    os.path.join(directory, filename),
+                    lambda f, state_dict=entry["weights"]: torch.save(state_dict, f),
+                    binary=True,
+                )
+
+            verified = self._read_model_archive(directory)
+            if (
+                verified["architecture"]["id"] != architecture_id
+                or set(verified["official"]) != set(group["official"])
+                or set(verified["manual"]) != set(group["manual"])
+            ):
+                raise RuntimeError(f"model folder {directory} failed verification")
+
+            for old_directory in old_directories:
+                if (
+                    old_directory != directory
+                    and MODEL_ARCHIVE_PATTERN.fullmatch(old_directory)
+                    and os.path.isdir(old_directory)
+                ):
+                    shutil.rmtree(old_directory)
+            group["paths"] = {directory}
+            group["path"] = directory
+
+    def _rebuild_archive_indexes(self):
+        official = {}
+        manual = {}
+        for group in self._archive_groups.values():
+            architecture = group["architecture"]
+            for gen, state_dict in group["official"].items():
+                gen = int(gen)
+                if gen in official:
+                    raise ValueError(f"generation {gen} exists in two archives")
+                official[gen] = (architecture, state_dict)
+            for name, entry in group["manual"].items():
+                key = (int(entry["generation"]), int(entry["iteration"]))
+                if key in manual:
+                    raise ValueError(f"manual snapshot {name} exists in two archives")
+                manual[key] = (name, architecture, entry["weights"])
+        self._archived_official = official
+        self._archived_manual = manual
+
+    def _sync_model_archives(self):
+        """Consolidate every known model by exact architecture at startup."""
+        groups = {}
+        cleanup_files = set()
+        for filename in os.listdir('.'):
+            if not MODEL_ARCHIVE_PATTERN.fullmatch(filename) or not os.path.isdir(filename):
+                continue
+            try:
+                payload = self._read_model_archive(filename)
+            except Exception as exc:
+                raise RuntimeError(f"model archive {filename} rejected: {exc}") from exc
+            architecture = payload["architecture"]
+            group = groups.setdefault(architecture["id"], {
+                "architecture": architecture,
+                "official": {}, "manual": {}, "paths": set(),
+            })
+            group["official"].update({
+                int(gen): state_dict
+                for gen, state_dict in payload.get("official", {}).items()
+            })
+            group["manual"].update(payload.get("manual", {}))
+            group["paths"].add(filename)
+
+        # Migrate the earlier packed archive format into the browsable folders.
+        for filename in os.listdir('.'):
+            if not PACKED_MODEL_ARCHIVE_PATTERN.fullmatch(filename):
+                continue
+            try:
+                payload = self._read_packed_model_archive(filename)
+            except Exception as exc:
+                raise RuntimeError(f"packed model archive {filename} rejected: {exc}") from exc
+            architecture = payload["architecture"]
+            group = groups.setdefault(architecture["id"], {
+                "architecture": architecture,
+                "official": {}, "manual": {}, "paths": set(),
+            })
+            group["official"].update({
+                int(gen): state_dict
+                for gen, state_dict in payload.get("official", {}).items()
+            })
+            group["manual"].update(payload.get("manual", {}))
+            cleanup_files.add(filename)
+
+        current_architecture = _model_architecture(self.teacher_net)
+        current_group = groups.setdefault(current_architecture["id"], {
+            "architecture": current_architecture,
+            "official": {}, "manual": {}, "paths": set(),
+        })
+
+        existing_official = {
+            int(gen): architecture_id
+            for architecture_id, group in groups.items()
+            for gen in group["official"]
+        }
+        existing_manual = {
+            name: architecture_id
+            for architecture_id, group in groups.items()
+            for name in group["manual"]
+        }
+
+        def matching_group(state_dict, preferred_id=None):
+            schema = _state_dict_schema(state_dict)
+            if preferred_id is not None:
+                preferred = groups.get(preferred_id)
+                if preferred and preferred["architecture"]["state_schema"] == schema:
+                    return preferred
+            matches = [
+                group for group in groups.values()
+                if group["architecture"]["state_schema"] == schema
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            if current_group in matches:
+                return current_group
+            return None
+
+        for filename in os.listdir('.'):
+            official_match = OFFICIAL_WEIGHTS_PATTERN.fullmatch(filename)
+            manual_match = MANUAL_WEIGHTS_PATTERN.fullmatch(filename)
+            if not official_match and not manual_match:
+                continue
+            try:
+                state_dict = torch.load(
+                    filename, map_location="cpu", weights_only=True
+                )
+            except Exception as exc:
+                print(f"Skipped legacy weights {filename}: {exc}")
+                continue
+
+            if official_match:
+                gen = int(official_match.group(1))
+                group = matching_group(state_dict, existing_official.get(gen))
+                if group is None:
+                    print(f"Skipped architecture-ambiguous weights {filename}")
+                    continue
+                group["official"][gen] = _cpu_state_dict(state_dict)
+                cleanup_files.add(filename)
+            else:
+                generation = int(manual_match.group(1))
+                iteration = int(manual_match.group(2))
+                name = f"gen_{generation}_manual_{iteration}"
+                group = matching_group(state_dict, existing_manual.get(name))
+                if group is None:
+                    print(f"Skipped architecture-ambiguous weights {filename}")
+                    continue
+                group["manual"][name] = {
+                    "generation": generation,
+                    "iteration": iteration,
+                    "weights": _cpu_state_dict(state_dict),
+                }
+                cleanup_files.add(filename)
+
+        # The restored bundle is authoritative for the current official teacher.
+        current_group["official"][self.teacher_gen] = _cpu_state_dict(
+            _model_state_dict(self.teacher_net)
+        )
+        self._archive_groups = groups
+        self._write_model_archives()
+        self._rebuild_archive_indexes()
+        for filename in cleanup_files:
+            if (
+                os.path.isfile(filename)
+                and (
+                    OFFICIAL_WEIGHTS_PATTERN.fullmatch(filename)
+                    or MANUAL_WEIGHTS_PATTERN.fullmatch(filename)
+                    or PACKED_MODEL_ARCHIVE_PATTERN.fullmatch(filename)
+                )
+            ):
+                os.remove(filename)
+
+    def _available_official_generations(self):
+        generations = set(self._archived_official)
+        for filename in os.listdir('.'):
+            match = OFFICIAL_WEIGHTS_PATTERN.fullmatch(filename)
+            if match:
+                generations.add(int(match.group(1)))
+        return sorted(generations)
+
     def update_opponent_pool(self):
         self.opponent_pool = []
         self.opponent_support_base_weights = []
@@ -915,9 +1526,9 @@ class Quoridor:
                 raw_weight / recent_raw_sum * self.RECENT_BUCKET_MASS
             )
 
+        available_generations = set(self._available_official_generations())
         historic_gens = [
-            g for g in range(1, recent_start)
-            if os.path.exists(f'quorinet_teacher_gen_{g}.pth')
+            g for g in range(1, recent_start) if g in available_generations
         ]
         if historic_gens:
             hist_weights = {}
@@ -1341,6 +1952,16 @@ class Quoridor:
 
     def _load_net_for_gen(self, gen):
         if gen == self.teacher_gen: return self.teacher_net
+        archived = self._archived_official.get(gen)
+        if archived is not None:
+            architecture, state_dict = archived
+            try:
+                net = ArchivedValueNet(architecture, state_dict)
+                net.eval()
+                return net
+            except Exception as e:
+                print(f"Failed to decode archived pool model {gen}: {e}")
+                return None
         path = f'quorinet_teacher_gen_{gen}.pth'
         if not os.path.exists(path): return None
         try:
@@ -1486,55 +2107,50 @@ class Quoridor:
         validate_model_contract(destination, label)
 
     def _find_manual_snapshots(self):
-        snapshots = []
-        for filename in os.listdir('.'):
-            match = MANUAL_WEIGHTS_PATTERN.fullmatch(filename)
-            if match:
-                snapshots.append((int(match.group(1)), int(match.group(2)), filename))
-        return sorted(snapshots)
+        return sorted(
+            (generation, iteration, name)
+            for (generation, iteration), (name, _, _) in self._archived_manual.items()
+        )
 
     def save_manual_student(self):
         """Atomically preserve the current student without changing official files."""
         validate_model_contract(self.student_net, "student before manual save")
         candidate_gen = self.teacher_gen + 1
         iterations = [
-            iteration for generation, iteration, _ in self._find_manual_snapshots()
+            iteration for generation, iteration in self._archived_manual
             if generation == candidate_gen
         ]
         iteration = max(iterations, default=0) + 1
-        filename = f"quorinet_gen_{candidate_gen}_manual_{iteration}.pth"
-        temporary = f"{filename}.tmp"
-        state_dict = {
-            key: value.detach().cpu().clone()
-            for key, value in self.student_net.state_dict().items()
+        name = f"gen_{candidate_gen}_manual_{iteration}"
+        architecture = capture_model_architecture(self.student_net)
+        group = self._archive_groups.setdefault(architecture["id"], {
+            "architecture": architecture,
+            "official": {}, "manual": {}, "paths": set(),
+        })
+        group["manual"][name] = {
+            "generation": candidate_gen,
+            "iteration": iteration,
+            "weights": _cpu_state_dict(self.student_net.state_dict()),
         }
-        try:
-            with open(temporary, 'wb') as f:
-                torch.save(state_dict, f)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(temporary, filename)
-        finally:
-            if os.path.exists(temporary):
-                os.remove(temporary)
-
+        self._write_model_archives()
+        self._rebuild_archive_indexes()
         self.manual_snapshots = self._find_manual_snapshots()
         self.manual_snapshot_index = self.manual_snapshots.index(
-            (candidate_gen, iteration, filename)
+            (candidate_gen, iteration, name)
         )
         self.toast_msg = f"Saved Gen #{candidate_gen} Manual #{iteration}"
         self.toast_timer = 180
-        print(f"[Manual Student Saved] {filename}")
-        return filename
+        print(f"[Manual Student Saved] {name}")
+        return name
 
     def select_manual_play_opponent(self):
         if not self.manual_snapshots:
             return False
-        generation, iteration, filename = self.manual_snapshots[
+        generation, iteration, _ = self.manual_snapshots[
             self.manual_snapshot_index
         ]
-        candidate = SpatialQuoriNetV2(in_channels=STATE_CHANNELS)
-        self._load_network_checkpoint(filename, candidate, "manual play opponent")
+        _, architecture, state_dict = self._archived_manual[(generation, iteration)]
+        candidate = ArchivedValueNet(architecture, state_dict)
         candidate.eval()
         self.play_opponent_net = candidate
         self.play_opponent_label = f"Gen #{generation} Manual #{iteration}"
@@ -1546,14 +2162,91 @@ class Quoridor:
         if os.path.exists('quorinet_training_state.pth'):
             bundle = torch.load('quorinet_training_state.pth', map_location='cpu',
                                 weights_only=True)
-            if bundle.get('format_version') != 1:
+            if bundle.get('format_version') not in (1, 2):
                 raise ValueError('unsupported training checkpoint format')
-            self.teacher_net.load_state_dict(bundle['teacher'], strict=True)
-            self.student_net.load_state_dict(bundle['student'], strict=True)
-            self.optimizer.load_state_dict(bundle['optimizer'])
-            self.latest_replay_buffer.extend(bundle['latest_replay'])
-            self.historic_replay_buffer.extend(bundle['historic_replay'])
-            self.tactical_replay_buffer.extend(bundle.get('tactical_replay', []))
+            current_architecture = capture_model_architecture(self.student_net)
+            teacher_gen = int(bundle.get('meta', {}).get('teacher_gen', 1))
+            teacher_architecture = bundle.get('teacher_architecture')
+            student_architecture = bundle.get('student_architecture')
+            for label, architecture, weights in (
+                ('teacher', teacher_architecture, bundle['teacher']),
+                ('student', student_architecture, bundle['student']),
+            ):
+                if architecture is not None:
+                    checked = self._validate_model_archive_payload({
+                        'format': MODEL_ARCHIVE_FORMAT,
+                        'format_version': MODEL_ARCHIVE_VERSION,
+                        'architecture': architecture,
+                        'official': {0: weights},
+                        'manual': {},
+                    })
+                    if checked['architecture']['id'] != architecture['id']:
+                        raise RuntimeError(
+                            f'checkpoint {label} uses an obsolete architecture definition'
+                        )
+            archived_teacher = self._archived_official.get(teacher_gen)
+            if teacher_architecture is None and archived_teacher is not None:
+                candidate, _ = archived_teacher
+                if candidate['state_schema'] == _state_dict_schema(bundle['teacher']):
+                    teacher_architecture = candidate
+            if student_architecture is None and teacher_architecture is not None:
+                if teacher_architecture['state_schema'] == _state_dict_schema(bundle['student']):
+                    student_architecture = teacher_architecture
+
+            teacher_matches_current = (
+                teacher_architecture is not None
+                and teacher_architecture['id'] == current_architecture['id']
+                and _state_dict_schema(bundle['teacher']) == current_architecture['state_schema']
+            )
+            student_matches_current = (
+                student_architecture is not None
+                and student_architecture['id'] == current_architecture['id']
+                and _state_dict_schema(bundle['student']) == current_architecture['state_schema']
+            )
+            same_architecture = teacher_matches_current and student_matches_current
+            if teacher_matches_current:
+                self.teacher_net.load_state_dict(bundle['teacher'], strict=True)
+            else:
+                if teacher_architecture is None:
+                    raise RuntimeError(
+                        'checkpoint architecture differs and its official teacher '
+                        'has no verified architecture archive'
+                    )
+                if _state_dict_schema(bundle['teacher']) != teacher_architecture['state_schema']:
+                    raise RuntimeError('checkpoint teacher tensor schema is not archived')
+                self.teacher_net = ArchivedValueNet(
+                    teacher_architecture, bundle['teacher']
+                )
+                self.teacher_net.eval()
+
+            if student_matches_current:
+                self.student_net.load_state_dict(bundle['student'], strict=True)
+                self.optimizer.load_state_dict(bundle['optimizer'])
+            else:
+                self.architecture_transition_status = 'fresh_student_and_optimizer'
+
+            if not teacher_matches_current:
+                if student_matches_current:
+                    self.architecture_transition_status = 'restored_student_and_optimizer'
+                self.architecture_transition_status += '; archived_official_teacher'
+            if not same_architecture:
+                print(
+                    'Architecture transition: preserved the official teacher and '
+                    + ('restored' if student_matches_current else 'started fresh')
+                    + ' student/optimizer state.'
+                )
+
+            replay_compatible = (
+                student_architecture is not None
+                and student_architecture['input_encoder'] == current_architecture['input_encoder']
+            )
+            if same_architecture or replay_compatible:
+                self.latest_replay_buffer.extend(bundle['latest_replay'])
+                self.historic_replay_buffer.extend(bundle['historic_replay'])
+                self.tactical_replay_buffer.extend(bundle.get('tactical_replay', []))
+            else:
+                self.architecture_transition_status += '; incompatible_replay_preserved_in_source_bundle'
+                print('Architecture transition: old-encoder replay remains only in the source bundle.')
             self.last_loss = bundle['last_loss']
             self._restored_rng = (bundle['python_rng'], bundle['torch_rng'], bundle.get('cuda_rng'))
         elif os.path.exists('quorinet_meta.json'):
@@ -1644,6 +2337,19 @@ class Quoridor:
                         latest_hist,
                         maxlen=self.LATEST_TEACHER_LOG_WINDOW
                     )
+                    # Legacy checkpoints retained only 30 per-teacher results.
+                    # The separate latest-teacher history still has the true
+                    # preceding outcomes, so recover them once for Gen #teacher.
+                    latest_log = self.checkpoint_log.get(self.teacher_gen)
+                    if (meta.get('gate_log_window_size', 30) < self.LOG_WINDOW_SIZE
+                            and latest_log is not None
+                            and len(latest_log) == 30
+                            and len(self.latest_teacher_history) >= self.LOG_WINDOW_SIZE
+                            and list(self.latest_teacher_history)[-30:] == list(latest_log)):
+                        self.checkpoint_log[self.teacher_gen] = deque(
+                            list(self.latest_teacher_history)[-self.LOG_WINDOW_SIZE:],
+                            maxlen=self.LOG_WINDOW_SIZE
+                        )
 
                     self.latest_teacher_games_seen = meta.get(
                         'latest_teacher_games_seen',
@@ -1719,7 +2425,8 @@ class Quoridor:
                 'optimizer_steps': self.optimizer_steps,
                 'replay_samples_latest': self.replay_samples_latest,
                 'replay_samples_historic': self.replay_samples_historic,
-                'replay_samples_tactical': self.replay_samples_tactical
+                'replay_samples_tactical': self.replay_samples_tactical,
+                'gate_log_window_size': self.LOG_WINDOW_SIZE
             }
 
     def save_meta(self):
@@ -1743,9 +2450,11 @@ class Quoridor:
         validate_model_contract(self.student_net, "student network before save")
         validate_optimizer_state_shapes(self.optimizer, "optimizer before save")
         bundle = {
-            'format_version': 1,
-            'teacher': self.teacher_net.state_dict(),
+            'format_version': 2,
+            'teacher': _model_state_dict(self.teacher_net),
             'student': self.student_net.state_dict(),
+            'teacher_architecture': _model_architecture(self.teacher_net),
+            'student_architecture': capture_model_architecture(self.student_net),
             'optimizer': self.optimizer.state_dict(),
             'meta': self._checkpoint_metadata(),
             'latest_replay': list(self.latest_replay_buffer),
@@ -1764,8 +2473,8 @@ class Quoridor:
         os.replace(temporary, 'quorinet_training_state.pth')
         self._save_requested = False
         # Compatibility exports. Interrupted exports cannot supersede the bundle.
-        torch.save(self.teacher_net.state_dict(), f'quorinet_teacher_gen_{self.teacher_gen}.pth')
-        torch.save(self.teacher_net.state_dict(), 'quorinet_teacher_weights.pth')
+        torch.save(_model_state_dict(self.teacher_net), f'quorinet_teacher_gen_{self.teacher_gen}.pth')
+        torch.save(_model_state_dict(self.teacher_net), 'quorinet_teacher_weights.pth')
         torch.save(self.student_net.state_dict(), 'quorinet_student_weights.pth')
         torch.save(self.optimizer.state_dict(), 'quorinet_optimizer.pth')
         self.save_meta()
@@ -2500,15 +3209,14 @@ class Quoridor:
                         # Preserve the teacher that was actually trained against
                         # before the live teacher network is overwritten.
                         torch.save(
-                            self.teacher_net.state_dict(),
+                            _model_state_dict(self.teacher_net),
                             f'quorinet_teacher_gen_{self.teacher_gen}.pth'
                         )
 
                         self.update_escalation_state()
                         self.teacher_gen += 1
-                        self.teacher_net.load_state_dict(
-                            self.student_net.state_dict()
-                        )
+                        self.teacher_net = copy.deepcopy(self.student_net)
+                        self.teacher_net.eval()
 
                         self._roll_replay_buffers_for_new_teacher()
                         self.latest_teacher_history.clear()
@@ -2516,6 +3224,7 @@ class Quoridor:
                         self._reset_lr_search_for_new_teacher()
                         self.curriculum_latest_credit = 1.0
 
+                        self._sync_model_archives()
                         self.update_opponent_pool()
                         self.student_eval_history.clear()
                         self.student_win_rate_str = "Pending live WR"
