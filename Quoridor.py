@@ -44,6 +44,7 @@ ARCHITECTURE_SOURCE = "NN architecture.py"
 ARCHITECTURE_EXECUTABLE = "NN architecture.pt"
 MODEL_ARCHIVE_FORMAT = "quorinet_architecture_archive"
 MODEL_ARCHIVE_VERSION = 1
+REPLAY_FORMAT_VERSION = 1  # Whole accepted games, partitioned by teacher.
 CURRENT_ENCODER_SPEC = {
     "id": "relative_8ch_path_v1",
     "shape": [STATE_CHANNELS, BOARD_SIZE, BOARD_SIZE],
@@ -174,7 +175,7 @@ def validate_optimizer_state_shapes(optimizer, name="optimizer"):
                 raise FloatingPointError(f"{name} state '{key}' contains NaN or infinity")
 
 
-def checked_value_loss(loss_fn, predictions, targets, name="value loss"):
+def checked_value_loss(loss_fn, predictions, targets, name="value loss", sample_weights=None):
     """Compute scalar loss only after proving [B, 1] shapes match exactly."""
     if predictions.ndim != 2 or predictions.shape[1] != VALUE_WIDTH:
         raise ValueError(
@@ -192,6 +193,13 @@ def checked_value_loss(loss_fn, predictions, targets, name="value loss"):
             f"vs targets {tuple(targets.shape)}"
         )
     loss = loss_fn(predictions, targets)
+    if sample_weights is not None:
+        if loss.shape != targets.shape or sample_weights.shape != targets.shape:
+            raise ValueError(f"{name} per-sample loss and weights must match targets")
+        if (not torch.isfinite(sample_weights).all().item()
+                or not (sample_weights > 0).all().item()):
+            raise ValueError(f"{name} weights must be finite and positive")
+        loss = (sample_weights * loss).sum() / sample_weights.sum()
     if loss.ndim != 0 or not torch.isfinite(loss).item():
         raise FloatingPointError(
             f"{name} must be one finite scalar, got shape {tuple(loss.shape)} "
@@ -914,7 +922,7 @@ WIDTH = BOARD_PIXEL_SIZE + SIDEBAR_WIDTH + LEFT_SIDEBAR_WIDTH
 HEIGHT = max(650, BOARD_PIXEL_SIZE + 80)
 
 class Quoridor:
-    def __init__(self, headless=False, train_depth=2, play_depth=4, train_updates=16):
+    def __init__(self, headless=False, train_depth=2, play_depth=4, train_updates=None):
         pygame.init()
         self.headless = headless
         self.train_depth = train_depth
@@ -959,20 +967,17 @@ class Quoridor:
         self.LATEST_TEACHER_LOG_WINDOW = 60
         self.CURRICULUM_UNIFORM_MASS = 0.25
 
-        # Replay remains split between latest and historical experience, but its
-        # batch ratio follows the same live gate deficits as opponent selection.
-        self.REPLAY_LATEST_CAPACITY = 140000
-        self.REPLAY_HISTORIC_CAPACITY = 60000
-        self.REPLAY_WARMUP = 256
+        # Fresh positions get exactly one pass; replay never adds extra batches.
+        self.REPLAY_GAMES_PER_TEACHER = 100
         self.REPLAY_BATCH_SIZE = 128
-        self.TACTICAL_REPLAY_CAPACITY = 50000
-        self.TACTICAL_REPLAY_SHARE = 0.25
+        self.GENERAL_REPLAY_SLOTS = 38
         self.TACTICAL_LEAD_PLIES = 8
-        self.TRAIN_UPDATES_PER_GAME = train_updates
+        self.TACTICAL_MIN_LEAD_PLIES = 4
+        self.TACTICAL_LOSS_WEIGHT = 3.0
+        if train_updates is not None:
+            warnings.warn('train_updates is ignored: every fresh position receives one pass.')
 
-        # Sparse terminal reward is propagated through every gated matchup and
-        # blended with the stable teacher bootstrap already used by this model.
-        self.OUTCOME_BACKFILL_MIX = 0.70
+        # Used only by the isolated one-game overfit diagnostic.
         self.OUTCOME_BACKFILL_DISCOUNT = 0.995
 
         # Explicit LR bounds. Legacy policy constants are retained for the
@@ -995,7 +1000,7 @@ class Quoridor:
         self.student_net.eval()
         self.teacher_net.eval()
         self.optimizer = optim.Adam(self.student_net.parameters(), lr=0.0001)
-        self.loss_fn = nn.MSELoss()
+        self.loss_fn = nn.MSELoss(reduction='none')
 
         self.games_played = 0
         self.teacher_gen = 1
@@ -1012,9 +1017,9 @@ class Quoridor:
         self.p1_gen_str = "Gen #1"
         self.p2_gen_str = "Gen #1"
 
-        self.latest_replay_buffer = deque(maxlen=self.REPLAY_LATEST_CAPACITY)
-        self.historic_replay_buffer = deque(maxlen=self.REPLAY_HISTORIC_CAPACITY)
-        self.tactical_replay_buffer = deque(maxlen=self.TACTICAL_REPLAY_CAPACITY)
+        self.replay_games = {}
+        self.next_replay_game_id = 1
+        self.last_game_batches = []
         self.episode_trajectory = []
         self.last_loss = 0.0
         self.optimizer_steps = 0
@@ -1730,172 +1735,111 @@ class Quoridor:
         support_weights = [self.opponent_weights[i] for i in support_indices]
         return random.choices(support_pool, weights=support_weights, k=1)[0]
 
-    def _append_replay_sample(self, state_tensor, target, opponent_gen):
-        state_tensor = validate_state_tensor(state_tensor, "replay state")
-        target = float(target)
-        if not math.isfinite(target):
-            raise ValueError("replay target must be finite")
-        # Replay is deliberately canonicalized on CPU. Batches are moved to the
-        # student device in one place, which prevents mixed-device surprises.
-        replay_state = state_tensor.detach().to(device="cpu", dtype=torch.float32).clone()
-        item = (replay_state, float(max(-1.0, min(1.0, target))))
-        if opponent_gen == self.teacher_gen:
-            self.latest_replay_buffer.append(item)
-        else:
-            self.historic_replay_buffer.append(item)
-
-    def _append_tactical_replay_sample(self, state_tensor, target):
-        state_tensor = validate_state_tensor(state_tensor, "tactical replay state")
-        target = float(target)
-        if not math.isfinite(target):
-            raise ValueError("tactical replay target must be finite")
-        replay_state = state_tensor.detach().to(
-            device="cpu", dtype=torch.float32
-        ).clone()
-        self.tactical_replay_buffer.append(
-            (replay_state, float(max(-1.0, min(1.0, target))))
-        )
-
     def _tactical_replay_indices(self, winner_id):
-        """Return the eight-ply lead-up to the loser's final positive path gap."""
+        """Find the final lasting race advantage, then tag only its lead-up.
+
+        Goal-arrival plies are 2 * distance - 1 for the side to move and
+        2 * distance for the other side. A positive loser-minus-winner gap
+        includes a one-ply edge without oscillating as both pawns advance.
+        This is a retrospective path heuristic, not a forced-win claim.
+        """
         if winner_id not in (1, 2) or not self.episode_trajectory:
             return set()
-
-        loser_id = 2 if winner_id == 1 else 1
-        loser_path_gaps = []
-        for state_tensor, active_pid, _, _ in self.episode_trajectory:
-            active_gap = float(
-                state_tensor[6, 0, 0].item()
-                - state_tensor[7, 0, 0].item()
-            )
-            loser_path_gaps.append(
-                active_gap if active_pid == loser_id else -active_gap
-            )
-
-        if loser_path_gaps[-1] <= 0.0:
+        positions = [(entry[0], entry[1]) for entry in self.episode_trajectory]
+        positions.append(self.episode_trajectory[-1][2:4])
+        advantages = []
+        for state, active_pid in positions:
+            active_distance = round(float(state[6, 0, 0]) * 81)
+            other_distance = round(float(state[7, 0, 0]) * 81)
+            active_arrival = max(0, 2 * active_distance - 1)
+            other_arrival = 2 * other_distance
+            gap = other_arrival - active_arrival
+            advantages.append(gap > 0 if active_pid == winner_id else gap < 0)
+        if not advantages[-1]:
             return set()
-
-        onset = 0
-        for index in range(len(loser_path_gaps) - 1, -1, -1):
-            if loser_path_gaps[index] <= 0.0:
-                onset = index + 1
-                break
-
-        # A trajectory that starts already behind contains no observed crossing.
-        if onset == 0:
+        onset = len(advantages) - 1
+        while onset > 0 and advantages[onset - 1]:
+            onset -= 1
+        # No observed onset, fewer than four lead plies, or terminal-only edge.
+        if onset < self.TACTICAL_MIN_LEAD_PLIES or onset >= len(self.episode_trajectory):
             return set()
-        return set(range(max(0, onset - self.TACTICAL_LEAD_PLIES), onset + 1))
+        return set(range(max(0, onset - self.TACTICAL_LEAD_PLIES), onset))
 
-    def _sample_replay_batch(self):
-        total_samples = (
-            len(self.latest_replay_buffer) + len(self.historic_replay_buffer)
-        )
-        if total_samples < self.REPLAY_WARMUP:
-            return None
+    def _training_batches(self, fresh, opponent_gen):
+        """Uniform position draws, with no replacement across either replay draw."""
+        general_pool = [sample for games in self.replay_games.values()
+                        for game in games for sample in game['positions']]
+        same_pool = [sample for sample in general_pool
+                     if sample['teacher_gen'] == opponent_gen]
+        fresh = list(fresh)
+        random.shuffle(fresh)
+        fresh_slots = self.REPLAY_BATCH_SIZE - self.GENERAL_REPLAY_SLOTS
+        for start in range(0, len(fresh), fresh_slots):
+            new = fresh[start:start + fresh_slots]
+            same = random.sample(same_pool, min(fresh_slots - len(new), len(same_pool)))
+            selected = {(sample['game_id'], sample['ply_index']) for sample in same}
+            available = [sample for sample in general_pool
+                         if (sample['game_id'], sample['ply_index']) not in selected]
+            general = random.sample(available, min(self.GENERAL_REPLAY_SLOTS, len(available)))
+            batch = new + same + general
+            random.shuffle(batch)
+            replay = same + general
+            counts = {
+                'batch_size': len(batch), 'fresh': len(new),
+                'same_teacher': len(same), 'general': len(general),
+                'fresh_tactical': sum(s['tactical'] for s in new),
+                'same_teacher_tactical': sum(s['tactical'] for s in same),
+                'general_tactical': sum(s['tactical'] for s in general),
+                'replay_latest': sum(s['teacher_gen'] == self.teacher_gen for s in replay),
+                'replay_historic': sum(s['teacher_gen'] != self.teacher_gen for s in replay),
+            }
+            yield batch, counts
 
-        tactical_count = min(
-            len(self.tactical_replay_buffer),
-            int(round(self.REPLAY_BATCH_SIZE * self.TACTICAL_REPLAY_SHARE))
-        )
-        normal_batch_size = self.REPLAY_BATCH_SIZE - tactical_count
-
-        # Match ordinary replay emphasis to the same live gate deficits that
-        # choose opponents. Tactical samples occupy a separate fixed share.
-        latest_share = self._latest_teacher_share()
-        desired_latest = int(round(normal_batch_size * latest_share))
-
-        n_latest = min(len(self.latest_replay_buffer), desired_latest)
-        n_historic = min(
-            len(self.historic_replay_buffer),
-            normal_batch_size - n_latest
-        )
-
-        remaining = normal_batch_size - n_latest - n_historic
-        if remaining > 0:
-            extra_latest = min(
-                len(self.latest_replay_buffer) - n_latest,
-                remaining
-            )
-            n_latest += extra_latest
-            remaining -= extra_latest
-
-        if remaining > 0:
-            extra_historic = min(
-                len(self.historic_replay_buffer) - n_historic,
-                remaining
-            )
-            n_historic += extra_historic
-            remaining -= extra_historic
-
-        if n_latest + n_historic < normal_batch_size:
-            return None
-
-        batch = []
-        if n_latest:
-            batch.extend(random.sample(self.latest_replay_buffer, n_latest))
-        if n_historic:
-            batch.extend(random.sample(self.historic_replay_buffer, n_historic))
-        if tactical_count:
-            batch.extend(random.sample(self.tactical_replay_buffer, tactical_count))
-        random.shuffle(batch)
-        self._last_replay_counts = (n_latest, n_historic, tactical_count)
-        return batch
-
-    def _optimize_student_from_replay(self):
-        """Run exactly one checked optimizer step, or return False during warmup."""
-        batch = self._sample_replay_batch()
-        if batch is None:
+    def _optimize_student_batch(self, batch):
+        """Run one checked, normalized, weighted MSE update."""
+        if not batch:
             return False
-
         self.student_net.train()
         try:
             device = model_device(self.student_net)
-            states = make_state_batch(
-                [item[0] for item in batch],
-                device=device,
-                name="replay states"
-            )
-            targets = make_value_batch(
-                [item[1] for item in batch],
-                device=device,
-                name="replay targets"
-            )
+            states = make_state_batch([s['state'] for s in batch], device=device,
+                                      name="training states")
+            targets = make_value_batch([s['target'] for s in batch], device=device,
+                                       name="training targets")
+            weights = make_value_batch(
+                [self.TACTICAL_LOSS_WEIGHT if s['tactical'] else 1.0 for s in batch],
+                device=device, name="training weights")
             reflect = torch.rand(states.shape[0], device=device) < 0.5
             states[reflect] = mirror_state_batch(states[reflect])
             self.optimizer.zero_grad(set_to_none=True)
             predictions = self.student_net(states)
-            loss = checked_value_loss(
-                self.loss_fn,
-                predictions,
-                targets,
-                name="student replay MSE"
-            )
+            loss = checked_value_loss(self.loss_fn, predictions, targets,
+                                      name="student weighted MSE", sample_weights=weights)
+            with torch.no_grad():
+                weighted_errors = weights * self.loss_fn(predictions, targets)
+                total_error = weighted_errors.sum().item()
+                tactical_error = weighted_errors[weights > 1].sum().item()
+                self._last_tactical_loss_share = (
+                    tactical_error / total_error if total_error else 0.0)
             loss.backward()
             for name, parameter in self.student_net.named_parameters():
                 if parameter.grad is not None and not torch.isfinite(parameter.grad).all().item():
                     raise FloatingPointError(f"non-finite gradient in {name}")
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.student_net.parameters(),
-                self.GRAD_CLIP_NORM
-            )
+                self.student_net.parameters(), self.GRAD_CLIP_NORM)
             if not torch.isfinite(grad_norm).item():
                 raise FloatingPointError("student gradient norm is NaN or infinite")
             self.optimizer.step()
-            self.optimizer_steps = getattr(self, 'optimizer_steps', 0) + 1
-            latest, historic, tactical = self._last_replay_counts
-            self.replay_samples_latest += latest
-            self.replay_samples_historic += historic
-            self.replay_samples_tactical += tactical
+            self.optimizer_steps += 1
             self.last_loss = loss.item()
             return True
         finally:
             self.student_net.eval()
 
     def _roll_replay_buffers_for_new_teacher(self):
-        # The old "latest" data is still useful for anti-forgetting, but after
-        # promotion it must no longer occupy the protected current-target bucket.
-        while self.latest_replay_buffer:
-            self.historic_replay_buffer.append(self.latest_replay_buffer.popleft())
+        # Older windows retain every previously accepted game, including wins.
+        self.replay_games.setdefault(
+            self.teacher_gen, deque(maxlen=self.REPLAY_GAMES_PER_TEACHER))
 
     def _set_learning_rate(self, requested_lr, reason):
         if not math.isfinite(requested_lr) or requested_lr <= 0:
@@ -2202,10 +2146,17 @@ class Quoridor:
                 student_architecture is not None
                 and student_architecture['input_encoder'] == current_architecture['input_encoder']
             )
-            if same_architecture or replay_compatible:
-                self.latest_replay_buffer.extend(bundle['latest_replay'])
-                self.historic_replay_buffer.extend(bundle['historic_replay'])
-                self.tactical_replay_buffer.extend(bundle.get('tactical_replay', []))
+            replay_version = bundle.get('replay_format_version')
+            if replay_version not in (None, REPLAY_FORMAT_VERSION):
+                raise ValueError('unsupported replay format')
+            if replay_version == REPLAY_FORMAT_VERSION and (same_architecture or replay_compatible):
+                self.replay_games = {
+                    int(gen): deque(games, maxlen=self.REPLAY_GAMES_PER_TEACHER)
+                    for gen, games in bundle['replay_games'].items()
+                }
+                self.next_replay_game_id = bundle['next_replay_game_id']
+            elif replay_version is None:
+                print('Replay policy migration: clearing old replay; preserving model and training state.')
             else:
                 self.architecture_transition_status += '; incompatible_replay_preserved_in_source_bundle'
                 print('Architecture transition: old-encoder replay remains only in the source bundle.')
@@ -2363,6 +2314,26 @@ class Quoridor:
             except Exception as e:
                 raise RuntimeError(f"Metadata checkpoint rejected: {e}") from e
 
+        if bundle is not None and bundle.get('replay_format_version') is None:
+            # Persist the migration immediately, without reserializing live
+            # metadata/RNG or rewriting weights/Adam sidecars. All other bundle
+            # fields are preserved exactly, including architecture archives.
+            migrated = dict(bundle)
+            for key in ('latest_replay', 'historic_replay', 'tactical_replay'):
+                migrated.pop(key, None)
+            migrated.update(replay_format_version=REPLAY_FORMAT_VERSION,
+                            replay_games={}, next_replay_game_id=1)
+            self._write_training_bundle(migrated)
+
+    @staticmethod
+    def _write_training_bundle(bundle):
+        temporary = 'quorinet_training_state.pth.tmp'
+        with open(temporary, 'wb') as f:
+            torch.save(bundle, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, 'quorinet_training_state.pth')
+
     def _checkpoint_metadata(self):
         return {
                 'games_played': self.games_played,
@@ -2403,8 +2374,8 @@ class Quoridor:
     def save_checkpoint(self, manual=False):
         # A training episode owns deferred targets and updates. Save only after
         # it commits; the input thread requests a save instead of racing Adam.
-        if not self.game_over and (getattr(self, 'mode', None) == 'TRAIN'
-                                   or self.episode_trajectory):
+        if self.episode_trajectory or (
+                not self.game_over and getattr(self, 'mode', None) == 'TRAIN'):
             self._save_requested = True
             print('Checkpoint requested; saving after this game finishes.')
             return
@@ -2419,20 +2390,15 @@ class Quoridor:
             'student_architecture': capture_model_architecture(self.student_net),
             'optimizer': self.optimizer.state_dict(),
             'meta': self._checkpoint_metadata(),
-            'latest_replay': list(self.latest_replay_buffer),
-            'historic_replay': list(self.historic_replay_buffer),
-            'tactical_replay': list(self.tactical_replay_buffer),
+            'replay_format_version': REPLAY_FORMAT_VERSION,
+            'replay_games': {gen: list(games) for gen, games in self.replay_games.items()},
+            'next_replay_game_id': self.next_replay_game_id,
             'last_loss': self.last_loss,
             'python_rng': random.getstate(),
             'torch_rng': torch.get_rng_state(),
             'cuda_rng': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
         }
-        temporary = 'quorinet_training_state.pth.tmp'
-        with open(temporary, 'wb') as f:
-            torch.save(bundle, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(temporary, 'quorinet_training_state.pth')
+        self._write_training_bundle(bundle)
         self._save_requested = False
         # Compatibility exports. Interrupted exports cannot supersede the bundle.
         torch.save(_model_state_dict(self.teacher_net), f'quorinet_teacher_gen_{self.teacher_gen}.pth')
@@ -2652,94 +2618,55 @@ class Quoridor:
         if not done:
             return
 
-        trajectory = self.episode_trajectory
-        trajectory_length = len(trajectory)
+        self.last_game_batches = []
         opponent_gen = self.current_opponent_gen
-        is_latest_game = self.current_opponent_is_latest
-        historical_student_loss = (
-            not is_latest_game
-            and winner_id in (1, 2)
-            and winner_id != self.student_id
-        )
-        commit_episode = is_latest_game or historical_student_loss
-        optimizer_steps = 0
+        accepted = winner_id in (1, 2) and (
+            opponent_gen == self.teacher_gen or winner_id != self.student_id)
+        if not accepted:
+            reason = 'unfinished' if winner_id == 0 else 'historical student win'
+            print(f"Gen #{opponent_gen} {reason}: discarded {len(self.episode_trajectory)} plies.")
+            self.episode_trajectory.clear()
+            return
 
-        if commit_episode:
-            bootstrap_values = [0.0] * trajectory_length
-            if winner_id and trajectory_length > 1:
-                next_states = make_state_batch(
-                    [entry[2] for entry in trajectory[:-1]],
-                    model_device(self.teacher_net),
-                    name="episode bootstrap states"
-                )
-                with torch.inference_mode():
-                    values = self.teacher_net(next_states)
-                expected = (trajectory_length - 1, VALUE_WIDTH)
-                if tuple(values.shape) != expected:
-                    raise ValueError(
-                        f"teacher bootstrap must return {expected}, "
-                        f"got {tuple(values.shape)}"
-                    )
-                if not torch.isfinite(values).all().item():
-                    raise ValueError("teacher bootstrap returned NaN or infinite values")
-                bootstrap_values[:-1] = values[:, 0].cpu().tolist()
+        tactical = self._tactical_replay_indices(winner_id)
+        game_id = self.next_replay_game_id
+        student_outcome = 1 if winner_id == self.student_id else -1
+        fresh = [
+            {'state': state, 'target': 1.0 if pid == winner_id else -1.0,
+             'game_id': game_id, 'teacher_gen': opponent_gen,
+             'student_outcome': student_outcome, 'ply_index': index,
+             'tactical': index in tactical}
+            for index, (state, pid, _, _) in enumerate(self.episode_trajectory)
+        ]
+        for batch, counts in self._training_batches(fresh, opponent_gen):
+            if not self._optimize_student_batch(batch):
+                raise RuntimeError('accepted game optimizer update did not complete')
+            self.replay_samples_latest += counts['replay_latest']
+            self.replay_samples_historic += counts['replay_historic']
+            self.replay_samples_tactical += (
+                counts['same_teacher_tactical'] + counts['general_tactical'])
+            counts['tactical'] = sum(sample['tactical'] for sample in batch)
+            counts['weighted_tactical_loss_share'] = self._last_tactical_loss_share
+            counts['loss'] = self.last_loss
+            self.last_game_batches.append(counts)
+            print(f"Batch {len(self.last_game_batches)}: size={len(batch)} "
+                  f"fresh/same/general={counts['fresh']}/{counts['same_teacher']}/{counts['general']} "
+                  f"tactical={counts['tactical']} "
+                  f"weighted tactical loss={self._last_tactical_loss_share:.2%}")
 
-            tactical_indices = self._tactical_replay_indices(winner_id)
-            for index, (episode_state, episode_pid, _, episode_next_pid) in enumerate(trajectory):
-                outcome = (
-                    0.0
-                    if winner_id == 0
-                    else (1.0 if episode_pid == winner_id else -1.0)
-                )
-                horizon = trajectory_length - 1 - index
-                if horizon == 0 or winner_id == 0:
-                    target = outcome
-                else:
-                    bootstrap = 0.99 * bootstrap_values[index]
-                    if episode_next_pid != episode_pid:
-                        bootstrap = -bootstrap
-                    target = (
-                        self.OUTCOME_BACKFILL_MIX
-                        * outcome
-                        * (self.OUTCOME_BACKFILL_DISCOUNT ** horizon)
-                        + (1.0 - self.OUTCOME_BACKFILL_MIX) * bootstrap
-                    )
-                if index in tactical_indices:
-                    self._append_tactical_replay_sample(episode_state, target)
-                else:
-                    self._append_replay_sample(episode_state, target, opponent_gen)
-
-            optimizer_steps = min(
-                self.TRAIN_UPDATES_PER_GAME,
-                max(4, math.ceil(trajectory_length / 4))
-            )
-            if historical_student_loss:
-                print(
-                    f"Historical Gen #{opponent_gen} loss: committed "
-                    f"{trajectory_length} terminal-labeled plies."
-                )
-        else:
-            result = "win" if winner_id == self.student_id else "draw"
-            print(
-                f"Historical Gen #{opponent_gen} {result}: discarded "
-                f"{trajectory_length} plies; student weights unchanged."
-            )
-
+        # Commit only after all fresh positions have trained. This game cannot
+        # fill its own replay slots; eviction always removes an entire game.
+        self.replay_games.setdefault(
+            opponent_gen, deque(maxlen=self.REPLAY_GAMES_PER_TEACHER)).append({
+                'game_id': game_id, 'teacher_gen': opponent_gen,
+                'student_outcome': student_outcome, 'positions': fresh,
+            })
+        self.next_replay_game_id += 1
         self.episode_trajectory.clear()
-        completed_steps = 0
-        for _ in range(optimizer_steps):
-            if not self._optimize_student_from_replay():
-                break
-            completed_steps += 1
-        if historical_student_loss and optimizer_steps > 1:
-            print(
-                f"Historical deferred optimizer steps: "
-                f"{completed_steps}/{optimizer_steps}."
-            )
 
     def log_match_result(self, winner_id):
         duration = round(time.time() - self.game_start_time, 1)
-        if winner_id == 0: winner_str = "Draw"
+        if winner_id == 0: winner_str = "Unfinished"
         elif getattr(self, 'mode', 'TRAIN') == "TRAIN": winner_str = "Student" if winner_id == self.student_id else "Teacher"
         else: winner_str = "Human" if winner_id == 1 else "Teacher"
             
@@ -2912,7 +2839,7 @@ class Quoridor:
             blue, (LEFT_SIDEBAR_WIDTH + BOARD_PIXEL_SIZE - blue.get_width() - 16, 22)
         )
         status = (
-            "Draw" if self.winner == "Draw" else
+            "Unfinished" if self.winner == "Unfinished" else
             f"{self.winner} won!" if self.game_over else
             "Red's turn" if self.state['turn'] == 1 else "Blue's turn"
         )
@@ -3005,7 +2932,7 @@ class Quoridor:
             self._result_recorded = True
             self.winner_id = winner_id
             if winner_id == 0:
-                self.winner = "Draw"
+                self.winner = "Unfinished"
             elif getattr(self, 'mode', 'TRAIN') == "TRAIN":
                 self.winner = "Student" if winner_id == self.student_id else "Teacher"
             else:
@@ -3019,6 +2946,13 @@ class Quoridor:
 
             if self.mode == "TRAIN":
                 self.games_played += 1
+
+                if winner_id == 0:
+                    # A cutoff has no outcome for learning or win-rate gates.
+                    self.save_meta()
+                    if self.games_played % 250 == 0 or self._save_requested:
+                        self.save_checkpoint(manual=self._save_requested)
+                    return
 
                 student_won = 1 if winner_id == self.student_id else 0
                 self.student_eval_history.append(student_won)
@@ -3413,8 +3347,8 @@ if __name__ == "__main__":
                         help='search depth during self-play (default: 2)')
     parser.add_argument('--play-depth', type=int, default=4,
                         help='search depth against a human (default: 4)')
-    parser.add_argument('--train-updates', type=int, default=16,
-                        help='maximum optimizer batches per completed game (default: 16)')
+    parser.add_argument('--train-updates', type=int, default=None,
+                        help='deprecated and ignored; fresh positions each receive one pass')
     parser.add_argument('--checkpoint-dir', default=None,
                         help='directory for all training saves; defaults to the working directory')
     parser.add_argument(
@@ -3448,8 +3382,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if min(args.threads, args.train_depth, args.play_depth, args.train_updates) < 1:
-        parser.error('threads, search depths and train-updates must be positive')
+    if min(args.threads, args.train_depth, args.play_depth) < 1:
+        parser.error('threads and search depths must be positive')
     torch.set_num_threads(args.threads)
     if args.seed is not None:
         random.seed(args.seed)
