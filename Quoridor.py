@@ -8,16 +8,20 @@ import threading
 import argparse
 import math
 import io
+import re
 from collections import deque
 from functools import lru_cache
 import torch
 import torch.nn as nn
 import torch.optim as optim
-"""h"""
+
 BOARD_SIZE = 9
 STATE_CHANNELS = 8
 STATE_SHAPE = (STATE_CHANNELS, BOARD_SIZE, BOARD_SIZE)
 VALUE_WIDTH = 1
+MANUAL_WEIGHTS_PATTERN = re.compile(
+    r"^quorinet_gen_(\d+)_manual_(\d+)\.pth$"
+)
 
 
 def mirror_state_batch(states):
@@ -860,7 +864,16 @@ class Quoridor:
         self.toast_msg = ""
         self.toast_timer = 0
         
-        self.rect_play, self.rect_train, self.rect_new_game, self.rect_menu, self.rect_train_toggle = [pygame.Rect(0, 0, 0, 0) for _ in range(5)]
+        (
+            self.rect_play, self.rect_train, self.rect_save_manual,
+            self.rect_play_manual, self.rect_manual_prev,
+            self.rect_manual_next, self.rect_new_game, self.rect_menu,
+            self.rect_train_toggle,
+        ) = [pygame.Rect(0, 0, 0, 0) for _ in range(9)]
+        self.manual_snapshots = self._find_manual_snapshots()
+        self.manual_snapshot_index = max(0, len(self.manual_snapshots) - 1)
+        self.play_opponent_net = self.teacher_net
+        self.play_opponent_label = f"Gen #{self.teacher_gen} Official"
         self.game_start_time = time.time()
         self.reset_game()
         if hasattr(self, '_restored_rng'):
@@ -967,14 +980,14 @@ class Quoridor:
         return prior_win_rate, recent_win_rate
 
     def _passes_training_generation_gate(self, gen):
-        """Require both the 30-game WR target and a strictly rising finish."""
+        """Require the WR target and a rise, except for a perfect finish."""
         log = self.checkpoint_log.get(gen)
         if not log or len(log) < self.GATE_MIN_GAMES:
             return False
         if not self._passes_generation_gate(gen, sum(log) / len(log)):
             return False
         trend = self._generation_gate_trend(gen)
-        return trend is not None and trend[1] > trend[0]
+        return trend is not None and (trend[1] > trend[0] or trend[1] == 1.0)
 
     def _all_training_gates_met(self):
         generations = self._training_generations()
@@ -1005,7 +1018,10 @@ class Quoridor:
                     )
                 else:
                     prior, recent = trend
-                    direction = "RISING" if recent > prior else "NOT RISING"
+                    direction = (
+                        "PERFECT" if recent == 1.0 else
+                        "RISING" if recent > prior else "NOT RISING"
+                    )
                     trend_text = (
                         f"Trend {prior * 100:.1f}%->{recent * 100:.1f}% "
                         f"{direction}"
@@ -1449,9 +1465,13 @@ class Quoridor:
                 self.student_id = 1
                 self.p1_gen_str, self.p2_gen_str = f"Gen #{self.teacher_gen + 1} (Student)", f"Gen #{pool_gen} (Teacher)"
         else:
-            self.bot1 = QuoridorBot(bot_id=1, max_depth=self.play_depth, nn_model=self.teacher_net, heuristic_weight=self.heuristic_weight)
-            self.bot2 = QuoridorBot(bot_id=2, max_depth=self.play_depth, nn_model=self.teacher_net, heuristic_weight=self.heuristic_weight)
-            self.p1_gen_str, self.p2_gen_str = "Human", f"Gen #{self.teacher_gen} (Teacher)"
+            play_net = getattr(self, 'play_opponent_net', self.teacher_net)
+            play_label = getattr(
+                self, 'play_opponent_label', f"Gen #{self.teacher_gen} Official"
+            )
+            self.bot1 = QuoridorBot(bot_id=1, max_depth=self.play_depth, nn_model=play_net, heuristic_weight=self.heuristic_weight)
+            self.bot2 = QuoridorBot(bot_id=2, max_depth=self.play_depth, nn_model=play_net, heuristic_weight=self.heuristic_weight)
+            self.p1_gen_str, self.p2_gen_str = "Human", play_label
 
         self.p1_draw_x, self.p1_draw_y = self._get_center_pixels(self.state['p1_pos'])
         self.p2_draw_x, self.p2_draw_y = self._get_center_pixels(self.state['p2_pos'])
@@ -1464,6 +1484,61 @@ class Quoridor:
         validate_model_contract(candidate, f"{label} checkpoint")
         destination.load_state_dict(candidate.state_dict(), strict=True)
         validate_model_contract(destination, label)
+
+    def _find_manual_snapshots(self):
+        snapshots = []
+        for filename in os.listdir('.'):
+            match = MANUAL_WEIGHTS_PATTERN.fullmatch(filename)
+            if match:
+                snapshots.append((int(match.group(1)), int(match.group(2)), filename))
+        return sorted(snapshots)
+
+    def save_manual_student(self):
+        """Atomically preserve the current student without changing official files."""
+        validate_model_contract(self.student_net, "student before manual save")
+        candidate_gen = self.teacher_gen + 1
+        iterations = [
+            iteration for generation, iteration, _ in self._find_manual_snapshots()
+            if generation == candidate_gen
+        ]
+        iteration = max(iterations, default=0) + 1
+        filename = f"quorinet_gen_{candidate_gen}_manual_{iteration}.pth"
+        temporary = f"{filename}.tmp"
+        state_dict = {
+            key: value.detach().cpu().clone()
+            for key, value in self.student_net.state_dict().items()
+        }
+        try:
+            with open(temporary, 'wb') as f:
+                torch.save(state_dict, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, filename)
+        finally:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+
+        self.manual_snapshots = self._find_manual_snapshots()
+        self.manual_snapshot_index = self.manual_snapshots.index(
+            (candidate_gen, iteration, filename)
+        )
+        self.toast_msg = f"Saved Gen #{candidate_gen} Manual #{iteration}"
+        self.toast_timer = 180
+        print(f"[Manual Student Saved] {filename}")
+        return filename
+
+    def select_manual_play_opponent(self):
+        if not self.manual_snapshots:
+            return False
+        generation, iteration, filename = self.manual_snapshots[
+            self.manual_snapshot_index
+        ]
+        candidate = SpatialQuoriNetV2(in_channels=STATE_CHANNELS)
+        self._load_network_checkpoint(filename, candidate, "manual play opponent")
+        candidate.eval()
+        self.play_opponent_net = candidate
+        self.play_opponent_label = f"Gen #{generation} Manual #{iteration}"
+        return True
 
     def load_checkpoint_if_exists(self):
         # One atomic bundle is authoritative over all legacy sidecar files.
@@ -1980,21 +2055,52 @@ class Quoridor:
         if self.headless: return
         self.virtual_screen.fill(BG_COLOR)
         title = self.title_font.render("QuoriNet AI Engine", True, TEXT_COLOR)
-        self.virtual_screen.blit(title, (WIDTH // 2 - title.get_width() // 2, int(100 * SCALE)))
+        self.virtual_screen.blit(title, (WIDTH // 2 - title.get_width() // 2, int(80 * SCALE)))
 
-        btn_w, btn_h = int(240 * SCALE), int(60 * SCALE)
-        self.rect_play = pygame.Rect(WIDTH // 2 - btn_w // 2, int(240 * SCALE), btn_w, btn_h)
+        btn_w, btn_h = int(320 * SCALE), int(55 * SCALE)
+        self.rect_play = pygame.Rect(WIDTH // 2 - btn_w // 2, int(190 * SCALE), btn_w, btn_h)
         pygame.draw.rect(self.virtual_screen, P1_COLOR, self.rect_play, border_radius=int(10 * SCALE))
-        play_txt = self.font.render("PLAY WITH BOT", True, (255, 255, 255))
+        play_txt = self.font.render(f"PLAY OFFICIAL GEN #{self.teacher_gen}", True, (255, 255, 255))
         self.virtual_screen.blit(play_txt, (self.rect_play.centerx - play_txt.get_width() // 2, self.rect_play.centery - play_txt.get_height() // 2))
 
-        self.rect_train = pygame.Rect(WIDTH // 2 - btn_w // 2, int(330 * SCALE), btn_w, btn_h)
+        selector_y = int(265 * SCALE)
+        arrow_w = int(45 * SCALE)
+        self.rect_manual_prev = pygame.Rect(WIDTH // 2 - btn_w // 2, selector_y, arrow_w, btn_h)
+        self.rect_manual_next = pygame.Rect(WIDTH // 2 + btn_w // 2 - arrow_w, selector_y, arrow_w, btn_h)
+        pygame.draw.rect(self.virtual_screen, (220, 224, 230), self.rect_manual_prev, border_radius=int(10 * SCALE))
+        pygame.draw.rect(self.virtual_screen, (220, 224, 230), self.rect_manual_next, border_radius=int(10 * SCALE))
+        self.virtual_screen.blit(self.font.render("<", True, TEXT_COLOR), self.font.render("<", True, TEXT_COLOR).get_rect(center=self.rect_manual_prev.center))
+        self.virtual_screen.blit(self.font.render(">", True, TEXT_COLOR), self.font.render(">", True, TEXT_COLOR).get_rect(center=self.rect_manual_next.center))
+        if self.manual_snapshots:
+            generation, iteration, _ = self.manual_snapshots[self.manual_snapshot_index]
+            manual_label = f"Gen #{generation} Manual #{iteration}"
+        else:
+            manual_label = "No manual snapshots"
+        manual_txt = self.small_font.render(manual_label, True, TEXT_COLOR)
+        self.virtual_screen.blit(manual_txt, manual_txt.get_rect(center=(WIDTH // 2, selector_y + btn_h // 2)))
+
+        self.rect_play_manual = pygame.Rect(WIDTH // 2 - btn_w // 2, int(335 * SCALE), btn_w, btn_h)
+        manual_color = P2_COLOR if self.manual_snapshots else (180, 184, 190)
+        pygame.draw.rect(self.virtual_screen, manual_color, self.rect_play_manual, border_radius=int(10 * SCALE))
+        play_manual_txt = self.font.render("PLAY SELECTED MANUAL", True, (255, 255, 255))
+        self.virtual_screen.blit(play_manual_txt, play_manual_txt.get_rect(center=self.rect_play_manual.center))
+
+        self.rect_save_manual = pygame.Rect(WIDTH // 2 - btn_w // 2, int(405 * SCALE), btn_w, btn_h)
+        pygame.draw.rect(self.virtual_screen, (92, 102, 116), self.rect_save_manual, border_radius=int(10 * SCALE))
+        save_txt = self.font.render("SAVE CURRENT STUDENT", True, (255, 255, 255))
+        self.virtual_screen.blit(save_txt, save_txt.get_rect(center=self.rect_save_manual.center))
+
+        self.rect_train = pygame.Rect(WIDTH // 2 - btn_w // 2, int(475 * SCALE), btn_w, btn_h)
         pygame.draw.rect(self.virtual_screen, P2_COLOR, self.rect_train, border_radius=int(10 * SCALE))
         train_txt = self.font.render("TRAIN BOT (WATCH)", True, (255, 255, 255))
         self.virtual_screen.blit(train_txt, (self.rect_train.centerx - train_txt.get_width() // 2, self.rect_train.centery - train_txt.get_height() // 2))
 
         hint_txt = self.tiny_font.render("[Press F11 or F to toggle Fullscreen]", True, MUTED_TEXT)
-        self.virtual_screen.blit(hint_txt, (WIDTH // 2 - hint_txt.get_width() // 2, int(420 * SCALE)))
+        self.virtual_screen.blit(hint_txt, (WIDTH // 2 - hint_txt.get_width() // 2, int(550 * SCALE)))
+        if self.toast_timer > 0:
+            self.toast_timer -= 1
+            toast = self.small_font.render(self.toast_msg, True, (46, 125, 50))
+            self.virtual_screen.blit(toast, toast.get_rect(center=(WIDTH // 2, int(590 * SCALE))))
         self.render_and_flip()
 
     def draw_left_sidebar(self):
@@ -2716,8 +2822,19 @@ class Quoridor:
 
                 if self.mode == "MENU" and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     if self.rect_play.collidepoint(virtual_mouse_pos):
+                        self.play_opponent_net = self.teacher_net
+                        self.play_opponent_label = f"Gen #{self.teacher_gen} Official"
                         self.mode, self.is_training_active = "PLAY", False
                         self.reset_game()
+                    elif self.rect_manual_prev.collidepoint(virtual_mouse_pos) and self.manual_snapshots:
+                        self.manual_snapshot_index = (self.manual_snapshot_index - 1) % len(self.manual_snapshots)
+                    elif self.rect_manual_next.collidepoint(virtual_mouse_pos) and self.manual_snapshots:
+                        self.manual_snapshot_index = (self.manual_snapshot_index + 1) % len(self.manual_snapshots)
+                    elif self.rect_play_manual.collidepoint(virtual_mouse_pos) and self.select_manual_play_opponent():
+                        self.mode, self.is_training_active = "PLAY", False
+                        self.reset_game()
+                    elif self.rect_save_manual.collidepoint(virtual_mouse_pos):
+                        self.save_manual_student()
                     elif self.rect_train.collidepoint(virtual_mouse_pos):
                         self.mode, self.is_training_active = "TRAIN", True
                         self.reset_game()
