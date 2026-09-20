@@ -1040,6 +1040,7 @@ class Quoridor:
         self.lr_last_reduced_at_gen = 0  # legacy metadata compatibility
         self.current_opponent_gen = 1
         self.current_opponent_is_latest = True
+        self.rematch_teacher_gen = None
         self.curriculum_latest_credit = 1.0
 
         # Latest-teacher LR search state. Reset whenever a new teacher becomes
@@ -1570,14 +1571,11 @@ class Quoridor:
         return prior_win_rate, recent_win_rate
 
     def _passes_training_generation_gate(self, gen):
-        """Require the WR target and a rise, except for a perfect finish."""
+        """Require enough games and the WR target; trend is informational only."""
         log = self.checkpoint_log.get(gen)
         if not log or len(log) < self.GATE_MIN_GAMES:
             return False
-        if not self._passes_generation_gate(gen, sum(log) / len(log)):
-            return False
-        trend = self._generation_gate_trend(gen)
-        return trend is not None and (trend[1] > trend[0] or trend[1] == 1.0)
+        return self._passes_generation_gate(gen, sum(log) / len(log))
 
     def _all_training_gates_met(self):
         generations = self._training_generations()
@@ -1704,6 +1702,12 @@ class Quoridor:
 
     def _select_training_opponent(self):
         self._refresh_opponent_weights()
+
+        if self.rematch_teacher_gen is not None:
+            for opponent, gen in self.opponent_pool:
+                if gen == self.rematch_teacher_gen:
+                    return opponent, gen
+            raise RuntimeError(f"Rematch teacher Gen #{self.rematch_teacher_gen} is unavailable")
 
         latest_idx = next(
             (i for i, (_, gen) in enumerate(self.opponent_pool)
@@ -2225,6 +2229,7 @@ class Quoridor:
                     meta = json.load(f)
                     self.games_played = meta.get('games_played', 0)
                     self.teacher_gen = meta.get('teacher_gen', 1)
+                    self.rematch_teacher_gen = meta.get('rematch_teacher_gen')
                     self.heuristic_weight = meta.get('heuristic_weight', 1.0)
 
                     eval_hist = meta.get('student_eval_history', [])
@@ -2338,6 +2343,7 @@ class Quoridor:
         return {
                 'games_played': self.games_played,
                 'teacher_gen': self.teacher_gen,
+                'rematch_teacher_gen': self.rematch_teacher_gen,
                 'heuristic_weight': self.heuristic_weight,
                 'student_eval_history': list(self.student_eval_history),
                 'latest_teacher_history': list(self.latest_teacher_history),
@@ -2958,6 +2964,12 @@ class Quoridor:
                 self.student_eval_history.append(student_won)
 
                 gen = self.current_opponent_gen
+                if not student_won:
+                    self.rematch_teacher_gen = gen
+                elif self.rematch_teacher_gen == gen:
+                    self.rematch_teacher_gen = None
+                if self.rematch_teacher_gen is not None:
+                    print(f"Rematch Gen #{self.rematch_teacher_gen} until the student wins.")
                 if gen not in self.checkpoint_log:
                     self.checkpoint_log[gen] = deque(maxlen=self.LOG_WINDOW_SIZE)
                 self.checkpoint_log[gen].append(student_won)
@@ -2991,7 +3003,9 @@ class Quoridor:
                 self.save_meta()
 
                 manual_test = self._manual_promotion_test_requested
-                if manual_test or self._all_training_gates_met():
+                if self.rematch_teacher_gen is None and (
+                    manual_test or self._all_training_gates_met()
+                ):
                     self._manual_promotion_test_requested = False
                     if manual_test:
                         print(
