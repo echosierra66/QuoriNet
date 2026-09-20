@@ -91,12 +91,17 @@ def make_state_batch(state_tensors, device, name="states"):
     """Create one contiguous float32 [B, 8, 9, 9] batch on model device."""
     if not state_tensors:
         raise ValueError(f"{name} cannot be empty")
-    checked = [
-        validate_state_tensor(tensor, f"{name}[{index}]")
-        for index, tensor in enumerate(state_tensors)
-    ]
-    batch = torch.stack(checked, dim=0).to(device=device, dtype=torch.float32)
-    expected = (len(checked), *STATE_SHAPE)
+    for index, tensor in enumerate(state_tensors):
+        if (not isinstance(tensor, torch.Tensor)
+                or tuple(tensor.shape) != STATE_SHAPE
+                or tensor.dtype != torch.float32):
+            validate_state_tensor(tensor, f"{name}[{index}]")
+    batch = torch.stack(state_tensors, dim=0).to(device=device, dtype=torch.float32)
+    if not torch.isfinite(batch).all().item():
+        # Keep precise failure messages without launching a check per state.
+        for index, tensor in enumerate(state_tensors):
+            validate_state_tensor(tensor, f"{name}[{index}]")
+    expected = (len(state_tensors), *STATE_SHAPE)
     if tuple(batch.shape) != expected:
         raise RuntimeError(f"{name} batch must have shape {expected}, got {tuple(batch.shape)}")
     return batch.contiguous()
@@ -264,22 +269,45 @@ def get_adjacent_global(state, c, r):
     if c < 8 and (c, r) not in state['walls_v'] and (c, r - 1) not in state['walls_v']: moves.append((c + 1, r))
     return moves
 
+_OPEN_BOARD_ADJACENCY = tuple(
+    tuple(
+        nr * BOARD_SIZE + nc
+        for nc, nr in ((c, r - 1), (c, r + 1), (c - 1, r), (c + 1, r))
+        if 0 <= nc < BOARD_SIZE and 0 <= nr < BOARD_SIZE
+    )
+    for r in range(BOARD_SIZE) for c in range(BOARD_SIZE)
+)
+
+
+@lru_cache(maxsize=4096)
+def _wall_adjacency(walls_h, walls_v):
+    """Share integer-square connectivity between both goal-distance fields."""
+    adjacent = [list(neighbors) for neighbors in _OPEN_BOARD_ADJACENCY]
+    for walls, offset, span in ((walls_h, BOARD_SIZE, 1), (walls_v, 1, BOARD_SIZE)):
+        for c, r in walls:
+            start = r * BOARD_SIZE + c
+            for square in (start, start + span):
+                other = square + offset
+                if other in adjacent[square]:
+                    adjacent[square].remove(other)
+                    adjacent[other].remove(square)
+    return tuple(tuple(neighbors) for neighbors in adjacent)
+
+
 @lru_cache(maxsize=8192)
 def _goal_distances(walls_h, walls_v, target_row):
     """One reverse BFS supplies every square's distance for a wall layout."""
-    state = {'walls_h': frozenset(walls_h), 'walls_v': frozenset(walls_v)}
+    adjacent = _wall_adjacency(walls_h, walls_v)
     distances = [999] * (BOARD_SIZE * BOARD_SIZE)
-    queue = deque((c, target_row) for c in range(BOARD_SIZE))
-    for c in range(BOARD_SIZE):
-        distances[target_row * BOARD_SIZE + c] = 0
-    while queue:
-        pos = queue.popleft()
-        dist = distances[pos[1] * BOARD_SIZE + pos[0]]
-        for nxt in get_adjacent_global(state, *pos):
-            index = nxt[1] * BOARD_SIZE + nxt[0]
-            if distances[index] == 999:
-                distances[index] = dist + 1
-                queue.append(nxt)
+    queue = list(range(target_row * BOARD_SIZE, (target_row + 1) * BOARD_SIZE))
+    for square in queue:
+        distances[square] = 0
+    for square in queue:
+        next_distance = distances[square] + 1
+        for neighbor in adjacent[square]:
+            if distances[neighbor] == 999:
+                distances[neighbor] = next_distance
+                queue.append(neighbor)
     return tuple(distances)
 
 
@@ -334,6 +362,52 @@ def encode_relative_8ch_path_v1(state, active_pid):
 
 def encode_state(state, active_pid):
     return encode_relative_8ch_path_v1(state, active_pid)
+
+
+def encode_model_state_batch(model, states, active_pids):
+    """Build the current encoder's sparse planes and constants in one batch."""
+    if not states or len(states) != len(active_pids):
+        raise ValueError("model states and active players must have matching nonempty lengths")
+    if (
+        (getattr(model, 'encode_game_state', None)
+         and not getattr(model, '_uses_current_encoder', False))
+        or tuple(getattr(model, 'input_shape', STATE_SHAPE)) != STATE_SHAPE
+    ):
+        return make_model_state_batch(model, [
+            encode_state_for_model(model, state, pid)
+            for state, pid in zip(states, active_pids)
+        ], name="bot evaluation states")
+
+    sample_ids, channels, rows, columns, constants = [], [], [], [], []
+    for index, (state, pid) in enumerate(zip(states, active_pids)):
+        if pid not in (1, 2):
+            raise ValueError(f"active_pid must be 1 or 2, got {pid}")
+        opponent = 3 - pid
+        for channel, pos in enumerate((state[f'p{pid}_pos'], state[f'p{opponent}_pos'])):
+            c, r = pos
+            sample_ids.append(index)
+            channels.append(channel)
+            rows.append(8 - r if pid == 2 else r)
+            columns.append(8 - c if pid == 2 else c)
+        for channel, walls in ((2, state['walls_h']), (3, state['walls_v'])):
+            for c, r in walls:
+                sample_ids.append(index)
+                channels.append(channel)
+                rows.append(7 - r if pid == 2 else r)
+                columns.append(7 - c if pid == 2 else c)
+        constants.append([
+            state[f'p{pid}_walls'] / 10.0,
+            state[f'p{opponent}_walls'] / 10.0,
+            get_shortest_path_dist(state, pid) / 81.0,
+            get_shortest_path_dist(state, opponent) / 81.0,
+        ])
+    constant_batch = torch.tensor(constants, dtype=torch.float32).view(-1, 4, 1, 1)
+    if not torch.isfinite(constant_batch).all().item():
+        raise ValueError("encoded states contain NaN or infinite values")
+    batch = torch.zeros((len(states), *STATE_SHAPE), dtype=torch.float32)
+    batch[sample_ids, channels, rows, columns] = 1.0
+    batch[:, 4:] = constant_batch
+    return batch.to(device=model_device(model))
 
 
 def _state_dict_schema(state_dict):
@@ -468,6 +542,7 @@ class ArchivedValueNet(nn.Module):
         source = self.encoder_spec.get("implementation_source")
         if not source:
             raise ValueError("archived input encoder has no preserved implementation")
+        self._uses_current_encoder = source == _encoder_implementation_source()
         namespace = dict(globals())
         exec(source, namespace)
         self._archived_encoder = namespace["encode_relative_8ch_path_v1"]
@@ -628,72 +703,23 @@ class QuoridorBot:
         )
 
     def generate_actions(self, state, pid):
-        actions = []
         valid_moves = self.get_valid_moves(state, pid)
-        
-        def get_path_dist(m):
-            sim_state = state.copy()
-            if pid == 1: sim_state['p1_pos'] = m
-            else: sim_state['p2_pos'] = m
-            return get_shortest_path_dist(sim_state, pid)
-
-        valid_moves.sort(key=get_path_dist)
-        for move in valid_moves: actions.append(('move', move))
-            
+        distances = get_distance_field(state, pid)
+        valid_moves.sort(key=lambda move: distances[move[1] * BOARD_SIZE + move[0]])
+        actions = [('move', move) for move in valid_moves]
         walls_left = state['p1_walls'] if pid == 1 else state['p2_walls']
         if walls_left <= 0: return actions
 
-        opponent_id = self.get_opponent(pid)
-        opp_path = self.get_shortest_path(state, opponent_id)
-        my_path = self.get_shortest_path(state, pid)
-        if not opp_path or not my_path: return actions
-
-        base_my_dist, base_opp_dist = len(my_path) - 1, len(opp_path) - 1
-        candidate_walls = set()
-        
-        for p in (opp_path, my_path):
-            for i in range(len(p) - 1):
-                c1, r1 = p[i]
-                c2, r2 = p[i+1]
-                if c1 == c2: 
-                    r_min = min(r1, r2)
-                    candidate_walls.update([(c1, r_min, 'H'), (c1-1, r_min, 'H')])
-                else:
-                    c_min = min(c1, c2)
-                    candidate_walls.update([(c_min, r1, 'V'), (c_min, r1-1, 'V')])
-
-        for placed_walls in (state['walls_h'], state['walls_v']):
-            for c, r in placed_walls:
-                for dc in (-1, 0, 1):
-                    for dr in (-1, 0, 1):
-                        nc, nr = c + dc, r + dr
-                        if 0 <= nc <= 7 and 0 <= nr <= 7:
-                            candidate_walls.add((nc, nr, 'H'))
-                            candidate_walls.add((nc, nr, 'V'))
-                
-        scored_walls = []
-        for c, r, orient in sorted(candidate_walls):
-            if self.is_valid_wall(state, c, r, orient):
-                candidate = state.copy()
-                key = 'walls_h' if orient == 'H' else 'walls_v'
-                candidate[key] = state[key] | {(c, r)}
-                delay = (
-                    get_shortest_path_dist(candidate, opponent_id) - base_opp_dist
-                    - (get_shortest_path_dist(candidate, pid) - base_my_dist)
-                )
-                scored_walls.append((delay, ('wall', (c, r, orient))))
-
-        scored_walls.sort(key=lambda x: x[0], reverse=True)
-        quota = int(4 + (1.0 - self.heuristic_weight) * 20)
-        
-        for i, (delay, wall_action) in enumerate(scored_walls):
-            if i < quota:
-                if delay > 0 or random.random() > self.heuristic_weight:
-                    actions.append(wall_action)
-            else: break
+        # Every rules-legal wall reaches neural ranking, including walls that
+        # do not touch a current shortest path or immediately delay a pawn.
+        for c in range(8):
+            for r in range(8):
+                for orient in ('H', 'V'):
+                    if self.is_valid_wall(state, c, r, orient):
+                        actions.append(('wall', (c, r, orient)))
         return actions
 
-    def rank_and_prune(self, state, actions, pid, top_k=TOP_MOVE_POOL_SIZE):
+    def rank_and_prune(self, state, actions, pid, top_k=TOP_MOVE_POOL_SIZE, return_states=False):
         if not actions: return []
         actions_copy = list(actions)
         random.shuffle(actions_copy)
@@ -709,10 +735,12 @@ class QuoridorBot:
                 for move in self.get_valid_moves(candidate, opponent)
             ):
                 values[index] = -10000.0
-        scored_actions = list(zip(values, actions_copy))
+        scored_actions = list(zip(values, actions_copy, next_states))
 
         scored_actions.sort(key=lambda x: x[0], reverse=True)
-        return [act for _, act in scored_actions[:top_k]]
+        if return_states:
+            return [(act, candidate) for _, act, candidate in scored_actions[:top_k]]
+        return [act for _, act, _ in scored_actions[:top_k]]
 
     def _oscillation_penalty(self, state, pid):
         """Soft penalty for landing on a square this player occupied recently.
@@ -759,19 +787,17 @@ class QuoridorBot:
                 scores.append(10000.0 if eval_pid == winner else -10000.0)
                 continue
 
-            progress = (8 - state['p1_pos'][1]) - state['p2_pos'][1]
-            heuristic = (d2 - d1) * 25.0 + progress * 5.0
-            if eval_pid == 2:
-                heuristic = -heuristic
             penalty = self._oscillation_penalty(state, eval_pid)
-            if get_state_key(state) in state.get('history', set()):
+            state_key = get_state_key(state)
+            if state_key in state.get('history', set()):
                 penalty += 8000.0
 
-            if self.nn_model is None:
-                scores.append(heuristic - penalty)
-                continue
-            if not (state['p1_walls'] or state['p2_walls']):
-                scores.append(2.0 * heuristic - penalty)
+            if self.nn_model is None or not (state['p1_walls'] or state['p2_walls']):
+                progress = (8 - state['p1_pos'][1]) - state['p2_pos'][1]
+                heuristic = (d2 - d1) * 25.0 + progress * 5.0
+                if eval_pid == 2:
+                    heuristic = -heuristic
+                scores.append((2.0 if self.nn_model is not None else 1.0) * heuristic - penalty)
                 continue
 
             # Training encodes the active player. Convert that value back to
@@ -779,7 +805,7 @@ class QuoridorBot:
             scores.append(-penalty)
             active_pid = state['turn']
             key = (
-                get_state_key(state),
+                state_key,
                 state['p1_walls'],
                 state['p2_walls'],
                 active_pid
@@ -787,16 +813,11 @@ class QuoridorBot:
             sign = 1.0 if active_pid == eval_pid else -1.0
             neural_requests.append((index, key, sign))
             if key not in self._value_cache and key not in missing:
-                missing[key] = encode_state_for_model(
-                    self.nn_model, state, active_pid
-                )
+                missing[key] = state
 
         if missing:
-            batch = make_model_state_batch(
-                self.nn_model,
-                list(missing.values()),
-                name="bot evaluation states"
-            )
+            batch = encode_model_state_batch(self.nn_model, list(missing.values()),
+                                            [key[-1] for key in missing])
             with torch.inference_mode():
                 output = self.nn_model(batch)
             if tuple(output.shape) != (len(missing), 1):
@@ -877,14 +898,13 @@ class QuoridorBot:
             if random.random() < self.WIDE_MOVE_SAMPLE_CHANCE
             else self.TOP_MOVE_POOL_SIZE
         )
-        actions = self.rank_and_prune(state, raw_actions, pid, top_k=top_k)
-        if not actions: return None, self.evaluate(state, self.bot_id)
+        children = self.rank_and_prune(state, raw_actions, pid, top_k=top_k, return_states=True)
+        if not children: return None, self.evaluate(state, self.bot_id)
 
         if maximizing:
             max_eval = float('-inf')
             best_action = None
-            for action in actions:
-                new_state = self.apply_action(state, pid, action)
+            for action, new_state in children:
                 _, eval_score = self.minimax(new_state, depth - 1, alpha, beta, False)
                 if eval_score > max_eval:
                     max_eval = eval_score
@@ -895,8 +915,7 @@ class QuoridorBot:
         else:
             min_eval = float('inf')
             best_action = None
-            for action in actions:
-                new_state = self.apply_action(state, pid, action)
+            for action, new_state in children:
                 _, eval_score = self.minimax(new_state, depth - 1, alpha, beta, True)
                 if eval_score < min_eval:
                     min_eval = eval_score
@@ -980,8 +999,8 @@ class Quoridor:
         # Used only by the isolated one-game overfit diagnostic.
         self.OUTCOME_BACKFILL_DISCOUNT = 0.995
 
-        # Explicit LR bounds. Legacy policy constants are retained for the
-        # isolated diagnostic; production holds the loaded optimizer LR fixed.
+        # Explicit LR bounds. Legacy constants remain for the retired-policy
+        # diagnostic; production uses fresh, seat-balanced decline evidence.
         self.LR_MIN = 0.00001
         self.LR_MAX = 0.0008
         self.LR_TUNE_INTERVAL_LATEST_GAMES = 15
@@ -991,6 +1010,10 @@ class Quoridor:
         self.LR_UP_FACTOR = 1.25
         self.LR_DOWN_FACTOR = 0.80
         self.LR_CONVERGE_FACTOR = 0.85
+        self.LR_BLOCK_PER_SEAT = 16
+        self.LR_DECLINE_BLOCKS = 3
+        self.LR_COOLDOWN_BLOCKS = 3
+        self.LR_MIN_UPDATE_STEPS = 64
         self.GRAD_CLIP_NORM = 1.0
 
         # State vars
@@ -1052,6 +1075,8 @@ class Quoridor:
         self.lr_best_metric = -1.0
         self.lr_best_value = self.optimizer.param_groups[0]['lr']
         self.lr_search_direction = 0
+
+        self._reset_lr_inertia()
 
         self.is_evaluating = False
         self.eval_vs_gen = 0
@@ -1658,6 +1683,7 @@ class Quoridor:
         )
 
     def _refresh_opponent_weights(self):
+        """Prioritize lower win rates, independent of history length."""
         if not self.opponent_pool:
             self.opponent_weights = []
             return
@@ -1674,21 +1700,15 @@ class Quoridor:
             default=0.0,
         )
 
-        for (_, gen), win_rate in zip(self.opponent_pool, win_rates):
-            log = self.checkpoint_log.get(gen)
-            samples = len(log) if log else 0
-            sample_deficit = max(
-                0.0,
-                1.0 - (samples / self.GATE_MIN_GAMES)
-            )
-            if samples:
+        for win_rate in win_rates:
+            if win_rate is not None:
                 performance_deficit = max(
                     0.0,
                     (performance_target - win_rate) / max(performance_target, 1e-9)
                 )
             else:
                 performance_deficit = 1.0
-            deficit_scores.append(sample_deficit + performance_deficit)
+            deficit_scores.append(performance_deficit)
 
         total_deficit = sum(deficit_scores)
         if total_deficit <= 0.0:
@@ -1721,6 +1741,9 @@ class Quoridor:
 
         if latest_idx is None:
             return self.teacher_net, self.teacher_gen
+
+        if not self._passes_training_generation_gate(self.teacher_gen):
+            return self.opponent_pool[latest_idx]
 
         if not support_indices:
             self.curriculum_latest_credit = 0.0
@@ -1782,8 +1805,9 @@ class Quoridor:
             new = fresh[start:start + fresh_slots]
             same = random.sample(same_pool, min(fresh_slots - len(new), len(same_pool)))
             selected = {(sample['game_id'], sample['ply_index']) for sample in same}
-            available = [sample for sample in general_pool
-                         if (sample['game_id'], sample['ply_index']) not in selected]
+            available = ([sample for sample in general_pool
+                          if (sample['game_id'], sample['ply_index']) not in selected]
+                         if selected else general_pool)
             general = random.sample(available, min(self.GENERAL_REPLAY_SLOTS, len(available)))
             batch = new + same + general
             random.shuffle(batch)
@@ -1826,12 +1850,17 @@ class Quoridor:
                 self._last_tactical_loss_share = (
                     tactical_error / total_error if total_error else 0.0)
             loss.backward()
-            for name, parameter in self.student_net.named_parameters():
-                if parameter.grad is not None and not torch.isfinite(parameter.grad).all().item():
-                    raise FloatingPointError(f"non-finite gradient in {name}")
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.student_net.parameters(), self.GRAD_CLIP_NORM)
-            if not torch.isfinite(grad_norm).item():
+            try:
+                torch.nn.utils.clip_grad_norm_(
+                    self.student_net.parameters(), self.GRAD_CLIP_NORM,
+                    error_if_nonfinite=True)
+            except RuntimeError as error:
+                if "non-finite" not in str(error):
+                    raise
+                for name, parameter in self.student_net.named_parameters():
+                    if (parameter.grad is not None
+                            and not torch.isfinite(parameter.grad).all().item()):
+                        raise FloatingPointError(f"non-finite gradient in {name}")
                 raise FloatingPointError("student gradient norm is NaN or infinite")
             self.optimizer.step()
             self.optimizer_steps += 1
@@ -1867,15 +1896,111 @@ class Quoridor:
         self.lr_best_metric = -1.0
         self.lr_best_value = self.optimizer.param_groups[0]['lr']
         self.lr_search_direction = 0
+        self._reset_lr_inertia()
+
+    def _reset_lr_inertia(self):
+        self.lr_inertia = {
+            'version': 1, 'teacher_gen': self.teacher_gen,
+            'train_depth': self.train_depth, 'wall_policy': 'all_legal_v1',
+            'seats': [[], []], 'previous': None, 'slow': None,
+            'velocity': 0.0, 'declines': 0, 'cooldown': 0,
+            'last_step': self.optimizer_steps, 'observed_step': self.optimizer_steps,
+            'blocks': 0,
+            'status': 'warming up',
+        }
+
+    def _restore_lr_inertia(self, saved):
+        """Resume only evidence collected under this teacher/search policy."""
+        self._reset_lr_inertia()
+        if not isinstance(saved, dict) or any(
+            saved.get(key) != self.lr_inertia[key]
+            for key in ('version', 'teacher_gen', 'train_depth', 'wall_policy')
+        ):
+            return
+        seats = saved.get('seats')
+        valid = (isinstance(seats, list) and len(seats) == 2
+                 and all(isinstance(seat, list) and len(seat) <= self.LR_BLOCK_PER_SEAT
+                         and all(value in (0, 1) for value in seat) for seat in seats))
+        for key in ('previous', 'slow'):
+            values = saved.get(key)
+            valid = valid and (values is None or (
+                isinstance(values, list) and len(values) == 2
+                and all(isinstance(v, (int, float)) and math.isfinite(v)
+                        and 0 <= v <= 1 for v in values)))
+        valid = valid and ((saved.get('previous') is None) == (saved.get('slow') is None))
+        for key in ('declines', 'cooldown', 'last_step', 'observed_step', 'blocks'):
+            valid = valid and isinstance(saved.get(key), int) and saved[key] >= 0
+        velocity = saved.get('velocity')
+        valid = valid and isinstance(velocity, (int, float)) and math.isfinite(velocity)
+        if not valid or max(saved['last_step'], saved['observed_step']) > self.optimizer_steps:
+            return
+        self.lr_inertia.update(copy.deepcopy(saved))
+
+    def _record_lr_result(self, winner_id):
+        """Never mix seats, teachers, cutoffs, or frozen tests into LR evidence."""
+        if (self.mode != 'TRAIN' or self.is_evaluating or winner_id not in (1, 2)
+                or self.current_opponent_gen != self.teacher_gen):
+            return
+        if (self.lr_inertia['teacher_gen'] != self.teacher_gen
+                or self.lr_inertia['train_depth'] != self.train_depth):
+            self._reset_lr_inertia()
+        seat = self.lr_inertia['seats'][self.student_id - 1]
+        seat.append(int(winner_id == self.student_id))
+        # Bound a seat that is overrepresented by adaptive teacher scheduling.
+        del seat[:-self.LR_BLOCK_PER_SEAT]
 
     def _tune_learning_rate_from_pool(self, force=False):
-        """Compatibility hook: training results no longer change optimizer LR.
+        """Patient live backoff, not a claim of frozen evaluation improvement.
 
-        The former policy used noisy, changing training matchups as experiments.
-        Keep the loaded optimizer LR until a controlled evaluation supports an
-        explicit change. Adam's moment adaptation remains active.
+        Flat or rebounding performance keeps its LR. Only repeated declines
+        on both seats can lower it; force never bypasses evidence or cooldown.
         """
-        return
+        state = self.lr_inertia
+        if any(len(seat) < self.LR_BLOCK_PER_SEAT for seat in state['seats']):
+            return
+        if self.optimizer_steps <= state['observed_step']:
+            return
+        state['observed_step'] = self.optimizer_steps
+        seats = state['seats']
+        state['seats'] = [[], []]  # Each result votes in exactly one block.
+        rates = [sum(seat) / len(seat) for seat in seats]
+        state['blocks'] += 1
+        previous, slow = state['previous'], state['slow']
+        state['previous'] = rates
+        if previous is None:
+            state['slow'] = rates
+            state['status'] = 'baseline collected'
+            return
+        delta = sum(r - p for r, p in zip(rates, previous)) / 2
+        state['velocity'] = 0.7 * state['velocity'] + 0.3 * delta
+        # The slow reference supplies inertia; it does not justify a cut once
+        # performance has flattened or begun recovering from a trough.
+        state['slow'] = [0.8 * old + 0.2 * new for old, new in zip(slow, rates)]
+        half = self.LR_BLOCK_PER_SEAT // 2
+        rebound = (delta > 0 or any(r > p + 0.05 for r, p in zip(rates, previous))
+                   or any((sum(seat[half:]) - sum(seat[:half])) / half >= 0.25
+                          for seat in seats))
+        if state['cooldown']:
+            state['cooldown'] -= 1
+            state['declines'] = 0
+            state['status'] = 'cooldown'
+            return
+        declining = (not rebound and delta < -self.LR_REGRESSION_EPS
+                     and state['velocity'] < -self.LR_PLATEAU_EPS
+                     and all(rate < reference - 0.10 for rate, reference in zip(rates, slow)))
+        state['declines'] = state['declines'] + 1 if declining else 0
+        state['status'] = ('recovery protected' if rebound else
+                           f"decline {state['declines']}/{self.LR_DECLINE_BLOCKS}" if declining
+                           else 'holding')
+        if (state['declines'] < self.LR_DECLINE_BLOCKS
+                or self.optimizer_steps - state['last_step'] < self.LR_MIN_UPDATE_STEPS):
+            return
+        changed = self._set_learning_rate(
+            self.optimizer.param_groups[0]['lr'] * self.LR_DOWN_FACTOR,
+            f"{self.LR_DECLINE_BLOCKS} fresh balanced declines; inertia={state['velocity']:+.3f}")
+        state.update(declines=0, cooldown=self.LR_COOLDOWN_BLOCKS,
+                     last_step=self.optimizer_steps, slow=rates, velocity=0.0,
+                     status='reduced; cooldown' if changed else 'at LR floor')
 
     def _load_net_for_gen(self, gen):
         if gen == self.teacher_gen: return self.teacher_net
@@ -1951,7 +2076,7 @@ class Quoridor:
         print(f"Red Player (P1):  {self.p1_gen_str}")
         print(f"Blue Player (P2): {self.p2_gen_str}")
         print(f"Latest Teacher:   Gen #{self.teacher_gen}")
-        print(f"Wall filter:    {self.heuristic_weight:.3f} | LR policy: fixed")
+        print(f"Walls: all legal | LR: inertia ({self.lr_inertia['status']})")
         print(f"Optimizer steps: {self.optimizer_steps}")
         print(f"Studt Win Rate:  {self.student_win_rate_str}")
         print(f"Training WRs:    {self._format_training_win_rates()}")
@@ -2319,6 +2444,12 @@ class Quoridor:
             except Exception as e:
                 raise RuntimeError(f"Metadata checkpoint rejected: {e}") from e
 
+        # Per-game JSON can be newer than the saved weights. Resume controller
+        # evidence only with the matching atomic model/Adam snapshot.
+        self._restore_lr_inertia(
+            bundle['meta'].get('lr_inertia')
+            if bundle is not None and student_matches_current else None)
+
         if bundle is not None and bundle.get('replay_format_version') is None:
             # Persist the migration immediately, without reserializing live
             # metadata/RNG or rewriting weights/Adam sidecars. All other bundle
@@ -2359,6 +2490,7 @@ class Quoridor:
                 'lr_best_metric': self.lr_best_metric,
                 'lr_best_value': self.lr_best_value,
                 'lr_search_direction': self.lr_search_direction,
+                'lr_inertia': copy.deepcopy(self.lr_inertia),
                 'curriculum_latest_credit': self.curriculum_latest_credit,
                 'heuristic_lr_floor': self.heuristic_lr_floor,
                 'optimizer_steps': self.optimizer_steps,
@@ -2766,11 +2898,11 @@ class Quoridor:
             ("Blue Player (P2)", self.p2_gen_str),
             ("Latest Teacher Gen", f"Gen #{self.teacher_gen}"),
             ("Candidate Student Gen", f"Gen #{self.teacher_gen + 1}"),
-            ("Wall filter", f"{self.heuristic_weight:.3f}"),
+            ("Wall candidates", "All legal"),
             ("Student Win Rate", self.student_win_rate_str),
             ("Final Test", final_test),
             ("AI Board Evaluation", f"{eval_score}"),
-            ("Learning Rate", f"{current_lr:.6f}"),
+            ("Learning Rate (inertia)", f"{current_lr:.8f}"),
             ("Student Training Loss", f"{self.last_loss:.5f}"),
         ]
         y = 46
@@ -2992,11 +3124,12 @@ class Quoridor:
                         f"({latest_wins}/{latest_games})"
                     )
 
+                self._record_lr_result(winner_id)
                 self._tune_learning_rate_from_pool(force=False)
                 print(f"Learning: {self.optimizer_steps - self._game_start_optimizer_steps} "
                       f"steps this game / {self.optimizer_steps} total | "
-                      f"fixed LR={self.optimizer.param_groups[0]['lr']:.8f} | "
-                      f"wall filter={self.heuristic_weight:.3f} | "
+                      f"LR={self.optimizer.param_groups[0]['lr']:.8f} "
+                      f"({self.lr_inertia['status']}) | walls=all legal | "
                       f"replay samples latest/historic="
                       f"{self.replay_samples_latest}/{self.replay_samples_historic}")
                 print(f"Current training WRs: {self._format_training_win_rates()}")
