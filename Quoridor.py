@@ -27,6 +27,7 @@ BOARD_SIZE = 9
 STATE_CHANNELS = 8
 STATE_SHAPE = (STATE_CHANNELS, BOARD_SIZE, BOARD_SIZE)
 VALUE_WIDTH = 1
+POLICY_SIZE = 81 + 64 + 64
 MANUAL_WEIGHTS_PATTERN = re.compile(
     r"^quorinet_gen_(\d+)_manual_(\d+)\.pth$"
 )
@@ -44,6 +45,18 @@ ARCHITECTURE_SOURCE = "NN architecture.py"
 ARCHITECTURE_EXECUTABLE = "NN architecture.pt"
 MODEL_ARCHIVE_FORMAT = "quorinet_architecture_archive"
 MODEL_ARCHIVE_VERSION = 1
+TRAINING_STATE_FILE = "quorinet_training_state.pth"
+STUDENT_WEIGHTS_FILE = "quorinet_student_weights.pth"
+TEACHER_WEIGHTS_FILE = "quorinet_teacher_weights.pth"
+OPTIMIZER_FILE = "quorinet_optimizer.pth"
+META_FILE = "quorinet_meta.json"
+ACTIVE_CHECKPOINT_FILES = (
+    TRAINING_STATE_FILE,
+    STUDENT_WEIGHTS_FILE,
+    TEACHER_WEIGHTS_FILE,
+    OPTIMIZER_FILE,
+    META_FILE,
+)
 REPLAY_FORMAT_VERSION = 1  # Whole accepted games, partitioned by teacher.
 CURRENT_ENCODER_SPEC = {
     "id": "relative_8ch_path_v1",
@@ -61,7 +74,6 @@ CURRENT_ENCODER_SPEC = {
         "opponent_shortest_path_div_81",
     ],
 }
-_ARCHITECTURE_CACHE = {}
 
 
 def mirror_state_batch(states):
@@ -161,6 +173,13 @@ def validate_model_contract(model, name="value model"):
             )
         if not torch.isfinite(output).all().item():
             raise FloatingPointError(f"{name} smoke output contains NaN or infinity")
+        if getattr(model, 'supports_policy', False):
+            with torch.no_grad():
+                logits, value = model.policy_value(batch)
+            if tuple(logits.shape) != (3, POLICY_SIZE) or not torch.isfinite(logits).all():
+                raise ValueError(f'{name} invalid policy output')
+            if not torch.equal(value, output):
+                raise ValueError(f'{name} two-head and scalar value paths differ')
     finally:
         model.train(was_training)
 
@@ -259,6 +278,64 @@ class SpatialQuoriNetV2(nn.Module):
                 f"network output must have shape {expected_output}, got {tuple(value.shape)}"
             )
         return value
+
+class PolicyValueQuoriNet(SpatialQuoriNetV2):
+    """Keep the complete V2 value path; learn spatial action priors beside it.
+
+    forward remains scalar for existing UI, diagnostics, and value opponents.
+    policy_value is the shared-trunk, two-head training/search interface.
+    """
+    supports_policy = True
+
+    def __init__(self, in_channels=STATE_CHANNELS):
+        super().__init__(in_channels)
+        self.policy_head = nn.Conv2d(64, 3, 1)
+        nn.init.zeros_(self.policy_head.weight)
+        nn.init.zeros_(self.policy_head.bias)
+
+    def policy_value(self, states):
+        features = self.conv(states)
+        spatial = self.policy_head(features)
+        logits = torch.cat((spatial[:, 0].flatten(1),
+                            spatial[:, 1, :8, :8].flatten(1),
+                            spatial[:, 2, :8, :8].flatten(1)), dim=1)
+        return logits, self.value_head(self.pool(features).flatten(1))
+
+
+def policy_action_index(action, pid):
+    """209 actions in the same active-player coordinates as the encoder."""
+    if action[0] == 'move':
+        c, r = action[1]
+        if pid == 2:
+            c, r = 8 - c, 8 - r
+        return r * 9 + c
+    c, r, orient = action[1]
+    if pid == 2:
+        c, r = 7 - c, 7 - r
+    return 81 + (64 if orient == 'V' else 0) + r * 8 + c
+
+
+def mirror_policy_batch(policy):
+    return torch.cat((policy[:, :81].reshape(-1, 9, 9).flip(-1).flatten(1),
+                      policy[:, 81:145].reshape(-1, 8, 8).flip(-1).flatten(1),
+                      policy[:, 145:].reshape(-1, 8, 8).flip(-1).flatten(1)), dim=1)
+
+
+def restore_student_optimizer(optimizer, saved):
+    """Append uninitialized policy slots while retaining every old Adam slot."""
+    saved = copy.deepcopy(saved)
+    current = optimizer.state_dict()
+    if len(saved['param_groups']) != len(current['param_groups']):
+        raise ValueError('optimizer parameter groups changed')
+    for old, new in zip(saved['param_groups'], current['param_groups']):
+        if len(old['params']) > len(new['params']):
+            raise ValueError('optimizer has more parameters than the student')
+        if old['params'] != new['params'][:len(old['params'])]:
+            raise ValueError('optimizer parameter ordering changed')
+        old['params'] = new['params']
+    optimizer.load_state_dict(saved)
+    validate_optimizer_state_shapes(optimizer)
+
 
 # Global Helper for encode_state distance calcs
 def get_adjacent_global(state, c, r):
@@ -439,12 +516,21 @@ def _current_encoder_spec():
 
 
 def _architecture_descriptor(architecture):
-    return {
+    descriptor = {
         "torchscript_code": architecture["torchscript_code"],
         "state_schema": architecture["state_schema"],
         "input_encoder": architecture["input_encoder"],
         "value_output": architecture["value_output"],
     }
+    if "torchscript_modules" in architecture:
+        descriptor["torchscript_modules"] = architecture["torchscript_modules"]
+    if "policy_value_code" in architecture:
+        descriptor["policy_value_code"] = architecture["policy_value_code"]
+    return descriptor
+
+
+def _scripted_module_codes(scripted):
+    return {name: module.code for name, module in scripted.named_modules()}
 
 
 def _architecture_id(descriptor):
@@ -467,14 +553,6 @@ def capture_model_architecture(model):
     """Return a weight-independent, self-contained inference definition."""
     state_schema = _state_dict_schema(model.state_dict())
     encoder_spec = _current_encoder_spec()
-    cache_key = (
-        model.__class__.__module__, model.__class__.__qualname__,
-        json.dumps(state_schema, sort_keys=True),
-        json.dumps(encoder_spec, sort_keys=True),
-    )
-    if cache_key in _ARCHITECTURE_CACHE:
-        return copy.deepcopy(_ARCHITECTURE_CACHE[cache_key])
-
     template = copy.deepcopy(model).cpu().eval()
     sample = torch.zeros(
         (1, *encoder_spec["shape"]), dtype=torch.float32
@@ -496,7 +574,11 @@ def capture_model_architecture(model):
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        scripted = torch.jit.trace(template, sample, check_trace=False)
+        if getattr(model, 'supports_policy', False):
+            scripted = torch.jit.trace_module(
+                template, {'forward': sample, 'policy_value': sample}, check_trace=False)
+        else:
+            scripted = torch.jit.trace(template, sample, check_trace=False)
     script_buffer = io.BytesIO()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -504,20 +586,24 @@ def capture_model_architecture(model):
     script_code = scripted.code
     descriptor = {
         "torchscript_code": script_code,
+        "torchscript_modules": _scripted_module_codes(scripted),
         "state_schema": state_schema,
         "input_encoder": encoder_spec,
         "value_output": value_output,
     }
+    if getattr(model, 'supports_policy', False):
+        descriptor['policy_value_code'] = scripted.policy_value.code
     architecture_id = _architecture_id(descriptor)
     architecture = {
         "id": architecture_id,
         "class_name": f"{model.__class__.__module__}.{model.__class__.__qualname__}",
-        "class_source": inspect.getsource(model.__class__),
+        "class_source": (inspect.getsource(SpatialQuoriNetV2) + '\n'
+                         if isinstance(model, PolicyValueQuoriNet) else '')
+                        + inspect.getsource(model.__class__),
         "torchscript": script_buffer.getvalue(),
         **descriptor,
     }
-    _ARCHITECTURE_CACHE[cache_key] = architecture
-    return copy.deepcopy(architecture)
+    return architecture
 
 
 class ArchivedValueNet(nn.Module):
@@ -531,6 +617,7 @@ class ArchivedValueNet(nn.Module):
         self.encoder_spec = architecture["input_encoder"]
         self.input_shape = tuple(self.encoder_spec["shape"])
         self.value_output = architecture["value_output"]
+        self.supports_policy = 'policy_value_code' in architecture
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             self.module = torch.jit.load(
@@ -561,6 +648,9 @@ class ArchivedValueNet(nn.Module):
         if self.value_output["kind"] == "sequence":
             output = output[self.value_output["index"]]
         return output
+
+    def policy_value(self, states):
+        return self.module.policy_value(states)
 
 
 def encode_state_for_model(model, state, active_pid):
@@ -607,8 +697,19 @@ class QuoridorBot:
         self.heuristic_weight = heuristic_weight
         self.was_last_random = False
         self._value_cache = {}
+        self.last_policy = None
+        # Preserve depth controls: each level buys 64 leaf evaluations.
+        self.mcts_simulations = max(1, max_depth) * 64
 
     def get_move_and_eval(self, state, epsilon=0.0):
+        self.last_policy = None
+        if getattr(self.nn_model, 'supports_policy', False):
+            was_training = self.nn_model.training
+            try:
+                self.nn_model.eval()
+                return self.mcts_move(state, epsilon)
+            finally:
+                self.nn_model.train(was_training)
         # Parameters can change between moves, but not during one search.
         self._value_cache.clear()
         for move in self.get_valid_moves(state, self.bot_id):
@@ -637,6 +738,95 @@ class QuoridorBot:
     def get_move(self, state):
         action, _ = self.get_move_and_eval(state, epsilon=0.0)
         return action
+
+    def mcts_move(self, state, epsilon=0.0):
+        """Rollout-free PUCT; each node stores value for its side to move."""
+        def node(position, prior=1.0):
+            return {'state': position, 'prior': prior, 'n': 0, 'w': 0.0,
+                    'children': None}
+
+        def expand(current):
+            position = current['state']
+            pid = position['turn']
+            for winner, row in ((1, 0), (2, 8)):
+                if position[f'p{winner}_pos'][1] == row:
+                    return 1.0 if winner == pid else -1.0
+            if position.get('turns_played', 0) >= 200:
+                return 0.0
+            actions = self.generate_actions(position, pid)
+            winning = [a for a in actions if a[0] == 'move'
+                       and a[1][1] == self.get_target_row(pid)]
+            if winning:
+                actions = winning
+            elif any(m[1] == self.get_target_row(3 - pid)
+                     for m in self.get_valid_moves(position, 3 - pid)):
+                # Retain the existing immediate forced-defense safeguard.
+                safe = [a for a in actions if not any(
+                    m[1] == self.get_target_row(3 - pid)
+                    for m in self.get_valid_moves(self.apply_action(position, pid, a), 3 - pid))]
+                if safe:
+                    actions = safe
+            batch = make_model_state_batch(self.nn_model, [
+                encode_state_for_model(self.nn_model, position, pid)])
+            with torch.inference_mode():
+                logits, value = self.nn_model.policy_value(batch)
+            if (tuple(logits.shape) != (1, POLICY_SIZE)
+                    or tuple(value.shape) != (1, 1)
+                    or not torch.isfinite(logits).all()
+                    or not torch.isfinite(value).all()):
+                raise FloatingPointError('invalid MCTS policy/value output')
+            indices = [policy_action_index(a, pid) for a in actions]
+            priors = torch.softmax(logits[0, indices], dim=0).cpu().tolist()
+            current['children'] = {
+                action: node(self.apply_action(position, pid, action), prior)
+                for action, prior in zip(actions, priors)}
+            return float(value[0, 0])
+
+        if state['turn'] != self.bot_id:
+            raise ValueError('MCTS bot must be the side to move')
+        root = node(state)
+        root_value = expand(root)
+        if not root['children']:
+            self.was_last_random = False
+            return None, root_value * 10000.0
+        explore = epsilon > 0 and not any(
+            child['state'][f'p{self.bot_id}_pos'][1] == self.get_target_row(self.bot_id)
+            for child in root['children'].values())
+        if explore:
+            noise = torch.distributions.Dirichlet(
+                torch.full((len(root['children']),), 0.3)).sample().tolist()
+            for child, sample in zip(root['children'].values(), noise):
+                child['prior'] = 0.75 * child['prior'] + 0.25 * sample
+        for _ in range(self.mcts_simulations):
+            current, path = root, [root]
+            while current['children']:
+                scale = math.sqrt(max(1, current['n']))
+                current = max(current['children'].values(), key=lambda child:
+                    (-child['w'] / child['n'] if child['n'] else 0.0)
+                    + 1.5 * child['prior'] * scale / (1 + child['n']))
+                path.append(current)
+            value = expand(current)
+            for visited in reversed(path):
+                visited['n'] += 1
+                visited['w'] += value
+                value = -value
+        children = root['children']
+        self.last_policy = torch.zeros(POLICY_SIZE, dtype=torch.float32)
+        for action, child in children.items():
+            self.last_policy[policy_action_index(action, self.bot_id)] = child['n']
+        self.last_policy /= self.last_policy.sum()
+        # Keep epsilon exploration and the UI marker; targets remain visits.
+        self.was_last_random = explore and random.random() < epsilon
+        if self.was_last_random:
+            chosen = random.choice(list(children))
+        else:
+            most_visits = max(child['n'] for child in children.values())
+            choices = [a for a, child in children.items() if child['n'] == most_visits]
+            chosen = min(choices, key=lambda a:
+                         self._oscillation_penalty(children[a]['state'], self.bot_id))
+        child = children[chosen]
+        score = -child['w'] / child['n'] if child['n'] else root_value
+        return chosen, score * 10000.0
 
     def get_opponent(self, pid):
         return 1 if pid == 2 else 2
@@ -1017,8 +1207,8 @@ class Quoridor:
         self.GRAD_CLIP_NORM = 1.0
 
         # State vars
-        self.student_net = SpatialQuoriNetV2(in_channels=STATE_CHANNELS)
-        self.teacher_net = SpatialQuoriNetV2(in_channels=STATE_CHANNELS)
+        self.student_net = PolicyValueQuoriNet(in_channels=STATE_CHANNELS)
+        self.teacher_net = PolicyValueQuoriNet(in_channels=STATE_CHANNELS)
         self.teacher_net.load_state_dict(self.student_net.state_dict())
         self.student_net.eval()
         self.teacher_net.eval()
@@ -1087,6 +1277,11 @@ class Quoridor:
         self._archive_groups = {}
         self._archived_official = {}
         self._archived_manual = {}
+        self._checkpoint_dir = "."
+        self._checkpoint_source_dir = None
+        self._loaded_student_architecture = None
+        self._loaded_student_architecture_id = None
+        self._checkpoint_needs_initial_save = False
         self.architecture_transition_status = "same_architecture"
         self._discover_model_archives()
         self.load_checkpoint_if_exists()
@@ -1113,6 +1308,8 @@ class Quoridor:
             if torch.cuda.is_available() and cuda_rng:
                 torch.cuda.set_rng_state_all(cuda_rng)
             del self._restored_rng
+        if self._checkpoint_needs_initial_save:
+            self.save_checkpoint(manual=True)
 
 
     # ==========================================
@@ -1124,7 +1321,8 @@ class Quoridor:
             or payload.get("format_version") != MODEL_ARCHIVE_VERSION
         ):
             raise ValueError("unsupported model archive format")
-        architecture = payload.get("architecture", {})
+        architecture = copy.deepcopy(payload.get("architecture", {}))
+        payload = dict(payload, architecture=architecture)
         required = {
             "id", "class_name", "class_source", "torchscript",
             "torchscript_code", "state_schema", "input_encoder",
@@ -1135,6 +1333,20 @@ class Quoridor:
         descriptor = _architecture_descriptor(architecture)
         if architecture["id"] != _architecture_id(descriptor):
             raise ValueError("model archive architecture fingerprint changed")
+        # Older fingerprints omitted child modules. Recover their exact code
+        # from the saved executable, never from the current network class.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            scripted = torch.jit.load(
+                io.BytesIO(architecture["torchscript"]), map_location="cpu"
+            )
+        module_codes = _scripted_module_codes(scripted)
+        if ('policy_value_code' in architecture
+                and architecture['policy_value_code'] != scripted.policy_value.code):
+            raise ValueError('model archive policy executable differs from its architecture')
+        if architecture.get("torchscript_modules", module_codes) != module_codes:
+            raise ValueError("model archive executable differs from its architecture")
+        architecture["torchscript_modules"] = module_codes
         encoder = architecture["input_encoder"]
         if "implementation_source" not in encoder:
             # Upgrade the immediately preceding archive format while its exact
@@ -1146,9 +1358,9 @@ class Quoridor:
                 source.encode("utf-8")
             ).hexdigest()
             architecture["input_encoder"] = encoder
-            architecture["id"] = _architecture_id(
-                _architecture_descriptor(architecture)
-            )
+        architecture["id"] = _architecture_id(
+            _architecture_descriptor(architecture)
+        )
         source = encoder["implementation_source"]
         if encoder.get("implementation_sha256") != hashlib.sha256(
             source.encode("utf-8")
@@ -1180,6 +1392,16 @@ class Quoridor:
             group["official"].update(payload.get("official", {}))
             group["manual"].update(payload.get("manual", {}))
             group["paths"].add(filename)
+            if not group["official"] and not group["manual"]:
+                generation_range = payload.get("generation_range") or []
+                if generation_range:
+                    group["checkpoint_generation"] = int(generation_range[-1])
+            group["active_checkpoint"] = (
+                group.get("active_checkpoint", False)
+                or payload.get("active_checkpoint", False)
+            )
+            if payload.get("active_checkpoint", False):
+                group["active_path"] = filename
         self._archive_groups = groups
         self._rebuild_archive_indexes()
 
@@ -1226,6 +1448,7 @@ class Quoridor:
             "format_version": manifest.get("format_version"),
             "title": manifest.get("title"),
             "generation_range": manifest.get("generation_range"),
+            "active_checkpoint": bool(manifest.get("active_checkpoint", False)),
             "architecture": architecture,
             "official": official,
             "manual": manual,
@@ -1239,6 +1462,8 @@ class Quoridor:
             generations.extend(
                 entry["generation"] for entry in group["manual"].values()
             )
+            if group.get("checkpoint_generation") is not None:
+                generations.append(group["checkpoint_generation"])
             if not generations:
                 continue
             ranges[architecture_id] = (min(generations), max(generations))
@@ -1282,6 +1507,9 @@ class Quoridor:
                 "format_version": MODEL_ARCHIVE_VERSION,
                 "title": f"gen {first_gen}-{last_gen}",
                 "generation_range": [first_gen, last_gen],
+                "active_checkpoint": (
+                    architecture_id == getattr(self, "_active_architecture_id", None)
+                ),
                 "architecture": manifest_architecture,
                 "official_generations": sorted(group["official"]),
                 "manual_snapshots": sorted(group["manual"]),
@@ -1388,6 +1616,14 @@ class Quoridor:
             })
             group["manual"].update(payload.get("manual", {}))
             group["paths"].add(filename)
+            if not group["official"] and not group["manual"]:
+                generation_range = payload.get("generation_range") or []
+                if generation_range:
+                    group["checkpoint_generation"] = int(generation_range[-1])
+            group["active_checkpoint"] = (
+                group.get("active_checkpoint", False)
+                or payload.get("active_checkpoint", False)
+            )
 
         # Migrate the earlier packed archive format into the browsable folders.
         for filename in os.listdir('.'):
@@ -1482,9 +1718,31 @@ class Quoridor:
         current_group["official"][self.teacher_gen] = _cpu_state_dict(
             _model_state_dict(self.teacher_net)
         )
+        if self._loaded_student_architecture is not None:
+            loaded_group = groups.setdefault(
+                self._loaded_student_architecture_id,
+                {
+                    "architecture": self._loaded_student_architecture,
+                    "official": {}, "manual": {}, "paths": set(),
+                },
+            )
+            if not loaded_group["official"] and not loaded_group["manual"]:
+                loaded_group["checkpoint_generation"] = self.teacher_gen + 1
+        active_architecture = capture_model_architecture(self.student_net)
+        active_group = groups.setdefault(active_architecture["id"], {
+            "architecture": active_architecture,
+            "official": {}, "manual": {}, "paths": set(),
+        })
+        self._active_architecture_id = active_architecture["id"]
+        if not active_group["official"] and not active_group["manual"]:
+            active_group["checkpoint_generation"] = self.teacher_gen + 1
         self._archive_groups = groups
         self._write_model_archives()
         self._rebuild_archive_indexes()
+        self._checkpoint_dir = self._archive_groups[
+            self._active_architecture_id
+        ]["path"]
+        self._migrate_loaded_checkpoint()
         for filename in cleanup_files:
             if (
                 os.path.isfile(filename)
@@ -1606,8 +1864,14 @@ class Quoridor:
         generations = self._training_generations()
         if not generations:
             return False
+        # Keep the latest-teacher-only opener's normal qualification window.
+        if not self._passes_training_generation_gate(self.teacher_gen):
+            return False
         for gen in generations:
-            if not self._passes_training_generation_gate(gen):
+            log = self.checkpoint_log.get(gen)
+            if not log or not self._passes_generation_gate(
+                gen, sum(log) / len(log)
+            ):
                 return False
         return True
 
@@ -1840,9 +2104,27 @@ class Quoridor:
             reflect = torch.rand(states.shape[0], device=device) < 0.5
             states[reflect] = mirror_state_batch(states[reflect])
             self.optimizer.zero_grad(set_to_none=True)
-            predictions = self.student_net(states)
+            has_policy = getattr(self.student_net, 'supports_policy', False)
+            if has_policy:
+                logits, predictions = self.student_net.policy_value(states)
+            else:
+                predictions = self.student_net(states)
             loss = checked_value_loss(self.loss_fn, predictions, targets,
                                       name="student weighted MSE", sample_weights=weights)
+            policy_rows = [i for i, sample in enumerate(batch)
+                           if sample.get('policy') is not None]
+            if has_policy and policy_rows:
+                policy = torch.stack([batch[i]['policy'] for i in policy_rows]).to(device)
+                if (tuple(policy.shape) != (len(policy_rows), POLICY_SIZE)
+                        or not torch.isfinite(policy).all() or (policy < 0).any()
+                        or not torch.allclose(policy.sum(1), torch.ones(len(policy_rows), device=device))):
+                    raise ValueError('invalid search visit targets')
+                policy[reflect[policy_rows]] = mirror_policy_batch(policy[reflect[policy_rows]])
+                policy_loss = -(policy * torch.log_softmax(logits[policy_rows], dim=1)).sum(1)
+                policy_weights = weights[policy_rows, 0]
+                loss = loss + (policy_loss * policy_weights).sum() / policy_weights.sum()
+                if not torch.isfinite(loss):
+                    raise FloatingPointError('non-finite joint policy/value loss')
             with torch.no_grad():
                 weighted_errors = weights * self.loss_fn(predictions, targets)
                 total_error = weighted_errors.sum().item()
@@ -2017,8 +2299,9 @@ class Quoridor:
         path = f'quorinet_teacher_gen_{gen}.pth'
         if not os.path.exists(path): return None
         try:
-            net = SpatialQuoriNetV2(in_channels=STATE_CHANNELS)
-            net.load_state_dict(torch.load(path, weights_only=True))
+            weights = torch.load(path, weights_only=True)
+            net = PolicyValueQuoriNet() if 'policy_head.weight' in weights else SpatialQuoriNetV2()
+            net.load_state_dict(weights)
             net.eval()
             return net
         except Exception as e:
@@ -2116,6 +2399,8 @@ class Quoridor:
         self.winner_id = 0
         self.game_start_time = time.time()
         self.episode_trajectory = []
+        self.episode_policies = []
+        self._pending_search_policy = None
 
         if getattr(self, 'mode', 'MENU') == 'TRAIN':
             if hasattr(self, 'opponent_pool') and self.opponent_pool:
@@ -2147,12 +2432,17 @@ class Quoridor:
 
     def _load_network_checkpoint(self, path, destination, label):
         """Load strictly through a temporary model so a bad file cannot half-load."""
-        candidate = SpatialQuoriNetV2(in_channels=STATE_CHANNELS)
         state_dict = torch.load(path, map_location="cpu", weights_only=True)
+        candidate = (PolicyValueQuoriNet() if 'policy_head.weight' in state_dict
+                     else SpatialQuoriNetV2())
         candidate.load_state_dict(state_dict, strict=True)
         validate_model_contract(candidate, f"{label} checkpoint")
-        destination.load_state_dict(candidate.state_dict(), strict=True)
-        validate_model_contract(destination, label)
+        if label == 'student network' and not getattr(candidate, 'supports_policy', False):
+            migrated = PolicyValueQuoriNet()
+            migrated.load_state_dict(candidate.state_dict(), strict=False)
+            candidate = migrated
+        candidate.eval()
+        return candidate
 
     def _find_manual_snapshots(self):
         return sorted(
@@ -2191,11 +2481,98 @@ class Quoridor:
         print(f"[Manual Student Saved] {name}")
         return name
 
+    def _checkpoint_path(self, filename, directory=None):
+        return os.path.join(directory or self._checkpoint_dir, filename)
+
+    def _locate_checkpoint_source(self):
+        if os.path.isfile(TRAINING_STATE_FILE):
+            return "."
+        active = []
+        candidates = []
+        for group in self._archive_groups.values():
+            for directory in group.get("paths", set()):
+                if not os.path.isfile(self._checkpoint_path(
+                        TRAINING_STATE_FILE, directory)):
+                    continue
+                candidates.append(directory)
+                if group.get("active_checkpoint", False):
+                    active.append(directory)
+        if len(active) > 1:
+            raise RuntimeError("multiple architecture folders claim the active checkpoint")
+        if active:
+            return active[0]
+        if len(candidates) > 1:
+            raise RuntimeError("multiple unmarked architecture checkpoints need review")
+        if candidates:
+            return candidates[0]
+        if any(os.path.isfile(filename) for filename in ACTIVE_CHECKPOINT_FILES[1:]):
+            return "."
+        return "."
+
+    @staticmethod
+    def _file_sha256(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.digest()
+
+    def _migrate_loaded_checkpoint(self):
+        source = self._checkpoint_source_dir
+        if source is None or os.path.abspath(source) == os.path.abspath(self._checkpoint_dir):
+            return
+        if self._loaded_student_architecture_id != self._active_architecture_id:
+            if os.path.abspath(source) == os.path.abspath("."):
+                source_group = self._archive_groups.get(
+                    self._loaded_student_architecture_id
+                )
+                if source_group is None or "path" not in source_group:
+                    raise RuntimeError(
+                        "source checkpoint architecture has no destination folder"
+                    )
+                self._copy_checkpoint_files(source, source_group["path"])
+            self._checkpoint_needs_initial_save = True
+            return
+
+        self._copy_checkpoint_files(source, self._checkpoint_dir)
+
+    def _copy_checkpoint_files(self, source, destination_dir):
+        if os.path.abspath(source) == os.path.abspath(destination_dir):
+            return
+
+        copied = []
+        for filename in ACTIVE_CHECKPOINT_FILES:
+            source_path = self._checkpoint_path(filename, source)
+            if not os.path.isfile(source_path):
+                continue
+            destination = self._checkpoint_path(filename, destination_dir)
+            temporary = destination + ".migrate.tmp"
+            shutil.copy2(source_path, temporary)
+            if self._file_sha256(source_path) != self._file_sha256(temporary):
+                os.remove(temporary)
+                raise RuntimeError(f"checkpoint migration verification failed: {filename}")
+            os.replace(temporary, destination)
+            copied.append((source_path, destination))
+
+        if not any(os.path.basename(path) == TRAINING_STATE_FILE for path, _ in copied):
+            return
+        for source_path, destination in copied:
+            if self._file_sha256(source_path) != self._file_sha256(destination):
+                raise RuntimeError(
+                    f"checkpoint migration changed after installation: {source_path}"
+                )
+        for source_path, _ in copied:
+            os.remove(source_path)
+
     def load_checkpoint_if_exists(self):
         # One atomic bundle is authoritative over all legacy sidecar files.
         bundle = None
-        if os.path.exists('quorinet_training_state.pth'):
-            bundle = torch.load('quorinet_training_state.pth', map_location='cpu',
+        self._checkpoint_source_dir = self._locate_checkpoint_source()
+        bundle_path = self._checkpoint_path(
+            TRAINING_STATE_FILE, self._checkpoint_source_dir
+        )
+        if os.path.exists(bundle_path):
+            bundle = torch.load(bundle_path, map_location='cpu',
                                 weights_only=True)
             if bundle.get('format_version') not in (1, 2):
                 raise ValueError('unsupported training checkpoint format')
@@ -2215,10 +2592,15 @@ class Quoridor:
                         'official': {0: weights},
                         'manual': {},
                     })
-                    if checked['architecture']['id'] != architecture['id']:
-                        raise RuntimeError(
-                            f'checkpoint {label} uses an obsolete architecture definition'
-                        )
+                    if label == 'teacher':
+                        teacher_architecture = checked['architecture']
+                    else:
+                        student_architecture = checked['architecture']
+            self._loaded_student_architecture = copy.deepcopy(student_architecture)
+            self._loaded_student_architecture_id = (
+                student_architecture.get('id')
+                if student_architecture is not None else None
+            )
             archived_teacher = self._archived_official.get(teacher_gen)
             if teacher_architecture is None and archived_teacher is not None:
                 candidate, _ = archived_teacher
@@ -2258,7 +2640,19 @@ class Quoridor:
                 self.student_net.load_state_dict(bundle['student'], strict=True)
                 self.optimizer.load_state_dict(bundle['optimizer'])
             else:
-                self.architecture_transition_status = 'fresh_student_and_optimizer'
+                legacy = SpatialQuoriNetV2()
+                legacy_architecture = capture_model_architecture(legacy)
+                if (getattr(self.student_net, 'supports_policy', False)
+                        and student_architecture is not None
+                        and student_architecture['id'] == legacy_architecture['id']):
+                    legacy.load_state_dict(bundle['student'], strict=True)
+                    missing = self.student_net.load_state_dict(legacy.state_dict(), strict=False)
+                    if set(missing.missing_keys) != {'policy_head.weight', 'policy_head.bias'} or missing.unexpected_keys:
+                        raise RuntimeError('value-to-policy migration did not match exactly')
+                    restore_student_optimizer(self.optimizer, bundle['optimizer'])
+                    self.architecture_transition_status = 'migrated_latest_student_value_and_optimizer'
+                else:
+                    self.architecture_transition_status = 'fresh_student_and_optimizer'
 
             if not teacher_matches_current:
                 if student_matches_current:
@@ -2267,7 +2661,7 @@ class Quoridor:
             if not same_architecture:
                 print(
                     'Architecture transition: preserved the official teacher and '
-                    + ('restored' if student_matches_current else 'started fresh')
+                    + self.architecture_transition_status
                     + ' student/optimizer state.'
                 )
 
@@ -2291,14 +2685,18 @@ class Quoridor:
                 print('Architecture transition: old-encoder replay remains only in the source bundle.')
             self.last_loss = bundle['last_loss']
             self._restored_rng = (bundle['python_rng'], bundle['torch_rng'], bundle.get('cuda_rng'))
-        elif os.path.exists('quorinet_meta.json'):
+        elif os.path.exists(self._checkpoint_path(
+                META_FILE, self._checkpoint_source_dir)):
             print('Legacy checkpoint: model/Adam files are authoritative; '
                   'JSON counters may be newer and replay is unavailable.')
         teacher_loaded = False
-        if bundle is None and os.path.exists('quorinet_teacher_weights.pth'):
+        teacher_path = self._checkpoint_path(
+            TEACHER_WEIGHTS_FILE, self._checkpoint_source_dir
+        )
+        if bundle is None and os.path.exists(teacher_path):
             try:
-                self._load_network_checkpoint(
-                    'quorinet_teacher_weights.pth',
+                self.teacher_net = self._load_network_checkpoint(
+                    teacher_path,
                     self.teacher_net,
                     'teacher network'
                 )
@@ -2306,27 +2704,36 @@ class Quoridor:
             except Exception as exc:
                 raise RuntimeError(f"Teacher checkpoint rejected: {exc}") from exc
 
-        if bundle is None and os.path.exists('quorinet_student_weights.pth'):
+        student_path = self._checkpoint_path(
+            STUDENT_WEIGHTS_FILE, self._checkpoint_source_dir
+        )
+        if bundle is None and os.path.exists(student_path):
             try:
-                self._load_network_checkpoint(
-                    'quorinet_student_weights.pth',
+                self.student_net = self._load_network_checkpoint(
+                    student_path,
                     self.student_net,
                     'student network'
                 )
             except Exception as exc:
                 raise RuntimeError(f"Student checkpoint rejected: {exc}") from exc
         elif teacher_loaded:
-            self.student_net.load_state_dict(self.teacher_net.state_dict(), strict=True)
+            self.student_net.load_state_dict(self.teacher_net.state_dict(), strict=False)
 
-        if bundle is None and os.path.exists('quorinet_optimizer.pth'):
+        if bundle is None:
+            self.optimizer = optim.Adam(self.student_net.parameters(), lr=0.0001)
+
+        optimizer_path = self._checkpoint_path(
+            OPTIMIZER_FILE, self._checkpoint_source_dir
+        )
+        if bundle is None and os.path.exists(optimizer_path):
             try:
                 candidate_optimizer = optim.Adam(
                     self.student_net.parameters(),
                     lr=self.optimizer.param_groups[0]['lr']
                 )
-                candidate_optimizer.load_state_dict(
+                restore_student_optimizer(candidate_optimizer,
                     torch.load(
-                        'quorinet_optimizer.pth',
+                        optimizer_path,
                         map_location=model_device(self.student_net),
                         weights_only=True
                     )
@@ -2346,10 +2753,11 @@ class Quoridor:
         )
 
         self.heuristic_weight = 1.0
-        if bundle is not None or os.path.exists('quorinet_meta.json'):
+        meta_path = self._checkpoint_path(META_FILE, self._checkpoint_source_dir)
+        if bundle is not None or os.path.exists(meta_path):
             try:
                 source = (io.StringIO(json.dumps(bundle['meta'])) if bundle is not None
-                          else open('quorinet_meta.json', 'r'))
+                          else open(meta_path, 'r'))
                 with source as f:
                     meta = json.load(f)
                     self.games_played = meta.get('games_played', 0)
@@ -2459,16 +2867,24 @@ class Quoridor:
                 migrated.pop(key, None)
             migrated.update(replay_format_version=REPLAY_FORMAT_VERSION,
                             replay_games={}, next_replay_game_id=1)
-            self._write_training_bundle(migrated)
+            self._write_training_bundle(migrated, self._checkpoint_source_dir)
 
-    @staticmethod
-    def _write_training_bundle(bundle):
-        temporary = 'quorinet_training_state.pth.tmp'
+        if bundle is None:
+            self._loaded_student_architecture = capture_model_architecture(
+                self.student_net
+            )
+            self._loaded_student_architecture_id = (
+                self._loaded_student_architecture["id"]
+            )
+
+    def _write_training_bundle(self, bundle, directory=None):
+        target = self._checkpoint_path(TRAINING_STATE_FILE, directory)
+        temporary = target + '.tmp'
         with open(temporary, 'wb') as f:
             torch.save(bundle, f)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(temporary, 'quorinet_training_state.pth')
+        os.replace(temporary, target)
 
     def _checkpoint_metadata(self):
         return {
@@ -2502,12 +2918,13 @@ class Quoridor:
 
     def save_meta(self):
         # Observational sidecar only; restoration uses the bundle's metadata.
-        temporary = 'quorinet_meta.json.tmp'
+        target = self._checkpoint_path(META_FILE)
+        temporary = target + '.tmp'
         with open(temporary, 'w') as f:
             json.dump(self._checkpoint_metadata(), f)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(temporary, 'quorinet_meta.json')
+        os.replace(temporary, target)
 
     def save_checkpoint(self, manual=False):
         # A training episode owns deferred targets and updates. Save only after
@@ -2539,10 +2956,14 @@ class Quoridor:
         self._write_training_bundle(bundle)
         self._save_requested = False
         # Compatibility exports. Interrupted exports cannot supersede the bundle.
-        torch.save(_model_state_dict(self.teacher_net), f'quorinet_teacher_gen_{self.teacher_gen}.pth')
-        torch.save(_model_state_dict(self.teacher_net), 'quorinet_teacher_weights.pth')
-        torch.save(self.student_net.state_dict(), 'quorinet_student_weights.pth')
-        torch.save(self.optimizer.state_dict(), 'quorinet_optimizer.pth')
+        torch.save(_model_state_dict(self.teacher_net), self._checkpoint_path(
+            f'quorinet_teacher_gen_{self.teacher_gen}.pth'))
+        torch.save(_model_state_dict(self.teacher_net), self._checkpoint_path(
+            TEACHER_WEIGHTS_FILE))
+        torch.save(self.student_net.state_dict(), self._checkpoint_path(
+            STUDENT_WEIGHTS_FILE))
+        torch.save(self.optimizer.state_dict(), self._checkpoint_path(
+            OPTIMIZER_FILE))
         self.save_meta()
         print(f"[{'Manual' if manual else 'Auto'} Saved] Gen #{self.teacher_gen} saved.")
         self.toast_msg, self.toast_timer = f"Saved Checkpoint! (Gen #{self.teacher_gen})", 120
@@ -2714,7 +3135,7 @@ class Quoridor:
         # live teacher network is overwritten.
         torch.save(
             _model_state_dict(self.teacher_net),
-            f'quorinet_teacher_gen_{self.teacher_gen}.pth'
+            self._checkpoint_path(f'quorinet_teacher_gen_{self.teacher_gen}.pth')
         )
 
         self.update_escalation_state()
@@ -2753,6 +3174,11 @@ class Quoridor:
             next_state_tensor.detach().cpu().clone(),
             next_turn_pid
         ))
+        if not hasattr(self, 'episode_policies'):
+            self.episode_policies = []
+        policy = getattr(self, '_pending_search_policy', None)
+        self._pending_search_policy = None
+        self.episode_policies.append(policy.detach().cpu().clone() if policy is not None else None)
         if not done:
             return
 
@@ -2764,6 +3190,7 @@ class Quoridor:
             reason = 'unfinished' if winner_id == 0 else 'historical student win'
             print(f"Gen #{opponent_gen} {reason}: discarded {len(self.episode_trajectory)} plies.")
             self.episode_trajectory.clear()
+            self.episode_policies.clear()
             return
 
         tactical = self._tactical_replay_indices(winner_id)
@@ -2776,6 +3203,9 @@ class Quoridor:
              'tactical': index in tactical}
             for index, (state, pid, _, _) in enumerate(self.episode_trajectory)
         ]
+        for sample, policy in zip(fresh, self.episode_policies):
+            if policy is not None:
+                sample['policy'] = policy
         for batch, counts in self._training_batches(fresh, opponent_gen):
             if not self._optimize_student_batch(batch):
                 raise RuntimeError('accepted game optimizer update did not complete')
@@ -2801,6 +3231,7 @@ class Quoridor:
             })
         self.next_replay_game_id += 1
         self.episode_trajectory.clear()
+        self.episode_policies.clear()
 
     def log_match_result(self, winner_id):
         duration = round(time.time() - self.game_start_time, 1)
@@ -3057,6 +3488,8 @@ class Quoridor:
     def _commit_training_action(self, state_tensor, turn_pid):
         done, winner_id = self._detect_terminal()
         next_pid = self.state['turn']
+        bot = self.bot1 if turn_pid == 1 else self.bot2
+        self._pending_search_policy = getattr(bot, 'last_policy', None)
         self.train_step(state_tensor, turn_pid, encode_state(self.state, next_pid),
                         next_pid, done, winner_id)
         self.check_win()
@@ -3491,9 +3924,9 @@ if __name__ == "__main__":
     parser.add_argument('--threads', type=int, default=min(4, os.cpu_count() or 1),
                         help='PyTorch CPU threads; small boards often benefit from 1-4')
     parser.add_argument('--train-depth', type=int, default=2,
-                        help='search depth during self-play (default: 2)')
+                        help='legacy search depth / MCTS budget in units of 64 simulations (default: 2)')
     parser.add_argument('--play-depth', type=int, default=4,
-                        help='search depth against a human (default: 4)')
+                        help='legacy search depth / MCTS budget in units of 64 simulations (default: 4)')
     parser.add_argument('--train-updates', type=int, default=None,
                         help='deprecated and ignored; fresh positions each receive one pass')
     parser.add_argument('--checkpoint-dir', default=None,
