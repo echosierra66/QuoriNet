@@ -279,7 +279,7 @@ class SpatialQuoriNetV2(nn.Module):
             )
         return value
 
-class PolicyValueQuoriNet(SpatialQuoriNetV2):
+class LegacyPolicyValueQuoriNet(SpatialQuoriNetV2):
     """Keep the complete V2 value path; learn spatial action priors beside it.
 
     forward remains scalar for existing UI, diagnostics, and value opponents.
@@ -300,6 +300,71 @@ class PolicyValueQuoriNet(SpatialQuoriNetV2):
                             spatial[:, 1, :8, :8].flatten(1),
                             spatial[:, 2, :8, :8].flatten(1)), dim=1)
         return logits, self.value_head(self.pool(features).flatten(1))
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv2d(64, 64, 3, padding=1, bias=False), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1, bias=False), nn.BatchNorm2d(64),
+        )
+
+    def forward(self, features):
+        return torch.relu(features + self.layers(features))
+
+
+class PolicyValueQuoriNet(nn.Module):
+    """Final two-head network: eight residual blocks and spatially aware heads."""
+    supports_policy = True
+
+    def __init__(self, in_channels=STATE_CHANNELS):
+        super().__init__()
+        if in_channels != STATE_CHANNELS:
+            raise ValueError(f"network requires {STATE_CHANNELS} input channels")
+        self.in_channels = in_channels
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(),
+            *(ResidualBlock() for _ in range(8)),
+        )
+        self.policy_features = nn.Sequential(
+            nn.Conv2d(64, 32, 1, bias=False), nn.BatchNorm2d(32), nn.ReLU(),
+        )
+        self.policy_head = nn.Conv2d(32, 3, 1)
+        self.value_head = nn.Sequential(
+            nn.Conv2d(64, 8, 1, bias=False), nn.BatchNorm2d(8), nn.ReLU(),
+            nn.Flatten(), nn.Linear(8 * BOARD_SIZE * BOARD_SIZE, 64), nn.ReLU(),
+            nn.Linear(64, 1), nn.Tanh(),
+        )
+
+    def _features(self, states):
+        if not isinstance(states, torch.Tensor):
+            raise TypeError("network input must be a torch.Tensor")
+        if states.ndim != 4 or tuple(states.shape[1:]) != STATE_SHAPE or states.shape[0] < 1:
+            raise ValueError(f"network input must have shape [B, {STATE_SHAPE}] with B >= 1")
+        if states.dtype != torch.float32:
+            raise TypeError("network input must have dtype torch.float32")
+        return self.conv(states)
+
+    def forward(self, states):
+        return self.value_head(self._features(states))
+
+    def policy_value(self, states):
+        features = self._features(states)
+        spatial = self.policy_head(self.policy_features(features))
+        logits = torch.cat((spatial[:, 0].flatten(1),
+                            spatial[:, 1, :8, :8].flatten(1),
+                            spatial[:, 2, :8, :8].flatten(1)), dim=1)
+        return logits, self.value_head(features)
+
+
+def network_from_weights(weights):
+    if 'policy_features.0.weight' in weights:
+        return PolicyValueQuoriNet()
+    if 'policy_head.weight' in weights:
+        return LegacyPolicyValueQuoriNet()
+    return SpatialQuoriNetV2()
 
 
 def policy_action_index(action, pid):
@@ -597,8 +662,10 @@ def capture_model_architecture(model):
     architecture = {
         "id": architecture_id,
         "class_name": f"{model.__class__.__module__}.{model.__class__.__qualname__}",
-        "class_source": (inspect.getsource(SpatialQuoriNetV2) + '\n'
-                         if isinstance(model, PolicyValueQuoriNet) else '')
+        "class_source": (inspect.getsource(ResidualBlock) + '\n'
+                         if any(isinstance(layer, ResidualBlock) for layer in model.modules())
+                         else inspect.getsource(SpatialQuoriNetV2) + '\n'
+                         if isinstance(model, LegacyPolicyValueQuoriNet) else '')
                         + inspect.getsource(model.__class__),
         "torchscript": script_buffer.getvalue(),
         **descriptor,
@@ -2300,7 +2367,7 @@ class Quoridor:
         if not os.path.exists(path): return None
         try:
             weights = torch.load(path, weights_only=True)
-            net = PolicyValueQuoriNet() if 'policy_head.weight' in weights else SpatialQuoriNetV2()
+            net = network_from_weights(weights)
             net.load_state_dict(weights)
             net.eval()
             return net
@@ -2433,14 +2500,9 @@ class Quoridor:
     def _load_network_checkpoint(self, path, destination, label):
         """Load strictly through a temporary model so a bad file cannot half-load."""
         state_dict = torch.load(path, map_location="cpu", weights_only=True)
-        candidate = (PolicyValueQuoriNet() if 'policy_head.weight' in state_dict
-                     else SpatialQuoriNetV2())
+        candidate = network_from_weights(state_dict)
         candidate.load_state_dict(state_dict, strict=True)
         validate_model_contract(candidate, f"{label} checkpoint")
-        if label == 'student network' and not getattr(candidate, 'supports_policy', False):
-            migrated = PolicyValueQuoriNet()
-            migrated.load_state_dict(candidate.state_dict(), strict=False)
-            candidate = migrated
         candidate.eval()
         return candidate
 
@@ -2640,19 +2702,7 @@ class Quoridor:
                 self.student_net.load_state_dict(bundle['student'], strict=True)
                 self.optimizer.load_state_dict(bundle['optimizer'])
             else:
-                legacy = SpatialQuoriNetV2()
-                legacy_architecture = capture_model_architecture(legacy)
-                if (getattr(self.student_net, 'supports_policy', False)
-                        and student_architecture is not None
-                        and student_architecture['id'] == legacy_architecture['id']):
-                    legacy.load_state_dict(bundle['student'], strict=True)
-                    missing = self.student_net.load_state_dict(legacy.state_dict(), strict=False)
-                    if set(missing.missing_keys) != {'policy_head.weight', 'policy_head.bias'} or missing.unexpected_keys:
-                        raise RuntimeError('value-to-policy migration did not match exactly')
-                    restore_student_optimizer(self.optimizer, bundle['optimizer'])
-                    self.architecture_transition_status = 'migrated_latest_student_value_and_optimizer'
-                else:
-                    self.architecture_transition_status = 'fresh_student_and_optimizer'
+                self.architecture_transition_status = 'fresh_student_and_optimizer'
 
             if not teacher_matches_current:
                 if student_matches_current:
@@ -2858,6 +2908,10 @@ class Quoridor:
             bundle['meta'].get('lr_inertia')
             if bundle is not None and student_matches_current else None)
 
+        if bundle is not None and not student_matches_current:
+            self._reset_student_training_progress()
+            self._checkpoint_needs_initial_save = True
+
         if bundle is not None and bundle.get('replay_format_version') is None:
             # Persist the migration immediately, without reserializing live
             # metadata/RNG or rewriting weights/Adam sidecars. All other bundle
@@ -2876,6 +2930,37 @@ class Quoridor:
             self._loaded_student_architecture_id = (
                 self._loaded_student_architecture["id"]
             )
+
+    def _reset_student_training_progress(self):
+        """A new architecture must earn every gate with its own training results."""
+        self.optimizer = optim.Adam(self.student_net.parameters(), lr=0.0001)
+        self.games_played = self.optimizer_steps = 0
+        self.replay_games = {}
+        self.next_replay_game_id = 1
+        self.replay_samples_latest = self.replay_samples_historic = self.replay_samples_tactical = 0
+        self.episode_trajectory = []
+        self.episode_policies = []
+        self._pending_search_policy = None
+        self.last_game_batches = []
+        self.last_loss = 0.0
+        self.student_eval_history.clear()
+        self.latest_teacher_history.clear()
+        self.checkpoint_log.clear()
+        self.escalation_state.clear()
+        self.wawr_history.clear()
+        self.match_history.clear()
+        self.student_win_rate_str = "Pending live WR"
+        self.rematch_teacher_gen = None
+        self.curriculum_latest_credit = 1.0
+        self.lr_last_reduced_at_gen = 0
+        self.heuristic_lr_floor = self.heuristic_weight * 0.0001
+        self._reset_lr_search_for_new_teacher()
+        self.is_evaluating = False
+        self.eval_vs_gen = self.eval_game_curr = self.eval_game_total = 0
+        self._manual_promotion_test_requested = False
+        self._save_requested = False
+        if hasattr(self, '_restored_rng'):
+            del self._restored_rng
 
     def _write_training_bundle(self, bundle, directory=None):
         target = self._checkpoint_path(TRAINING_STATE_FILE, directory)
