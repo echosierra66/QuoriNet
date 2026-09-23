@@ -1363,7 +1363,8 @@ class Quoridor:
         (
             self.rect_train, self.rect_save_manual, self.rect_new_game,
             self.rect_menu, self.rect_train_toggle, self.rect_test_promotion,
-        ) = [pygame.Rect(0, 0, 0, 0) for _ in range(6)]
+            self.rect_lr_up, self.rect_lr_down,
+        ) = [pygame.Rect(0, 0, 0, 0) for _ in range(8)]
         self.manual_snapshots = self._find_manual_snapshots()
         self.manual_snapshot_index = max(0, len(self.manual_snapshots) - 1)
         self.game_start_time = time.time()
@@ -2247,6 +2248,40 @@ class Quoridor:
         self.lr_search_direction = 0
         self._reset_lr_inertia()
 
+    def _adjust_lr_manually(self, factor):
+        changed = self._set_learning_rate(
+            self.optimizer.param_groups[0]['lr'] * factor, f'manual x{factor:g}')
+        if changed:
+            self._reset_lr_inertia()
+            if self.student_eval_history:
+                self.lr_inertia['best_combined_wr'] = (
+                    sum(self.student_eval_history) / len(self.student_eval_history))
+        self.toast_msg = f"LR: {self.optimizer.param_groups[0]['lr']:.8f}"
+        if not changed:
+            self.toast_msg += ' (at limit)'
+        self.toast_timer = 180
+
+    def _reduce_lr_on_stagnation(self):
+        """Call once after each decided training result updates combined WR."""
+        if self.mode != 'TRAIN' or self.is_evaluating or not self.student_eval_history:
+            return False
+        state = self.lr_inertia
+        rate = sum(self.student_eval_history) / len(self.student_eval_history)
+        if state['best_combined_wr'] is None or rate > state['best_combined_wr']:
+            state.update(best_combined_wr=rate, stagnant_games=0)
+            return False
+        state['stagnant_games'] += 1
+        if state['stagnant_games'] <= 100:
+            return False
+        changed = self._set_learning_rate(
+            self.optimizer.param_groups[0]['lr'] * 0.1,
+            'combined WR has not improved for over 100 games')
+        # Give the new LR a fresh interval; do not stack an inertia cut on it.
+        self._reset_lr_inertia()
+        self.lr_inertia.update(best_combined_wr=rate,
+                              status='stagnation reduced' if changed else 'at LR floor')
+        return True
+
     def _reset_lr_inertia(self):
         self.lr_inertia = {
             'version': 1, 'teacher_gen': self.teacher_gen,
@@ -2255,6 +2290,7 @@ class Quoridor:
             'velocity': 0.0, 'declines': 0, 'cooldown': 0,
             'last_step': self.optimizer_steps, 'observed_step': self.optimizer_steps,
             'blocks': 0,
+            'best_combined_wr': None, 'stagnant_games': 0,
             'status': 'warming up',
         }
 
@@ -2281,6 +2317,11 @@ class Quoridor:
             valid = valid and isinstance(saved.get(key), int) and saved[key] >= 0
         velocity = saved.get('velocity')
         valid = valid and isinstance(velocity, (int, float)) and math.isfinite(velocity)
+        best = saved.get('best_combined_wr')
+        stagnant = saved.get('stagnant_games', 0)
+        valid = valid and (best is None or (
+            isinstance(best, (int, float)) and math.isfinite(best) and 0 <= best <= 1))
+        valid = valid and isinstance(stagnant, int) and 0 <= stagnant <= 100
         if not valid or max(saved['last_step'], saved['observed_step']) > self.optimizer_steps:
             return
         self.lr_inertia.update(copy.deepcopy(saved))
@@ -3418,7 +3459,7 @@ class Quoridor:
             ("Student Win Rate", self.student_win_rate_str),
             ("Final Test", final_test),
             ("AI Board Evaluation", f"{eval_score}"),
-            ("Learning Rate (inertia)", f"{current_lr:.8f}"),
+            ("Learning Rate", f"{current_lr:.8f}"),
             ("Student Training Loss", f"{self.last_loss:.5f}"),
         ]
         y = 46
@@ -3427,6 +3468,13 @@ class Quoridor:
             rendered = self.tiny_font.render(str(value), True, TEXT_COLOR)
             self.virtual_screen.blit(rendered, (x + SIDEBAR_WIDTH - rendered.get_width() - 12, y))
             y += 20
+
+        self.rect_lr_up = pygame.Rect(x + 12, 240, 156, 26)
+        self.rect_lr_down = pygame.Rect(x + 180, 240, 168, 26)
+        for rect, label in ((self.rect_lr_up, 'LR x10'), (self.rect_lr_down, 'LR x0.1')):
+            pygame.draw.rect(self.virtual_screen, MUTED_TEXT, rect)
+            text = self.small_font.render(label, True, (255, 255, 255))
+            self.virtual_screen.blit(text, text.get_rect(center=rect.center))
 
         self._blit_text("MATCH LOG HISTORY", x + 12, 270, font=self.small_font)
         for label, dx in (("Game", 12), ("Winner", 72), ("Turns", 180), ("Time", 245)):
@@ -3643,7 +3691,8 @@ class Quoridor:
                     )
 
                 self._record_lr_result(winner_id)
-                self._tune_learning_rate_from_pool(force=False)
+                if not self._reduce_lr_on_stagnation():
+                    self._tune_learning_rate_from_pool(force=False)
                 print(f"Learning: {self.optimizer_steps - self._game_start_optimizer_steps} "
                       f"steps this game / {self.optimizer_steps} total | "
                       f"LR={self.optimizer.param_groups[0]['lr']:.8f} "
@@ -3966,7 +4015,11 @@ class Quoridor:
                         elif self.rect_save_manual.collidepoint(mouse_pos):
                             self.save_manual_student()
                     elif self.mode == "TRAIN":
-                        if self.rect_menu.collidepoint(mouse_pos):
+                        if self.rect_lr_up.collidepoint(mouse_pos):
+                            self._adjust_lr_manually(10.0)
+                        elif self.rect_lr_down.collidepoint(mouse_pos):
+                            self._adjust_lr_manually(0.1)
+                        elif self.rect_menu.collidepoint(mouse_pos):
                             self.mode = "MENU"
                         elif self.rect_new_game.collidepoint(mouse_pos):
                             self.reset_game()
