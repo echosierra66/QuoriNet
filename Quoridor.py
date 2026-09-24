@@ -1258,8 +1258,6 @@ class Quoridor:
 
         # Explicit LR bounds. Legacy constants remain for the retired-policy
         # diagnostic; production uses fresh, seat-balanced decline evidence.
-        self.LR_MIN = 0.00001
-        self.LR_MAX = 0.0008
         self.LR_TUNE_INTERVAL_LATEST_GAMES = 15
         self.LR_MIN_SAMPLES = 15
         self.LR_PLATEAU_EPS = 0.015
@@ -2228,14 +2226,14 @@ class Quoridor:
         if not math.isfinite(requested_lr) or requested_lr <= 0:
             raise ValueError('learning rate must be finite and positive')
         old_lr = self.optimizer.param_groups[0]['lr']
-        new_lr = max(self.LR_MIN, min(self.LR_MAX, requested_lr))
-        if abs(new_lr - old_lr) < 1e-12:
+        new_lr = requested_lr
+        if new_lr == old_lr:
             return False
 
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = new_lr
 
-        print(f"LR: {old_lr:.6f} -> {new_lr:.6f} | {reason}")
+        print(f"LR: {old_lr:.6g} -> {new_lr:.6g} | {reason}")
         return True
 
     def _reset_lr_search_for_new_teacher(self):
@@ -2258,7 +2256,7 @@ class Quoridor:
                     sum(self.student_eval_history) / len(self.student_eval_history))
         self.toast_msg = f"LR: {self.optimizer.param_groups[0]['lr']:.8f}"
         if not changed:
-            self.toast_msg += ' (at limit)'
+            self.toast_msg += ' (unchanged)'
         self.toast_timer = 180
 
     def _reduce_lr_on_stagnation(self):
@@ -2279,7 +2277,7 @@ class Quoridor:
         # Give the new LR a fresh interval; do not stack an inertia cut on it.
         self._reset_lr_inertia()
         self.lr_inertia.update(best_combined_wr=rate,
-                              status='stagnation reduced' if changed else 'at LR floor')
+                              status='stagnation reduced' if changed else 'LR unchanged')
         return True
 
     def _reset_lr_inertia(self):
@@ -2390,7 +2388,7 @@ class Quoridor:
             f"{self.LR_DECLINE_BLOCKS} fresh balanced declines; inertia={state['velocity']:+.3f}")
         state.update(declines=0, cooldown=self.LR_COOLDOWN_BLOCKS,
                      last_step=self.optimizer_steps, slow=rates, velocity=0.0,
-                     status='reduced; cooldown' if changed else 'at LR floor')
+                     status='reduced; cooldown' if changed else 'LR unchanged')
 
     def _load_net_for_gen(self, gen):
         if gen == self.teacher_gen: return self.teacher_net
