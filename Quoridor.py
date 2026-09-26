@@ -17,6 +17,7 @@ import re
 import shutil
 import textwrap
 import warnings
+import queue
 from collections import deque
 from functools import lru_cache
 import torch
@@ -465,6 +466,41 @@ def get_shortest_path_dist(state, pid):
     c, r = state[f'p{pid}_pos']
     return get_distance_field(state, pid)[r * BOARD_SIZE + c]
 
+
+@lru_cache(maxsize=8192)
+def _wall_path_witnesses(walls_h, walls_v, p1_pos, p2_pos):
+    """Keep one existing route per pawn; an untouched route proves legality."""
+    adjacent = _wall_adjacency(walls_h, walls_v)
+    paths = []
+    for (c, r), target in ((p1_pos, 0), (p2_pos, 8)):
+        distances = _goal_distances(walls_h, walls_v, target)
+        square = r * BOARD_SIZE + c
+        if distances[square] == 999:
+            paths.append(None)
+            continue
+        edges = set()
+        while distances[square]:
+            other = next(n for n in adjacent[square]
+                         if distances[n] == distances[square] - 1)
+            edges.add((square, other))
+            square = other
+        paths.append(frozenset(edges))
+    return adjacent, tuple(paths)
+
+
+def _reaches_goal_without_edges(adjacent, position, target_row, blocked):
+    square = position[1] * BOARD_SIZE + position[0]
+    seen = {square}
+    pending = [square]
+    for square in pending:
+        if square // BOARD_SIZE == target_row:
+            return True
+        for other in adjacent[square]:
+            if other not in seen and (square, other) not in blocked:
+                seen.add(other)
+                pending.append(other)
+    return False
+
 def encode_relative_8ch_path_v1(state, active_pid):
     if active_pid not in (1, 2):
         raise ValueError(f"active_pid must be 1 or 2, got {active_pid}")
@@ -808,12 +844,21 @@ class QuoridorBot:
 
     def mcts_move(self, state, epsilon=0.0):
         """Rollout-free PUCT; each node stores value for its side to move."""
-        def node(position, prior=1.0):
+        predictions = {}  # Only this search: weights may change before the next.
+
+        def node(position, prior=1.0, parent=None, action=None):
             return {'state': position, 'prior': prior, 'n': 0, 'w': 0.0,
-                    'children': None}
+                    'children': None, 'parent_state': parent, 'action': action}
+
+        def materialize(current):
+            if current['state'] is None:
+                parent = current.pop('parent_state')
+                current['state'] = self.apply_action(
+                    parent, parent['turn'], current.pop('action'))
+            return current['state']
 
         def expand(current):
-            position = current['state']
+            position = materialize(current)
             pid = position['turn']
             for winner, row in ((1, 0), (2, 8)):
                 if position[f'p{winner}_pos'][1] == row:
@@ -833,19 +878,25 @@ class QuoridorBot:
                     for m in self.get_valid_moves(self.apply_action(position, pid, a), 3 - pid))]
                 if safe:
                     actions = safe
-            batch = make_model_state_batch(self.nn_model, [
-                encode_state_for_model(self.nn_model, position, pid)])
-            with torch.inference_mode():
-                logits, value = self.nn_model.policy_value(batch)
-            if (tuple(logits.shape) != (1, POLICY_SIZE)
-                    or tuple(value.shape) != (1, 1)
-                    or not torch.isfinite(logits).all()
-                    or not torch.isfinite(value).all()):
-                raise FloatingPointError('invalid MCTS policy/value output')
+            encoded = encode_state_for_model(self.nn_model, position, pid)
+            batch = make_model_state_batch(self.nn_model, [encoded])
+            # Key the actual input, including custom archived encoders. Cache
+            # raw outputs, never legal masks, visits, terminal values or history.
+            key = encoded.detach().cpu().contiguous().numpy().tobytes()
+            if key not in predictions:
+                with torch.inference_mode():
+                    logits, value = self.nn_model.policy_value(batch)
+                if (tuple(logits.shape) != (1, POLICY_SIZE)
+                        or tuple(value.shape) != (1, 1)
+                        or not torch.isfinite(logits).all()
+                        or not torch.isfinite(value).all()):
+                    raise FloatingPointError('invalid MCTS policy/value output')
+                predictions[key] = (logits, value)
+            logits, value = predictions[key]
             indices = [policy_action_index(a, pid) for a in actions]
             priors = torch.softmax(logits[0, indices], dim=0).cpu().tolist()
             current['children'] = {
-                action: node(self.apply_action(position, pid, action), prior)
+                action: node(None, prior, position, action)
                 for action, prior in zip(actions, priors)}
             return float(value[0, 0])
 
@@ -857,8 +908,8 @@ class QuoridorBot:
             self.was_last_random = False
             return None, root_value * 10000.0
         explore = epsilon > 0 and not any(
-            child['state'][f'p{self.bot_id}_pos'][1] == self.get_target_row(self.bot_id)
-            for child in root['children'].values())
+            action[0] == 'move' and action[1][1] == self.get_target_row(self.bot_id)
+            for action in root['children'])
         if explore:
             noise = torch.distributions.Dirichlet(
                 torch.full((len(root['children']),), 0.3)).sample().tolist()
@@ -890,7 +941,7 @@ class QuoridorBot:
             most_visits = max(child['n'] for child in children.values())
             choices = [a for a, child in children.items() if child['n'] == most_visits]
             chosen = min(choices, key=lambda a:
-                         self._oscillation_penalty(children[a]['state'], self.bot_id))
+                         self._oscillation_penalty(materialize(children[a]), self.bot_id))
         child = children[chosen]
         score = -child['w'] / child['n'] if child['n'] else root_value
         return chosen, score * 10000.0
@@ -951,13 +1002,21 @@ class QuoridorBot:
         else:
             if (c, r) in state['walls_v'] or (c, r-1) in state['walls_v'] or (c, r+1) in state['walls_v']: return False
             if (c, r) in state['walls_h']: return False
-        candidate = state.copy()
-        key = 'walls_h' if orient == 'H' else 'walls_v'
-        candidate[key] = state[key] | {(c, r)}
-        return (
-            get_shortest_path_dist(candidate, 1) < 999
-            and get_shortest_path_dist(candidate, 2) < 999
-        )
+        adjacent, paths = _wall_path_witnesses(
+            frozenset(state['walls_h']), frozenset(state['walls_v']),
+            state['p1_pos'], state['p2_pos'])
+        start = r * BOARD_SIZE + c
+        offset, span = (BOARD_SIZE, 1) if orient == 'H' else (1, BOARD_SIZE)
+        blocked = frozenset(
+            edge for square in (start, start + span)
+            for edge in ((square, square + offset), (square + offset, square)))
+        for pid, target, path in zip((1, 2), (0, 8), paths):
+            if path is None:
+                return False
+            if not path.isdisjoint(blocked) and not _reaches_goal_without_edges(
+                    adjacent, state[f'p{pid}_pos'], target, blocked):
+                return False
+        return True
 
     def generate_actions(self, state, pid):
         valid_moves = self.get_valid_moves(state, pid)
@@ -3107,7 +3166,14 @@ class Quoridor:
         result = 0
         try:
             for _ in range(200):
-                if not self.headless:
+                if hasattr(self, '_trainer_commands'):
+                    self._publish_trainer_view()
+                    while not self._trainer_allowed.wait(0.05):
+                        if self._trainer_stop.is_set():
+                            raise InterruptedError('Trainer closed during evaluation')
+                    if self._trainer_stop.is_set():
+                        raise InterruptedError('Trainer closed during evaluation')
+                elif not self.headless:
                     for event in pygame.event.get():
                         if event.type == pygame.QUIT:
                             pygame.quit()
@@ -3442,8 +3508,12 @@ class Quoridor:
         )
         self._blit_text("LIVE METRICS & ANALYTICS", x + 12, 14, font=self.small_font)
 
-        eval_score = round(self.bot1.evaluate(self.state, self.state['turn']), 1)
-        current_lr = self.optimizer.param_groups[0]['lr']
+        if hasattr(self, '_display_eval'):
+            eval_score = self._display_eval
+            current_lr = self._display_lr
+        else:
+            eval_score = round(self.bot1.evaluate(self.state, self.state['turn']), 1)
+            current_lr = self.optimizer.param_groups[0]['lr']
         final_test = (
             f"Vs Gen #{self.eval_vs_gen} ({self.eval_game_curr}/{self.eval_game_total})"
             if self.is_evaluating else "Waiting on live gates"
@@ -3567,15 +3637,13 @@ class Quoridor:
             )
         )
 
-        button_y = HEIGHT - 42
-        self.rect_train_toggle = pygame.Rect(LEFT_SIDEBAR_WIDTH + 12, button_y, 150, 30)
-        self.rect_test_promotion = pygame.Rect(LEFT_SIDEBAR_WIDTH + 172, button_y, 180, 30)
-        self.rect_new_game = pygame.Rect(
-            LEFT_SIDEBAR_WIDTH + BOARD_PIXEL_SIZE - 230, button_y, 105, 30
-        )
-        self.rect_menu = pygame.Rect(
-            LEFT_SIDEBAR_WIDTH + BOARD_PIXEL_SIZE - 115, button_y, 105, 30
-        )
+        button_width = (BOARD_PIXEL_SIZE - 36) // 2
+        left = LEFT_SIDEBAR_WIDTH + 12
+        right = left + button_width + 12
+        self.rect_train_toggle = pygame.Rect(left, HEIGHT - 78, button_width, 30)
+        self.rect_test_promotion = pygame.Rect(right, HEIGHT - 78, button_width, 30)
+        self.rect_new_game = pygame.Rect(left, HEIGHT - 42, button_width, 30)
+        self.rect_menu = pygame.Rect(right, HEIGHT - 42, button_width, 30)
         controls = [
             (self.rect_train_toggle,
              "Stop Training" if self.is_training_active else "Continue Training",
@@ -3992,66 +4060,184 @@ class Quoridor:
         pygame.quit()
         sys.exit()
 
+    def _publish_trainer_view(self):
+        """Publish detached display data; only the worker touches models/state."""
+        names = (
+            'state', 'game_over', 'winner', 'games_played', 'teacher_gen',
+            'current_opponent_gen', 'p1_gen_str', 'p2_gen_str',
+            'student_win_rate_str', 'last_loss', 'is_evaluating',
+            'eval_vs_gen', 'eval_game_curr', 'eval_game_total',
+            '_manual_promotion_test_requested', 'match_history',
+            'checkpoint_log', 'opponent_weights', 'toast_msg', 'toast_timer',
+        )
+        snapshot = {name: copy.deepcopy(getattr(self, name)) for name in names}
+        snapshot['opponent_pool'] = [(None, gen) for _, gen in self.opponent_pool]
+        # A separate cache prevents the display evaluation from changing search
+        # caches, and prevents old values surviving an optimizer update.
+        display_bot = copy.copy(self.bot1)
+        display_bot._value_cache = {}
+        snapshot['_display_eval'] = round(
+            display_bot.evaluate(self.state, self.state['turn']), 1)
+        snapshot['_display_lr'] = self.optimizer.param_groups[0]['lr']
+        self._trainer_snapshot = snapshot
+        self.toast_timer = 0
+
+    def _apply_trainer_command(self, command, value=None):
+        if command == 'start':
+            self.mode, self.is_training_active = 'TRAIN', True
+            self.reset_game()
+        elif command == 'menu':
+            self.mode = 'MENU'
+        elif command == 'active':
+            self.is_training_active = value
+            if not value:
+                self.save_checkpoint(manual=True)
+        elif command == 'new':
+            self.reset_game()
+        elif command == 'lr':
+            self._adjust_lr_manually(value)
+        elif command == 'save':
+            self.save_checkpoint(manual=True)
+        elif command == 'snapshot':
+            self.save_manual_student()
+        elif command == 'promotion':
+            self.request_manual_promotion_test()
+
+    def _trainer_work(self):
+        try:
+            self._publish_trainer_view()
+            while not self._trainer_stop.is_set() or not self._trainer_commands.empty():
+                changed = False
+                while not self._trainer_commands.empty():
+                    self._apply_trainer_command(*self._trainer_commands.get_nowait())
+                    changed = True
+                if changed:
+                    self._publish_trainer_view()
+                    changed = False
+                if (not self._trainer_stop.is_set()
+                        and self._trainer_allowed.is_set() and self.mode == 'TRAIN'
+                        and self.is_training_active):
+                    if self.game_over:
+                        self.reset_game()
+                    else:
+                        active_bot = self.bot1 if self.state['turn'] == 1 else self.bot2
+                        state_tensor = encode_state(self.state, self.state['turn'])
+                        pid = self.state['turn']
+                        action, _ = active_bot.get_move_and_eval(
+                            self.state, epsilon=self._training_epsilon(active_bot))
+                        if action:
+                            self.state = active_bot.apply_action(
+                                self.state, pid, action,
+                                is_random=getattr(active_bot, 'was_last_random', False))
+                        else:
+                            self.state['turns_played'] = 200
+                        self._commit_training_action(state_tensor, pid)
+                    changed = True
+                if changed:
+                    self._publish_trainer_view()
+                else:
+                    self._trainer_stop.wait(0.01)
+        except InterruptedError:
+            if not self._trainer_stop.is_set():
+                self._trainer_error = sys.exc_info()[1]
+        except Exception as error:
+            self._trainer_error = error
+
     def run_trainer(self):
+        # Pygame stays on the main thread. One worker preserves the existing
+        # move/update/curriculum sequence; the view only reads published copies.
+        view = copy.copy(self)
+        view._display_eval = 'Pending'
+        view._display_lr = self.optimizer.param_groups[0]['lr']
+        view.opponent_pool = [(None, gen) for _, gen in self.opponent_pool]
+        view.opponent_weights = list(self.opponent_weights)
+        view.checkpoint_log = copy.deepcopy(self.checkpoint_log)
+        view.match_history = copy.deepcopy(self.match_history)
+        view.state = copy.deepcopy(self.state)
+        self._trainer_commands = queue.SimpleQueue()
+        self._trainer_allowed = threading.Event()
+        self._trainer_stop = threading.Event()
+        self._trainer_snapshot = None
+        self._trainer_error = None
+        worker = threading.Thread(target=self._trainer_work, name='quoridor-trainer')
+        worker.start()
+        last_snapshot = None
+
+        def request(command, value=None):
+            self._trainer_commands.put((command, value))
+            view.toast_msg = 'Request queued; finishing current operation'
+            view.toast_timer = 180
+
         clock = pygame.time.Clock()
         running = True
-        while running:
-            mouse_pos = self.get_virtual_mouse_pos()
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
-                elif event.type == pygame.KEYDOWN:
-                    if event.key in (pygame.K_F11, pygame.K_f):
-                        self.toggle_fullscreen()
-                    elif event.key == pygame.K_c:
-                        self.save_checkpoint(manual=True)
-                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    if self.mode == "MENU":
-                        if self.rect_train.collidepoint(mouse_pos):
-                            self.mode, self.is_training_active = "TRAIN", True
-                            self.reset_game()
-                        elif self.rect_save_manual.collidepoint(mouse_pos):
-                            self.save_manual_student()
-                    elif self.mode == "TRAIN":
-                        if self.rect_lr_up.collidepoint(mouse_pos):
-                            self._adjust_lr_manually(10.0)
-                        elif self.rect_lr_down.collidepoint(mouse_pos):
-                            self._adjust_lr_manually(0.1)
-                        elif self.rect_menu.collidepoint(mouse_pos):
-                            self.mode = "MENU"
-                        elif self.rect_new_game.collidepoint(mouse_pos):
-                            self.reset_game()
-                        elif self.rect_test_promotion.collidepoint(mouse_pos):
-                            self.request_manual_promotion_test()
-                        elif self.rect_train_toggle.collidepoint(mouse_pos):
-                            self.is_training_active = not self.is_training_active
-                            if not self.is_training_active:
-                                self.save_checkpoint(manual=True)
+        try:
+            while running or worker.is_alive():
+                snapshot = self._trainer_snapshot
+                if snapshot is not None and snapshot is not last_snapshot:
+                    # Mode/pause belong to the UI so an older snapshot cannot undo
+                    # a click while a move or frozen evaluation is finishing.
+                    view.__dict__.update(snapshot)
+                    last_snapshot = snapshot
+                if self._trainer_error is not None:
+                    self._trainer_allowed.clear()
+                    view.is_training_active = False
+                    view.toast_msg = f'Training stopped: {self._trainer_error}'
+                    view.toast_timer = 180
+                mouse_pos = view.get_virtual_mouse_pos()
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        running = False
+                        self._trainer_stop.set()
+                        self._trainer_allowed.set()
+                        view.toast_msg = 'Closing after the current operation finishes'
+                        view.toast_timer = 180
+                    elif not running:
+                        continue
+                    elif event.type == pygame.KEYDOWN:
+                        if event.key in (pygame.K_F11, pygame.K_f):
+                            view.toggle_fullscreen()
+                        elif event.key == pygame.K_c:
+                            request('save')
+                    elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                        if view.mode == "MENU":
+                            if view.rect_train.collidepoint(mouse_pos):
+                                view.mode, view.is_training_active = "TRAIN", True
+                                request('start')
+                                self._trainer_allowed.set()
+                            elif view.rect_save_manual.collidepoint(mouse_pos):
+                                request('snapshot')
+                        elif view.mode == "TRAIN":
+                            if view.rect_lr_up.collidepoint(mouse_pos):
+                                request('lr', 10.0)
+                            elif view.rect_lr_down.collidepoint(mouse_pos):
+                                request('lr', 0.1)
+                            elif view.rect_menu.collidepoint(mouse_pos):
+                                view.mode = "MENU"
+                                self._trainer_allowed.clear()
+                                request('menu')
+                            elif view.rect_new_game.collidepoint(mouse_pos):
+                                request('new')
+                            elif view.rect_test_promotion.collidepoint(mouse_pos):
+                                request('promotion')
+                                view._manual_promotion_test_requested = True
+                            elif view.rect_train_toggle.collidepoint(mouse_pos):
+                                view.is_training_active = not view.is_training_active
+                                request('active', view.is_training_active)
+                                if view.is_training_active:
+                                    self._trainer_allowed.set()
+                                else:
+                                    self._trainer_allowed.clear()
 
-            if self.mode == "TRAIN" and self.is_training_active and not self.is_evaluating:
-                if self.game_over:
-                    self.reset_game()
+                if view.mode == "MENU":
+                    view.draw_menu()
                 else:
-                    active_bot = self.bot1 if self.state['turn'] == 1 else self.bot2
-                    state_tensor = encode_state(self.state, self.state['turn'])
-                    pid = self.state['turn']
-                    epsilon = self._training_epsilon(active_bot)
-                    action, _ = active_bot.get_move_and_eval(self.state, epsilon=epsilon)
-                    if action:
-                        self.state = active_bot.apply_action(
-                            self.state, pid, action,
-                            is_random=getattr(active_bot, 'was_last_random', False)
-                        )
-                    else:
-                        self.state['turns_played'] = 200
-                    self._commit_training_action(state_tensor, pid)
-
-            if self.mode == "MENU":
-                self.draw_menu()
-            else:
-                self.draw_board()
-            clock.tick(1000)
-        pygame.quit()
+                    view.draw_board()
+                clock.tick(60)
+        finally:
+            self._trainer_stop.set()
+            self._trainer_allowed.set()
+            worker.join()
+            pygame.quit()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
