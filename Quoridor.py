@@ -25,7 +25,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 BOARD_SIZE = 9
-STATE_CHANNELS = 8
+STATE_CHANNELS = 9
 STATE_SHAPE = (STATE_CHANNELS, BOARD_SIZE, BOARD_SIZE)
 VALUE_WIDTH = 1
 POLICY_SIZE = 81 + 64 + 64
@@ -60,7 +60,7 @@ ACTIVE_CHECKPOINT_FILES = (
 )
 REPLAY_FORMAT_VERSION = 1  # Whole accepted games, partitioned by teacher.
 CURRENT_ENCODER_SPEC = {
-    "id": "relative_8ch_path_v1",
+    "id": "relative_9ch_path_moves_v2",
     "shape": [STATE_CHANNELS, BOARD_SIZE, BOARD_SIZE],
     "dtype": "float32",
     "perspective": "active_player_rotated_180_for_player_2",
@@ -73,6 +73,7 @@ CURRENT_ENCODER_SPEC = {
         "opponent_walls_remaining_div_10",
         "active_player_shortest_path_div_81",
         "opponent_shortest_path_div_81",
+        "total_moves_played_div_200",
     ],
 }
 
@@ -85,13 +86,13 @@ def mirror_state_batch(states):
     return mirrored
 
 
-def validate_state_tensor(tensor, name="state"):
-    """Enforce the unbatched neural-state contract: float32 [8, 9, 9]."""
+def validate_state_tensor(tensor, name="state", shape=STATE_SHAPE):
+    """Enforce the unbatched neural-state shape, dtype, and finiteness."""
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
-    if tuple(tensor.shape) != STATE_SHAPE:
+    if tuple(tensor.shape) != shape:
         raise ValueError(
-            f"{name} must have shape {STATE_SHAPE}, got {tuple(tensor.shape)}"
+            f"{name} must have shape {shape}, got {tuple(tensor.shape)}"
         )
     if tensor.dtype != torch.float32:
         raise TypeError(f"{name} must have dtype torch.float32, got {tensor.dtype}")
@@ -101,7 +102,7 @@ def validate_state_tensor(tensor, name="state"):
 
 
 def make_state_batch(state_tensors, device, name="states"):
-    """Create one contiguous float32 [B, 8, 9, 9] batch on model device."""
+    """Create one contiguous current-encoder batch on model device."""
     if not state_tensors:
         raise ValueError(f"{name} cannot be empty")
     for index, tensor in enumerate(state_tensors):
@@ -142,9 +143,8 @@ def model_device(model):
 
 
 def predict_value_scalar(model, state_tensor, name="state"):
-    """Evaluate exactly one [8, 9, 9] state and return its one scalar value."""
-    device = model_device(model)
-    state_batch = make_state_batch([state_tensor], device=device, name=name)
+    """Evaluate one model-encoded state and return its scalar value."""
+    state_batch = make_model_state_batch(model, [state_tensor], name=name)
     with torch.no_grad():
         output = model(state_batch)
     if tuple(output.shape) != (1, VALUE_WIDTH):
@@ -158,13 +158,14 @@ def predict_value_scalar(model, state_tensor, name="state"):
 
 
 def validate_model_contract(model, name="value model"):
-    """Smoke-test the complete [B, 8, 9, 9] -> [B, 1] contract."""
+    """Smoke-test the model's input shape and [B, 1] value contract."""
     device = model_device(model)
     was_training = model.training
     try:
         model.eval()
-        samples = [torch.zeros(STATE_SHAPE, dtype=torch.float32) for _ in range(3)]
-        batch = make_state_batch(samples, device=device, name=f"{name} smoke states")
+        shape = tuple(getattr(model, 'input_shape', STATE_SHAPE))
+        samples = [torch.zeros(shape, dtype=torch.float32) for _ in range(3)]
+        batch = make_model_state_batch(model, samples, name=f"{name} smoke states")
         with torch.no_grad():
             output = model(batch)
         expected = (3, VALUE_WIDTH)
@@ -239,12 +240,13 @@ class SpatialQuoriNetV2(nn.Module):
     def __init__(self, in_channels=STATE_CHANNELS):
         # Channels: P1 pos, P2 pos, H-wall, V-wall, P1 walls-left, P2 walls-left, P1 path-dist, P2 path-dist
         super().__init__()
-        if in_channels != STATE_CHANNELS:
+        if in_channels not in (8, STATE_CHANNELS):
             raise ValueError(
                 f"SpatialQuoriNetV2 requires {STATE_CHANNELS} input channels, "
                 f"got {in_channels}"
             )
         self.in_channels = in_channels
+        self.input_shape = (in_channels, BOARD_SIZE, BOARD_SIZE)
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
             nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
@@ -321,9 +323,10 @@ class PolicyValueQuoriNet(nn.Module):
 
     def __init__(self, in_channels=STATE_CHANNELS):
         super().__init__()
-        if in_channels != STATE_CHANNELS:
+        if in_channels not in (8, STATE_CHANNELS):
             raise ValueError(f"network requires {STATE_CHANNELS} input channels")
         self.in_channels = in_channels
+        self.input_shape = (in_channels, BOARD_SIZE, BOARD_SIZE)
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, 64, 3, padding=1, bias=False),
             nn.BatchNorm2d(64), nn.ReLU(),
@@ -342,8 +345,8 @@ class PolicyValueQuoriNet(nn.Module):
     def _features(self, states):
         if not isinstance(states, torch.Tensor):
             raise TypeError("network input must be a torch.Tensor")
-        if states.ndim != 4 or tuple(states.shape[1:]) != STATE_SHAPE or states.shape[0] < 1:
-            raise ValueError(f"network input must have shape [B, {STATE_SHAPE}] with B >= 1")
+        if states.ndim != 4 or tuple(states.shape[1:]) != self.input_shape or states.shape[0] < 1:
+            raise ValueError(f"network input must have shape [B, {self.input_shape}] with B >= 1")
         if states.dtype != torch.float32:
             raise TypeError("network input must have dtype torch.float32")
         return self.conv(states)
@@ -361,11 +364,12 @@ class PolicyValueQuoriNet(nn.Module):
 
 
 def network_from_weights(weights):
+    in_channels = weights['conv.0.weight'].shape[1]
     if 'policy_features.0.weight' in weights:
-        return PolicyValueQuoriNet()
+        return PolicyValueQuoriNet(in_channels)
     if 'policy_head.weight' in weights:
-        return LegacyPolicyValueQuoriNet()
-    return SpatialQuoriNetV2()
+        return LegacyPolicyValueQuoriNet(in_channels)
+    return SpatialQuoriNetV2(in_channels)
 
 
 def policy_action_index(action, pid):
@@ -505,7 +509,7 @@ def encode_relative_8ch_path_v1(state, active_pid):
     if active_pid not in (1, 2):
         raise ValueError(f"active_pid must be 1 or 2, got {active_pid}")
     # 8 Channels exactly as specified
-    tensor = torch.zeros(STATE_SHAPE, dtype=torch.float32)
+    tensor = torch.zeros((8, BOARD_SIZE, BOARD_SIZE), dtype=torch.float32)
     
     my_pos = state['p1_pos'] if active_pid == 1 else state['p2_pos']
     opp_pos = state['p2_pos'] if active_pid == 1 else state['p1_pos']
@@ -535,11 +539,19 @@ def encode_relative_8ch_path_v1(state, active_pid):
     tensor[6, :, :] = my_dist / 81.0
     tensor[7, :, :] = opp_dist / 81.0
     
+    return validate_state_tensor(tensor, "encoded state", shape=(8, BOARD_SIZE, BOARD_SIZE))
+
+
+def encode_relative_9ch_path_moves_v2(state, active_pid):
+    tensor = torch.cat((encode_relative_8ch_path_v1(state, active_pid),
+                        torch.full((1, BOARD_SIZE, BOARD_SIZE),
+                                   state.get('turns_played', 0) / 200.0,
+                                   dtype=torch.float32)))
     return validate_state_tensor(tensor, "encoded state")
 
 
 def encode_state(state, active_pid):
-    return encode_relative_8ch_path_v1(state, active_pid)
+    return encode_relative_9ch_path_moves_v2(state, active_pid)
 
 
 def encode_model_state_batch(model, states, active_pids):
@@ -578,8 +590,9 @@ def encode_model_state_batch(model, states, active_pids):
             state[f'p{opponent}_walls'] / 10.0,
             get_shortest_path_dist(state, pid) / 81.0,
             get_shortest_path_dist(state, opponent) / 81.0,
+            state.get('turns_played', 0) / 200.0,
         ])
-    constant_batch = torch.tensor(constants, dtype=torch.float32).view(-1, 4, 1, 1)
+    constant_batch = torch.tensor(constants, dtype=torch.float32).view(-1, 5, 1, 1)
     if not torch.isfinite(constant_batch).all().item():
         raise ValueError("encoded states contain NaN or infinite values")
     batch = torch.zeros((len(states), *STATE_SHAPE), dtype=torch.float32)
@@ -602,13 +615,19 @@ def _cpu_state_dict(state_dict):
     }
 
 
-def _encoder_implementation_source():
-    return textwrap.dedent(inspect.getsource(encode_relative_8ch_path_v1))
+def _encoder_implementation_source(channels=STATE_CHANNELS):
+    source = textwrap.dedent(inspect.getsource(encode_relative_8ch_path_v1))
+    if channels == 9:
+        source += '\n' + textwrap.dedent(inspect.getsource(encode_relative_9ch_path_moves_v2))
+    return source
 
 
-def _current_encoder_spec():
+def _current_encoder_spec(channels=STATE_CHANNELS):
     spec = copy.deepcopy(CURRENT_ENCODER_SPEC)
-    source = _encoder_implementation_source()
+    if channels == 8:
+        spec.update(id="relative_8ch_path_v1", shape=[8, BOARD_SIZE, BOARD_SIZE])
+        spec['channels'] = spec['channels'][:8]
+    source = _encoder_implementation_source(channels)
     spec["implementation_source"] = source
     spec["implementation_sha256"] = hashlib.sha256(
         source.encode("utf-8")
@@ -653,7 +672,7 @@ def _model_state_dict(model):
 def capture_model_architecture(model):
     """Return a weight-independent, self-contained inference definition."""
     state_schema = _state_dict_schema(model.state_dict())
-    encoder_spec = _current_encoder_spec()
+    encoder_spec = _current_encoder_spec(getattr(model, 'in_channels', STATE_CHANNELS))
     template = copy.deepcopy(model).cpu().eval()
     sample = torch.zeros(
         (1, *encoder_spec["shape"]), dtype=torch.float32
@@ -734,15 +753,18 @@ class ArchivedValueNet(nn.Module):
             raise ValueError("archived input encoder has no preserved implementation")
         self._uses_current_encoder = source == _encoder_implementation_source()
         namespace = dict(globals())
+        # Old encoder sources refer to these globals; keep their saved contract.
+        namespace.update(STATE_SHAPE=self.input_shape, STATE_CHANNELS=self.input_shape[0])
+        namespace['validate_state_tensor'] = lambda tensor, name="state", shape=self.input_shape: validate_state_tensor(tensor, name, shape)
         exec(source, namespace)
-        self._archived_encoder = namespace["encode_relative_8ch_path_v1"]
+        self._archived_encoder = namespace['encode_' + self.encoder_spec['id']]
 
     def archived_state_dict(self):
         return _cpu_state_dict(self._archived_weights)
 
     def encode_game_state(self, state, active_pid):
         encoder_id = self.encoder_spec.get("id")
-        if encoder_id == "relative_8ch_path_v1":
+        if encoder_id in ("relative_8ch_path_v1", "relative_9ch_path_moves_v2"):
             return self._archived_encoder(state, active_pid)
         raise ValueError(f"unsupported archived input encoder: {encoder_id}")
 
@@ -758,7 +780,11 @@ class ArchivedValueNet(nn.Module):
 
 def encode_state_for_model(model, state, active_pid):
     encoder = getattr(model, "encode_game_state", None)
-    return encoder(state, active_pid) if encoder else encode_state(state, active_pid)
+    if encoder:
+        return encoder(state, active_pid)
+    if tuple(getattr(model, 'input_shape', STATE_SHAPE)) == (8, BOARD_SIZE, BOARD_SIZE):
+        return encode_relative_8ch_path_v1(state, active_pid)
+    return encode_state(state, active_pid)
 
 
 def make_model_state_batch(model, state_tensors, name="states"):
@@ -1124,6 +1150,7 @@ class QuoridorBot:
                 state_key,
                 state['p1_walls'],
                 state['p2_walls'],
+                state.get('turns_played', 0),
                 active_pid
             )
             sign = 1.0 if active_pid == eval_pid else -1.0
