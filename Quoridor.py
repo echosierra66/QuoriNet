@@ -296,13 +296,16 @@ class LegacyPolicyValueQuoriNet(SpatialQuoriNetV2):
         nn.init.zeros_(self.policy_head.weight)
         nn.init.zeros_(self.policy_head.bias)
 
-    def policy_value(self, states):
+    def policy_value(self, states, return_value_logits=False):
         features = self.conv(states)
         spatial = self.policy_head(features)
         logits = torch.cat((spatial[:, 0].flatten(1),
                             spatial[:, 1, :8, :8].flatten(1),
                             spatial[:, 2, :8, :8].flatten(1)), dim=1)
-        return logits, self.value_head(self.pool(features).flatten(1))
+        pooled = self.pool(features).flatten(1)
+        value = (self.value_head[:-1](pooled) if return_value_logits
+                 else self.value_head(pooled))
+        return logits, value
 
 
 class ResidualBlock(nn.Module):
@@ -354,13 +357,15 @@ class PolicyValueQuoriNet(nn.Module):
     def forward(self, states):
         return self.value_head(self._features(states))
 
-    def policy_value(self, states):
+    def policy_value(self, states, return_value_logits=False):
         features = self._features(states)
         spatial = self.policy_head(self.policy_features(features))
         logits = torch.cat((spatial[:, 0].flatten(1),
                             spatial[:, 1, :8, :8].flatten(1),
                             spatial[:, 2, :8, :8].flatten(1)), dim=1)
-        return logits, self.value_head(features)
+        value = (self.value_head[:-1](features) if return_value_logits
+                 else self.value_head(features))
+        return logits, value
 
 
 def network_from_weights(weights):
@@ -869,7 +874,7 @@ class QuoridorBot:
         return action
 
     def mcts_move(self, state, epsilon=0.0):
-        """Rollout-free PUCT; each node stores value for its side to move."""
+        """PUCT with root UCT exploration; values use each node's side to move."""
         predictions = {}  # Only this search: weights may change before the next.
 
         def node(position, prior=1.0, parent=None, action=None):
@@ -947,7 +952,11 @@ class QuoridorBot:
                 scale = math.sqrt(max(1, current['n']))
                 current = max(current['children'].values(), key=lambda child:
                     (-child['w'] / child['n'] if child['n'] else 0.0)
-                    + 1.5 * child['prior'] * scale / (1 + child['n']))
+                    + 1.5 * child['prior'] * scale / (1 + child['n'])
+                    # At the root, explore independently of the policy too:
+                    # softmax underflow must not make alternatives invisible.
+                    + (0.5 * math.sqrt(math.log1p(current['n']) / (1 + child['n']))
+                       if current is root else 0.0))
                 path.append(current)
             value = expand(current)
             for visited in reversed(path):
@@ -996,6 +1005,37 @@ class QuoridorBot:
 
     def get_adjacent(self, state, c, r):
         return get_adjacent_global(state, c, r)
+
+    def get_shortest_move_dist(self, state, pid):
+        """Shortest legal pawn route with the opponent at its current square.
+
+        Includes straight/side jumps. This is a position-local race estimate;
+        future opponent moves and future wall placements can change the route.
+        """
+        position_key = f'p{pid}_pos'
+        start = state[position_key]
+        target_row = self.get_target_row(pid)
+        pending = deque([(start, 0)])
+        seen = {start}
+        position = dict(state)
+        while pending:
+            square, distance = pending.popleft()
+            if square[1] == target_row:
+                return distance
+            position[position_key] = square
+            for move in self.get_valid_moves(position, pid):
+                if move not in seen:
+                    seen.add(move)
+                    pending.append((move, distance + 1))
+        return 999
+
+    def race_arrival_gap(self, state):
+        """Positive means P1 arrives first; equal distances favor side to move."""
+        arrivals = []
+        for pid in (1, 2):
+            distance = self.get_shortest_move_dist(state, pid)
+            arrivals.append(max(0, 2 * distance - int(state['turn'] == pid)))
+        return arrivals[1] - arrivals[0]
 
     def get_valid_moves(self, state, pid):
         pos = state['p1_pos'] if pid == 1 else state['p2_pos']
@@ -1331,10 +1371,11 @@ class Quoridor:
 
         # Fresh positions get exactly one pass; replay never adds extra batches.
         self.REPLAY_GAMES_PER_TEACHER = 100
-        self.REPLAY_BATCH_SIZE = 128
-        self.GENERAL_REPLAY_SLOTS = 38
-        self.TACTICAL_LEAD_PLIES = 8
-        self.TACTICAL_MIN_LEAD_PLIES = 4
+        self.REPLAY_BATCH_SIZE = 256
+        self.GENERAL_REPLAY_SLOTS = 76
+        self.TACTICAL_LEAD_PLIES = 6
+        self.TACTICAL_MIN_LEAD_PLIES = 2
+        self.TACTICAL_MAINTAINED_PLIES = 4
         self.TACTICAL_LOSS_WEIGHT = 3.0
         if train_updates is not None:
             warnings.warn('train_updates is ignored: every fresh position receives one pass.')
@@ -1375,7 +1416,7 @@ class Quoridor:
         # this mixed-opponent history.
         self.student_eval_history = deque(maxlen=100)
         self.latest_teacher_history = deque(maxlen=self.LATEST_TEACHER_LOG_WINDOW)
-        self.student_win_rate_str = "Pending live WR"
+        self.student_win_rate_str = "Pending greedy WR"
         self.student_id = 2
 
         self.p1_gen_str = "Gen #1"
@@ -1404,6 +1445,8 @@ class Quoridor:
         self.lr_last_reduced_at_gen = 0  # legacy metadata compatibility
         self.current_opponent_gen = 1
         self.current_opponent_is_latest = True
+        self.latest_games_by_seat = [0, 0]
+        self.game_has_exploration = False
         self.rematch_teacher_gen = None
         self.curriculum_latest_credit = 1.0
 
@@ -2178,35 +2221,48 @@ class Quoridor:
         support_weights = [self.opponent_weights[i] for i in support_indices]
         return random.choices(support_pool, weights=support_weights, k=1)[0]
 
-    def _tactical_replay_indices(self, winner_id):
-        """Find the final lasting race advantage, then tag only its lead-up.
+    def _tactical_replay_indices(self):
+        """Tag 2-6 lead-up plies around advantages maintained for 4+ plies.
 
-        Goal-arrival plies are 2 * distance - 1 for the side to move and
-        2 * distance for the other side. A positive loser-minus-winner gap
-        includes a one-ply edge without oscillating as both pawns advance.
-        This is a retrospective path heuristic, not a forced-win claim.
+        A one-ply edge is a tempo lead, not a draw. Distinguish it from an
+        extra-move lead so equalizations, reversals and new material leads
+        count. Neither player has to retain the new advantage until victory.
         """
-        if winner_id not in (1, 2) or not self.episode_trajectory:
-            return set()
-        positions = [(entry[0], entry[1]) for entry in self.episode_trajectory]
-        positions.append(self.episode_trajectory[-1][2:4])
-        advantages = []
-        for state, active_pid in positions:
-            active_distance = round(float(state[6, 0, 0]) * 81)
-            other_distance = round(float(state[7, 0, 0]) * 81)
-            active_arrival = max(0, 2 * active_distance - 1)
-            other_arrival = 2 * other_distance
-            gap = other_arrival - active_arrival
-            advantages.append(gap > 0 if active_pid == winner_id else gap < 0)
-        if not advantages[-1]:
-            return set()
-        onset = len(advantages) - 1
-        while onset > 0 and advantages[onset - 1]:
-            onset -= 1
-        # No observed onset, fewer than four lead plies, or terminal-only edge.
-        if onset < self.TACTICAL_MIN_LEAD_PLIES or onset >= len(self.episode_trajectory):
-            return set()
-        return set(range(max(0, onset - self.TACTICAL_LEAD_PLIES), onset))
+        tactical = set()
+        bands = []
+        bot = QuoridorBot()
+        # Pre-move states exclude the terminal goal-arrival event itself.
+        for encoded, active_pid, _, _ in self.episode_trajectory:
+            # Reconstruct in encoder coordinates: active player is P1, aiming
+            # at row 0. Keep the saved encoder/NN contract unchanged.
+            pawns = [encoded[channel].nonzero()[0].tolist() for channel in (0, 1)]
+            position = {
+                'p1_pos': tuple(reversed(pawns[0])),
+                'p2_pos': tuple(reversed(pawns[1])),
+                'walls_h': {tuple(reversed(rc)) for rc in encoded[2].nonzero().tolist()},
+                'walls_v': {tuple(reversed(rc)) for rc in encoded[3].nonzero().tolist()},
+                'turn': 1,
+            }
+            gap = bot.race_arrival_gap(position) * (1 if active_pid == 1 else -1)
+            bands.append((1 if gap > 0 else -1 if gap < 0 else 0) * min(abs(gap), 2))
+
+        start = 0
+        for end in range(1, len(bands) + 1):
+            if end < len(bands) and bands[end] == bands[start]:
+                continue
+            if bands[start] and end - start >= self.TACTICAL_MAINTAINED_PLIES:
+                # Credit the setup BEFORE the maintained lead, not its duration.
+                events = [start]
+                if end < len(bands) and (
+                        bands[end] * bands[start] <= 0
+                        or abs(bands[end]) < abs(bands[start])):
+                    # Also credit undoing that lead, even if the comeback is brief.
+                    events.append(end)
+                for onset in events:
+                    if onset >= self.TACTICAL_MIN_LEAD_PLIES:
+                        tactical.update(range(max(0, onset - self.TACTICAL_LEAD_PLIES), onset))
+            start = end
+        return tactical
 
     def _training_batches(self, fresh, opponent_gen):
         """Uniform position draws, with no replacement across either replay draw."""
@@ -2240,7 +2296,7 @@ class Quoridor:
             yield batch, counts
 
     def _optimize_student_batch(self, batch):
-        """Run one checked, normalized, weighted MSE update."""
+        """Train outcomes from raw logits so wrong saturated values can recover."""
         if not batch:
             return False
         self.student_net.train()
@@ -2257,12 +2313,17 @@ class Quoridor:
             states[reflect] = mirror_state_batch(states[reflect])
             self.optimizer.zero_grad(set_to_none=True)
             has_policy = getattr(self.student_net, 'supports_policy', False)
+            value_loss_fn = self.loss_fn
             if has_policy:
-                logits, predictions = self.student_net.policy_value(states)
+                logits, predictions = self.student_net.policy_value(states, return_value_logits=True)
+                # (tanh(z) + 1) / 2 == sigmoid(2z). Working in logit space
+                # avoids a zero tanh derivative for confidently wrong values.
+                value_loss_fn = lambda raw, target: nn.functional.binary_cross_entropy_with_logits(
+                    2 * raw, (target + 1) / 2, reduction='none')
             else:
                 predictions = self.student_net(states)
-            loss = checked_value_loss(self.loss_fn, predictions, targets,
-                                      name="student weighted MSE", sample_weights=weights)
+            loss = checked_value_loss(value_loss_fn, predictions, targets,
+                                      name="student weighted outcome loss", sample_weights=weights)
             policy_rows = [i for i, sample in enumerate(batch)
                            if sample.get('policy') is not None]
             if has_policy and policy_rows:
@@ -2278,7 +2339,7 @@ class Quoridor:
                 if not torch.isfinite(loss):
                     raise FloatingPointError('non-finite joint policy/value loss')
             with torch.no_grad():
-                weighted_errors = weights * self.loss_fn(predictions, targets)
+                weighted_errors = weights * value_loss_fn(predictions, targets)
                 total_error = weighted_errors.sum().item()
                 tactical_error = weighted_errors[weights > 1].sum().item()
                 self._last_tactical_loss_share = (
@@ -2323,6 +2384,7 @@ class Quoridor:
         return True
 
     def _reset_lr_search_for_new_teacher(self):
+        self.latest_games_by_seat = [0, 0]
         self.latest_teacher_games_seen = 0
         self.lr_training_games_seen = 0
         self.lr_metric_history.clear()
@@ -2551,7 +2613,7 @@ class Quoridor:
         print(f"Red Player (P1):  {self.p1_gen_str}")
         print(f"Blue Player (P2): {self.p2_gen_str}")
         print(f"Latest Teacher:   Gen #{self.teacher_gen}")
-        print(f"Walls: all legal | LR: inertia ({self.lr_inertia['status']})")
+        print("Walls: all legal | LR: manual")
         print(f"Optimizer steps: {self.optimizer_steps}")
         print(f"Studt Win Rate:  {self.student_win_rate_str}")
         print(f"Training WRs:    {self._format_training_win_rates()}")
@@ -2593,6 +2655,7 @@ class Quoridor:
         self.episode_trajectory = []
         self.episode_policies = []
         self._pending_search_policy = None
+        self.game_has_exploration = False
 
         if getattr(self, 'mode', 'MENU') == 'TRAIN':
             if hasattr(self, 'opponent_pool') and self.opponent_pool:
@@ -2614,6 +2677,10 @@ class Quoridor:
                 self.bot2 = QuoridorBot(bot_id=2, max_depth=self.train_depth, nn_model=pool_opponent, heuristic_weight=self.heuristic_weight)
                 self.student_id = 1
                 self.p1_gen_str, self.p2_gen_str = f"Gen #{self.teacher_gen + 1} (Student)", f"Gen #{pool_gen} (Teacher)"
+            # Alternate within each seat so greedy WR includes both sides.
+            self.game_has_exploration = (
+                self.current_opponent_is_latest
+                and self.latest_games_by_seat[self.student_id - 1] % 2 == 1)
         else:
             self.bot1 = QuoridorBot(bot_id=1, max_depth=self.play_depth, nn_model=self.teacher_net, heuristic_weight=self.heuristic_weight)
             self.bot2 = QuoridorBot(bot_id=2, max_depth=self.play_depth, nn_model=self.teacher_net, heuristic_weight=self.heuristic_weight)
@@ -3018,7 +3085,7 @@ class Quoridor:
                         wins = sum(latest_log)
                         games = len(latest_log)
                         self.student_win_rate_str = (
-                            f"{wins / games * 100:.1f}% Latest ({wins}/{games})"
+                            f"{wins / games * 100:.1f}% Greedy ({wins}/{games})"
                         )
                     elif self.student_eval_history:
                         wins = sum(self.student_eval_history)
@@ -3032,6 +3099,8 @@ class Quoridor:
         self._restore_lr_inertia(
             bundle['meta'].get('lr_inertia')
             if bundle is not None and student_matches_current else None)
+        self._restore_game_sampling(
+            meta if bundle is not None or os.path.exists(meta_path) else {})
 
         if bundle is not None and not student_matches_current:
             self._reset_student_training_progress()
@@ -3074,7 +3143,7 @@ class Quoridor:
         self.escalation_state.clear()
         self.wawr_history.clear()
         self.match_history.clear()
-        self.student_win_rate_str = "Pending live WR"
+        self.student_win_rate_str = "Pending greedy WR"
         self.rematch_teacher_gen = None
         self.curriculum_latest_credit = 1.0
         self.lr_last_reduced_at_gen = 0
@@ -3099,6 +3168,8 @@ class Quoridor:
     def _checkpoint_metadata(self):
         return {
                 'games_played': self.games_played,
+                'greedy_wr_version': 1,
+                'latest_games_by_seat': list(self.latest_games_by_seat),
                 'teacher_gen': self.teacher_gen,
                 'rematch_teacher_gen': self.rematch_teacher_gen,
                 'heuristic_weight': self.heuristic_weight,
@@ -3331,7 +3402,7 @@ class Quoridor:
                 latest_wins = sum(latest_log)
                 latest_games = len(latest_log)
                 self.student_win_rate_str = (
-                    f"{latest_wins / latest_games * 100:.1f}% Latest "
+                    f"{latest_wins / latest_games * 100:.1f}% Greedy "
                     f"({latest_wins}/{latest_games})"
                 )
             self._refresh_opponent_weights()
@@ -3369,7 +3440,7 @@ class Quoridor:
         self._sync_model_archives()
         self.update_opponent_pool()
         self.student_eval_history.clear()
-        self.student_win_rate_str = "Pending live WR"
+        self.student_win_rate_str = "Pending greedy WR"
         self.save_checkpoint(manual=True)
 
     def train_step(self, state_tensor, turn_pid, next_state_tensor, next_turn_pid, done, winner_id):
@@ -3410,7 +3481,7 @@ class Quoridor:
             self.episode_policies.clear()
             return
 
-        tactical = self._tactical_replay_indices(winner_id)
+        tactical = self._tactical_replay_indices()
         game_id = self.next_replay_game_id
         student_outcome = 1 if winner_id == self.student_id else -1
         fresh = [
@@ -3743,6 +3814,8 @@ class Quoridor:
 
             if self.mode == "TRAIN":
                 self.games_played += 1
+                if self.current_opponent_is_latest:
+                    self.latest_games_by_seat[self.student_id - 1] += 1
 
                 if winner_id == 0:
                     # A cutoff has no outcome for learning or win-rate gates.
@@ -3752,7 +3825,7 @@ class Quoridor:
                     return
 
                 student_won = 1 if winner_id == self.student_id else 0
-                self.student_eval_history.append(student_won)
+                count_for_wr = not self.game_has_exploration
 
                 gen = self.current_opponent_gen
                 if not student_won:
@@ -3761,14 +3834,16 @@ class Quoridor:
                     self.rematch_teacher_gen = None
                 if self.rematch_teacher_gen is not None:
                     print(f"Rematch Gen #{self.rematch_teacher_gen} until the student wins.")
-                if gen not in self.checkpoint_log:
-                    self.checkpoint_log[gen] = deque(maxlen=self.LOG_WINDOW_SIZE)
-                self.checkpoint_log[gen].append(student_won)
-                self.lr_training_games_seen += 1
+                if count_for_wr:
+                    self.student_eval_history.append(student_won)
+                    if gen not in self.checkpoint_log:
+                        self.checkpoint_log[gen] = deque(maxlen=self.LOG_WINDOW_SIZE)
+                    self.checkpoint_log[gen].append(student_won)
+                    self.lr_training_games_seen += 1
 
-                if self.current_opponent_is_latest:
-                    self.latest_teacher_history.append(student_won)
-                    self.latest_teacher_games_seen += 1
+                    if self.current_opponent_is_latest:
+                        self.latest_teacher_history.append(student_won)
+                        self.latest_teacher_games_seen += 1
 
                 # Keep the displayed and next-game sampling weights current
                 # after every result, including historical opponents.
@@ -3779,17 +3854,16 @@ class Quoridor:
                     latest_wins = sum(latest_log)
                     latest_games = len(latest_log)
                     self.student_win_rate_str = (
-                        f"{latest_wins / latest_games * 100:.1f}% Latest "
+                        f"{latest_wins / latest_games * 100:.1f}% Greedy "
                         f"({latest_wins}/{latest_games})"
                     )
 
-                self._record_lr_result(winner_id)
-                if not self._reduce_lr_on_stagnation():
-                    self._tune_learning_rate_from_pool(force=False)
+                if not count_for_wr:
+                    print('Exploratory game: trained; excluded from WR.')
                 print(f"Learning: {self.optimizer_steps - self._game_start_optimizer_steps} "
                       f"steps this game / {self.optimizer_steps} total | "
                       f"LR={self.optimizer.param_groups[0]['lr']:.8f} "
-                      f"({self.lr_inertia['status']}) | walls=all legal | "
+                      f"(manual) | walls=all legal | "
                       f"replay samples latest/historic="
                       f"{self.replay_samples_latest}/{self.replay_samples_historic}")
                 print(f"Current training WRs: {self._format_training_win_rates()}")
@@ -3797,7 +3871,7 @@ class Quoridor:
 
                 manual_test = self._manual_promotion_test_requested
                 if self.rematch_teacher_gen is None and (
-                    manual_test or self._all_training_gates_met()
+                    manual_test or (count_for_wr and self._all_training_gates_met())
                 ):
                     self._manual_promotion_test_requested = False
                     if manual_test:
@@ -4030,9 +4104,27 @@ class Quoridor:
         print("Production student, optimizer, replay, and checkpoints were not modified.")
         return passed
 
+    def _restore_game_sampling(self, meta):
+        if meta.get('greedy_wr_version') == 1:
+            counts = meta.get('latest_games_by_seat', [0, 0])
+            if (not isinstance(counts, list) or len(counts) != 2
+                    or any(type(n) is not int or n < 0 for n in counts)):
+                raise ValueError('invalid latest-teacher game counts by seat')
+            self.latest_games_by_seat = list(counts)
+            return
+        # Old WR histories do not identify exploratory games. Start clean
+        # metrics while preserving the model, optimizer and replay.
+        self.student_eval_history.clear()
+        self.latest_teacher_history.clear()
+        self.checkpoint_log.clear()
+        self.escalation_state.clear()
+        self.wawr_history.clear()
+        self.student_win_rate_str = 'Pending greedy WR'
+        self._reset_lr_search_for_new_teacher()
+
     def _training_epsilon(self, active_bot):
         is_teacher = (active_bot.nn_model is not self.student_net)
-        if not self.current_opponent_is_latest or is_teacher:
+        if not self.game_has_exploration or not self.current_opponent_is_latest or is_teacher:
             return 0.0
         return 0.30 * (0.85 ** self.state['turns_played'])
 
