@@ -27,6 +27,8 @@ import torch.optim as optim
 BOARD_SIZE = 9
 STATE_CHANNELS = 9
 STATE_SHAPE = (STATE_CHANNELS, BOARD_SIZE, BOARD_SIZE)
+HISTORY_LENGTH = 8
+HISTORY_CHANNELS = STATE_CHANNELS * HISTORY_LENGTH
 VALUE_WIDTH = 1
 POLICY_SIZE = 81 + 64 + 64
 MANUAL_WEIGHTS_PATTERN = re.compile(
@@ -47,6 +49,9 @@ ARCHITECTURE_EXECUTABLE = "NN architecture.pt"
 MODEL_ARCHIVE_FORMAT = "quorinet_architecture_archive"
 MODEL_ARCHIVE_VERSION = 1
 TRAINING_STATE_FILE = "quorinet_training_state.pth"
+LADDER_STATE_FILE = "quorinet_ladder_state.pth"
+LADDER_PROGRESS_FILE = "quorinet_ladder_progress.json"
+STARTUP_REPLAY_FILE = "quorinet_replay_once.json"
 STUDENT_WEIGHTS_FILE = "quorinet_student_weights.pth"
 TEACHER_WEIGHTS_FILE = "quorinet_teacher_weights.pth"
 OPTIMIZER_FILE = "quorinet_optimizer.pth"
@@ -58,7 +63,8 @@ ACTIVE_CHECKPOINT_FILES = (
     OPTIMIZER_FILE,
     META_FILE,
 )
-REPLAY_FORMAT_VERSION = 1  # Whole accepted games, partitioned by teacher.
+REPLAY_FORMAT_VERSION = 2  # Contiguous eight-ply replay, partitioned by teacher.
+GREEDY_WR_VERSION = 2  # Full-width MCTS, restored budget and path-based races.
 CURRENT_ENCODER_SPEC = {
     "id": "relative_9ch_path_moves_v2",
     "shape": [STATE_CHANNELS, BOARD_SIZE, BOARD_SIZE],
@@ -81,8 +87,9 @@ CURRENT_ENCODER_SPEC = {
 def mirror_state_batch(states):
     """Reflect columns while preserving the 8x8 wall-anchor geometry."""
     mirrored = states.flip(-1).clone()
-    mirrored[:, 2:4] = 0
-    mirrored[:, 2:4, :8, :8] = states[:, 2:4, :8, :8].flip(-1)
+    for offset in range(0, states.shape[1], 9):
+        mirrored[:, offset + 2:offset + 4] = 0
+        mirrored[:, offset + 2:offset + 4, :8, :8] = states[:, offset + 2:offset + 4, :8, :8].flip(-1)
     return mirrored
 
 
@@ -326,8 +333,8 @@ class PolicyValueQuoriNet(nn.Module):
 
     def __init__(self, in_channels=STATE_CHANNELS):
         super().__init__()
-        if in_channels not in (8, STATE_CHANNELS):
-            raise ValueError(f"network requires {STATE_CHANNELS} input channels")
+        if in_channels not in (8, STATE_CHANNELS, HISTORY_CHANNELS):
+            raise ValueError("network requires 8, 9 or 72 input channels")
         self.in_channels = in_channels
         self.input_shape = (in_channels, BOARD_SIZE, BOARD_SIZE)
         self.conv = nn.Sequential(
@@ -375,6 +382,28 @@ def network_from_weights(weights):
     if 'policy_head.weight' in weights:
         return LegacyPolicyValueQuoriNet(in_channels)
     return SpatialQuoriNetV2(in_channels)
+
+
+def upgrade_history_weights(weights):
+    """Preserve the current-position response; history starts with zero weight."""
+    upgraded = dict(weights)
+    kernel = weights['conv.0.weight']
+    if kernel.shape[1] != STATE_CHANNELS:
+        raise ValueError('history migration requires a 9-channel input')
+    widened = kernel.new_zeros((kernel.shape[0], HISTORY_CHANNELS, *kernel.shape[2:]))
+    widened[:, :STATE_CHANNELS] = kernel
+    upgraded['conv.0.weight'] = widened
+    return upgraded
+
+
+def upgrade_history_optimizer(saved):
+    """Widen only the first convolution's Adam moments, retaining its step/LR."""
+    saved = copy.deepcopy(saved)
+    first = saved['param_groups'][0]['params'][0]
+    for key, buffer in saved['state'].get(first, {}).items():
+        if isinstance(buffer, torch.Tensor) and buffer.ndim == 4:
+            saved['state'][first][key] = upgrade_history_weights({'conv.0.weight': buffer})['conv.0.weight']
+    return saved
 
 
 def policy_action_index(action, pid):
@@ -552,7 +581,81 @@ def encode_relative_9ch_path_moves_v2(state, active_pid):
                         torch.full((1, BOARD_SIZE, BOARD_SIZE),
                                    state.get('turns_played', 0) / 200.0,
                                    dtype=torch.float32)))
-    return validate_state_tensor(tensor, "encoded state")
+    return validate_state_tensor(tensor, "encoded state", shape=(9, BOARD_SIZE, BOARD_SIZE))
+
+
+def encode_relative_72ch_history_v3(state, active_pid):
+    """Current position first, then seven ancestors in the SAME player view."""
+    positions = [state, *reversed(state.get('position_history', ())[-7:])]
+    frames = [encode_relative_9ch_path_moves_v2(position, active_pid) for position in positions]
+    frames.extend(torch.zeros_like(frames[0]) for _ in range(8 - len(frames)))
+    return validate_state_tensor(torch.cat(frames), 'history state', shape=(72, BOARD_SIZE, BOARD_SIZE))
+
+
+def history_replay_games(replay_games):
+    """Upgrade consecutive per-game frames without crossing game boundaries."""
+    upgraded = {}
+    for gen, games in replay_games.items():
+        upgraded[gen] = []
+        for game in games:
+            positions = sorted(game['positions'], key=lambda sample: sample['ply_index'])
+            if [s['ply_index'] for s in positions] != list(range(len(positions))):
+                raise ValueError('history replay migration requires whole consecutive games')
+            converted = []
+            for index, sample in enumerate(positions):
+                frames = []
+                for previous in range(index, max(-1, index - HISTORY_LENGTH), -1):
+                    frame = positions[previous]['state']
+                    validate_state_tensor(frame, 'legacy replay frame')
+                    if (index - previous) % 2:
+                        # Player 2's coordinates are rotated 180 degrees, with
+                        # pawn/wall/path ownership swapped. Walls use 8x8 anchors.
+                        rotated = frame[[1, 0, 2, 3, 5, 4, 7, 6, 8]].flip((-2, -1)).clone()
+                        rotated[2:4] = 0
+                        rotated[2:4, :8, :8] = frame[2:4, :8, :8].flip((-2, -1))
+                        frame = rotated
+                    frames.append(frame)
+                frames.extend(torch.zeros_like(frames[0]) for _ in range(HISTORY_LENGTH - len(frames)))
+                converted.append(dict(sample, state=torch.cat(frames)))
+            upgraded[gen].append(dict(game, positions=converted))
+    return upgraded
+
+
+def replay_games_for_windows(replay_games, history_migration=False):
+    """Check saved games before sampling contiguous eight-ply windows."""
+    games_by_teacher = (history_replay_games(replay_games)
+                        if history_migration else replay_games)
+    for games in games_by_teacher.values():
+        for game in games:
+            positions = game['positions']
+            if [sample['ply_index'] for sample in positions] != list(range(len(positions))):
+                raise ValueError('replay requires whole consecutive games')
+            if any(tuple(sample['state'].shape) != (HISTORY_CHANNELS, BOARD_SIZE, BOARD_SIZE)
+                   for sample in positions):
+                raise ValueError('replay state does not match current encoder')
+            # Legacy saves did not track replay exposures; start tracking now.
+            uses = game.get('replay_uses', [0] * len(positions))
+            if (not isinstance(uses, list)
+                    or len(uses) != len(positions)
+                    or any(type(count) is not int or count < 0 for count in uses)):
+                raise ValueError('invalid replay position usage counts')
+            game['replay_uses'] = uses
+            for sample in positions:
+                if 'position_key' not in sample:
+                    # Older replay contains full games starting with P1. Decode
+                    # only the endpoint board; history and ply age are not identity.
+                    pid = 1 + sample['ply_index'] % 2
+                    frame = sample['state']
+                    position = {'turn': pid}
+                    for channel, player in enumerate((pid, 3 - pid)):
+                        row, col = frame[channel].nonzero()[0].tolist()
+                        position[f'p{player}_pos'] = ((col, row) if pid == 1 else (8 - col, 8 - row))
+                        position[f'p{player}_walls'] = round(float(frame[4 + channel, 0, 0]) * 10)
+                    for channel, name in ((2, 'walls_h'), (3, 'walls_v')):
+                        position[name] = {(col, row) if pid == 1 else (7 - col, 7 - row)
+                                          for row, col in frame[channel].nonzero().tolist()}
+                    sample['position_key'] = get_position_key(position)
+    return games_by_teacher
 
 
 def encode_state(state, active_pid):
@@ -622,8 +725,10 @@ def _cpu_state_dict(state_dict):
 
 def _encoder_implementation_source(channels=STATE_CHANNELS):
     source = textwrap.dedent(inspect.getsource(encode_relative_8ch_path_v1))
-    if channels == 9:
+    if channels in (9, HISTORY_CHANNELS):
         source += '\n' + textwrap.dedent(inspect.getsource(encode_relative_9ch_path_moves_v2))
+    if channels == HISTORY_CHANNELS:
+        source += '\n' + textwrap.dedent(inspect.getsource(encode_relative_72ch_history_v3))
     return source
 
 
@@ -632,6 +737,11 @@ def _current_encoder_spec(channels=STATE_CHANNELS):
     if channels == 8:
         spec.update(id="relative_8ch_path_v1", shape=[8, BOARD_SIZE, BOARD_SIZE])
         spec['channels'] = spec['channels'][:8]
+    elif channels == HISTORY_CHANNELS:
+        spec.update(id='relative_72ch_history_v3', shape=[72, BOARD_SIZE, BOARD_SIZE],
+                    history_length=8, history_order='current_then_newest_to_oldest',
+                    missing_history='zero_padding')
+        spec['channels'] = [f'plies_ago_{age}_{name}' for age in range(8) for name in spec['channels']]
     source = _encoder_implementation_source(channels)
     spec["implementation_source"] = source
     spec["implementation_sha256"] = hashlib.sha256(
@@ -769,7 +879,7 @@ class ArchivedValueNet(nn.Module):
 
     def encode_game_state(self, state, active_pid):
         encoder_id = self.encoder_spec.get("id")
-        if encoder_id in ("relative_8ch_path_v1", "relative_9ch_path_moves_v2"):
+        if encoder_id in ("relative_8ch_path_v1", "relative_9ch_path_moves_v2", "relative_72ch_history_v3"):
             return self._archived_encoder(state, active_pid)
         raise ValueError(f"unsupported archived input encoder: {encoder_id}")
 
@@ -789,6 +899,8 @@ def encode_state_for_model(model, state, active_pid):
         return encoder(state, active_pid)
     if tuple(getattr(model, 'input_shape', STATE_SHAPE)) == (8, BOARD_SIZE, BOARD_SIZE):
         return encode_relative_8ch_path_v1(state, active_pid)
+    if tuple(getattr(model, 'input_shape', STATE_SHAPE)) == (HISTORY_CHANNELS, BOARD_SIZE, BOARD_SIZE):
+        return encode_relative_72ch_history_v3(state, active_pid)
     return encode_state(state, active_pid)
 
 
@@ -813,16 +925,23 @@ def make_model_state_batch(model, state_tensors, name="states"):
 def get_state_key(state):
     return (state['p1_pos'], state['p2_pos'], tuple(sorted(state['walls_h'])), tuple(sorted(state['walls_v'])))
 
+
+def get_position_key(state):
+    """Deduplicate boards (including reflections), irrespective of their age."""
+    board = get_state_key(state)
+    reflected = (
+        (8 - board[0][0], board[0][1]), (8 - board[1][0], board[1][1]),
+        tuple(sorted((7 - c, r) for c, r in board[2])),
+        tuple(sorted((7 - c, r) for c, r in board[3])))
+    return (state['turn'], state['p1_walls'], state['p2_walls'], min(board, reflected))
+
+
 class QuoridorBot:
-    # How many of a player's own most-recent squares to remember, purely to
-    # discourage short A<->B (or small-loop) oscillation when two paths are
-    # otherwise perfectly tied. This is a soft nudge (see _oscillation_penalty),
-    # not a hard rule, so a truly forced backtrack is still allowed.
-    RECENT_MEMORY_LEN = 8
+    # Count visits for the whole game, including loops longer than eight moves.
+    # Repetition remains a penalty, so a forced backtrack is still allowed.
     OSCILLATION_PENALTY = 45.0
+    MCTS_MAX_REPEAT_PENALTY = 0.5
     TOP_MOVE_POOL_SIZE = 4
-    WIDE_MOVE_POOL_SIZE = 10
-    WIDE_MOVE_SAMPLE_CHANCE = 0.10
 
     def __init__(self, bot_id=2, max_depth=3, nn_model=None, heuristic_weight=1.0):
         self.bot_id = bot_id
@@ -834,26 +953,36 @@ class QuoridorBot:
         self.last_policy = None
         # Preserve depth controls: each level buys 64 leaf evaluations.
         self.mcts_simulations = max(1, max_depth) * 64
+        self.search_top_k = self.TOP_MOVE_POOL_SIZE
 
-    def get_move_and_eval(self, state, epsilon=0.0):
+    def get_move_and_eval(self, state, epsilon=0.0, *, temperature=None, root_noise=None):
         self.last_policy = None
         if getattr(self.nn_model, 'supports_policy', False):
             was_training = self.nn_model.training
             try:
                 self.nn_model.eval()
-                return self.mcts_move(state, epsilon)
+                return self.mcts_move(
+                    state, epsilon, temperature=temperature, root_noise=root_noise)
             finally:
                 self.nn_model.train(was_training)
+
+        def teacher_choice(action, value):
+            # Distill searched teacher choices alongside their outcome targets.
+            self.last_policy = torch.zeros(POLICY_SIZE, dtype=torch.float32)
+            self.last_policy[policy_action_index(action, self.bot_id)] = 1.0
+            return action, value
+
         # Parameters can change between moves, but not during one search.
         self._value_cache.clear()
         for move in self.get_valid_moves(state, self.bot_id):
             if move[1] == self.get_target_row(self.bot_id):
                 self.was_last_random = False
-                return ('move', move), 10000.0
+                return teacher_choice(('move', move), 10000.0)
         if epsilon > 0.0 and random.random() < epsilon:
             raw_actions = self.generate_actions(state, self.bot_id)
             if raw_actions:
-                chosen_action = random.choice(raw_actions)
+                chosen_action = random.choice(self.rank_and_prune(
+                    state, raw_actions, self.bot_id, top_k=self.search_top_k))
                 next_state = self.apply_action(state, self.bot_id, chosen_action, is_random=True)
                 self.was_last_random = True
                 return chosen_action, self.evaluate(next_state, self.bot_id)
@@ -865,21 +994,50 @@ class QuoridorBot:
             if raw_actions:
                 ranked = self.rank_and_prune(state, raw_actions, self.bot_id, top_k=1)
                 if ranked:
-                    return ranked[0], self.evaluate(state, self.bot_id)
+                    return teacher_choice(ranked[0], self.evaluate(state, self.bot_id))
             return None, 0.0
-        return best_move, max_eval
+        return teacher_choice(best_move, max_eval)
 
     def get_move(self, state):
         action, _ = self.get_move_and_eval(state, epsilon=0.0)
         return action
 
-    def mcts_move(self, state, epsilon=0.0):
-        """PUCT with root UCT exploration; values use each node's side to move."""
+    def mcts_move(self, state, epsilon=0.0, *, temperature=None, root_noise=None):
+        """Search all legal candidates; values use each node's side to move."""
+        # Keep old callers working while replacing epsilon's uniform sampling.
+        if temperature is None:
+            temperature = 1.0 if epsilon > 0 and state.get('turns_played', 0) < 11 else 0.0
+        if not math.isfinite(temperature) or temperature < 0:
+            raise ValueError('MCTS temperature must be finite and nonnegative')
+        if root_noise is None:
+            root_noise = epsilon > 0
         predictions = {}  # Only this search: weights may change before the next.
 
-        def node(position, prior=1.0, parent=None, action=None):
+        def predict(positions):
+            keys, missing = [], {}
+            for position in positions:
+                encoded = encode_state_for_model(self.nn_model, position, position['turn'])
+                key = encoded.detach().cpu().contiguous().numpy().tobytes()
+                keys.append(key)
+                if key not in predictions:
+                    missing[key] = encoded
+            if missing:
+                batch = make_model_state_batch(self.nn_model, list(missing.values()))
+                with torch.inference_mode():
+                    logits, values = self.nn_model.policy_value(batch)
+                if (tuple(logits.shape) != (len(missing), POLICY_SIZE)
+                        or tuple(values.shape) != (len(missing), 1)
+                        or not torch.isfinite(logits).all()
+                        or not torch.isfinite(values).all()):
+                    raise FloatingPointError('invalid MCTS policy/value output')
+                predictions.update((key, (logits[index], float(values[index, 0])))
+                                   for index, key in enumerate(missing))
+            return [predictions[key] for key in keys]
+
+        def node(position, prior=1.0, parent=None, action=None, repeat_penalty=0.0):
             return {'state': position, 'prior': prior, 'n': 0, 'w': 0.0,
-                    'children': None, 'parent_state': parent, 'action': action}
+                    'children': None, 'parent_state': parent, 'action': action,
+                    'repeat_penalty': repeat_penalty, 'race_penalty': 0.0}
 
         def materialize(current):
             if current['state'] is None:
@@ -894,42 +1052,39 @@ class QuoridorBot:
             for winner, row in ((1, 0), (2, 8)):
                 if position[f'p{winner}_pos'][1] == row:
                     return 1.0 if winner == pid else -1.0
-            if position.get('turns_played', 0) >= 200:
-                return 0.0
-            actions = self.generate_actions(position, pid)
-            winning = [a for a in actions if a[0] == 'move'
-                       and a[1][1] == self.get_target_row(pid)]
-            if winning:
-                actions = winning
-            elif any(m[1] == self.get_target_row(3 - pid)
-                     for m in self.get_valid_moves(position, 3 - pid)):
-                # Retain the existing immediate forced-defense safeguard.
-                safe = [a for a in actions if not any(
-                    m[1] == self.get_target_row(3 - pid)
-                    for m in self.get_valid_moves(self.apply_action(position, pid, a), 3 - pid))]
-                if safe:
-                    actions = safe
-            encoded = encode_state_for_model(self.nn_model, position, pid)
-            batch = make_model_state_batch(self.nn_model, [encoded])
-            # Key the actual input, including custom archived encoders. Cache
-            # raw outputs, never legal masks, visits, terminal values or history.
-            key = encoded.detach().cpu().contiguous().numpy().tobytes()
-            if key not in predictions:
-                with torch.inference_mode():
-                    logits, value = self.nn_model.policy_value(batch)
-                if (tuple(logits.shape) != (1, POLICY_SIZE)
-                        or tuple(value.shape) != (1, 1)
-                        or not torch.isfinite(logits).all()
-                        or not torch.isfinite(value).all()):
-                    raise FloatingPointError('invalid MCTS policy/value output')
-                predictions[key] = (logits, value)
-            logits, value = predictions[key]
-            indices = [policy_action_index(a, pid) for a in actions]
-            priors = torch.softmax(logits[0, indices], dim=0).cpu().tolist()
+            # A time limit is an unfinished leaf: bootstrap its estimate instead
+            # of declaring a draw. Only actual goal arrivals have terminal values.
+            actions, _ = (([], False) if position.get('turns_played', 0) >= 200 else
+                               self._tactical_candidates(
+                                   position, self.generate_actions(position, pid), pid))
+            wall_free = not (position['p1_walls'] or position['p2_walls'])
+            if wall_free:
+                # With no walls left, use legal routes (including jumps) and
+                # turn order. This estimate must stay below a proven goal win.
+                gap = self.race_arrival_gap(position) * (1 if pid == 1 else -1)
+                value = max(-0.99, min(0.99, math.tanh(gap / 8.0)))
+                priors = [1.0 / len(actions)] * len(actions) if actions else []
+            else:
+                logits, value = predict([position])[0]
+                indices = [policy_action_index(a, pid) for a in actions]
+                priors = torch.softmax(logits[indices], dim=0).cpu().tolist()
+            # A low policy score must not remove a move or an opponent reply.
             current['children'] = {
-                action: node(None, prior, position, action)
+                action: node(None, prior, position, action,
+                             min(self.MCTS_MAX_REPEAT_PENALTY,
+                                 self._oscillation_penalty(position, pid, action[1]) / 25.0)
+                             if action[0] == 'move' else 0.0)
                 for action, prior in zip(actions, priors)}
-            return float(value[0, 0])
+            if actions and wall_free:
+                # Prefer shorter legal routes among the race moves.
+                distances = {
+                    action: self.get_shortest_move_dist(
+                        dict(position, **{f'p{pid}_pos': action[1]}), pid)
+                    for action in actions}
+                shortest = min(distances.values())
+                for action, child in current['children'].items():
+                    child['race_penalty'] = 0.1 * min(2, distances[action] - shortest)
+            return value
 
         if state['turn'] != self.bot_id:
             raise ValueError('MCTS bot must be the side to move')
@@ -938,25 +1093,43 @@ class QuoridorBot:
         if not root['children']:
             self.was_last_random = False
             return None, root_value * 10000.0
-        explore = epsilon > 0 and not any(
+        forced_win = any(
             action[0] == 'move' and action[1][1] == self.get_target_row(self.bot_id)
             for action in root['children'])
-        if explore:
+        if root_noise and not forced_win:
             noise = torch.distributions.Dirichlet(
                 torch.full((len(root['children']),), 0.3)).sample().tolist()
             for child, sample in zip(root['children'].values(), noise):
                 child['prior'] = 0.75 * child['prior'] + 0.25 * sample
-        for _ in range(self.mcts_simulations):
+        # Every root child will be visited. Evaluate their neural inputs together
+        # while leaving terminal/race values and tree statistics to expand().
+        root_positions = [materialize(child) for child in root['children'].values()]
+        predict([position for position in root_positions
+                 if (position['p1_walls'] or position['p2_walls'])
+                 and position['p1_pos'][1] != 0 and position['p2_pos'][1] != 8])
+        # Cover every root candidate, then leave at least as much budget for
+        # deeper comparisons. Broad openings must not consume the entire search.
+        simulations = max(self.mcts_simulations, 2 * len(root['children']))
+        for _ in range(simulations):
             current, path = root, [root]
             while current['children']:
+                unvisited = ([child for child in current['children'].values() if not child['n']]
+                             if current is root else [])
+                if unvisited:
+                    current = max(unvisited, key=lambda child: child['prior'])
+                    path.append(current)
+                    break
                 scale = math.sqrt(max(1, current['n']))
                 current = max(current['children'].values(), key=lambda child:
                     (-child['w'] / child['n'] if child['n'] else 0.0)
+                    # A bounded loop preference stays below the value gap
+                    # between a forced win (+1) and a draw (0).
+                    - child['repeat_penalty']
+                    - child['race_penalty']
                     + 1.5 * child['prior'] * scale / (1 + child['n'])
-                    # At the root, explore independently of the policy too:
-                    # softmax underflow must not make alternatives invisible.
-                    + (0.5 * math.sqrt(math.log1p(current['n']) / (1 + child['n']))
-                       if current is root else 0.0))
+                    # Explore independently of the policy at opponent nodes
+                    # too, even when a prior underflows to zero.
+                    + 0.5 * math.sqrt(math.log1p(current['n']) / (1 + child['n'])))
                 path.append(current)
             value = expand(current)
             for visited in reversed(path):
@@ -968,10 +1141,13 @@ class QuoridorBot:
         for action, child in children.items():
             self.last_policy[policy_action_index(action, self.bot_id)] = child['n']
         self.last_policy /= self.last_policy.sum()
-        # Keep epsilon exploration and the UI marker; targets remain visits.
-        self.was_last_random = explore and random.random() < epsilon
+        # Action temperature never changes the full visit-count training target.
+        self.was_last_random = temperature > 0 and not forced_win and len(children) > 1
         if self.was_last_random:
-            chosen = random.choice(list(children))
+            largest = max(child['n'] for child in children.values())
+            weights = [(child['n'] / largest) ** (1.0 / temperature)
+                       for child in children.values()]
+            chosen = random.choices(list(children), weights=weights, k=1)[0]
         else:
             most_visits = max(child['n'] for child in children.values())
             choices = [a for a, child in children.items() if child['n'] == most_visits]
@@ -1101,8 +1277,24 @@ class QuoridorBot:
                         actions.append(('wall', (c, r, orient)))
         return actions
 
+    def _tactical_candidates(self, state, actions, pid):
+        winning = [a for a in actions if a[0] == 'move'
+                   and a[1][1] == self.get_target_row(pid)]
+        if winning:
+            return winning, True
+        opponent = 3 - pid
+        if any(move[1] == self.get_target_row(opponent)
+               for move in self.get_valid_moves(state, opponent)):
+            safe = [action for action in actions if not any(
+                move[1] == self.get_target_row(opponent)
+                for move in self.get_valid_moves(self.apply_action(state, pid, action), opponent))]
+            if safe:
+                return safe, True
+        return actions, False
+
     def rank_and_prune(self, state, actions, pid, top_k=TOP_MOVE_POOL_SIZE, return_states=False):
         if not actions: return []
+        actions, forced = self._tactical_candidates(state, actions, pid)
         actions_copy = list(actions)
         random.shuffle(actions_copy)
 
@@ -1120,33 +1312,17 @@ class QuoridorBot:
         scored_actions = list(zip(values, actions_copy, next_states))
 
         scored_actions.sort(key=lambda x: x[0], reverse=True)
+        if not forced:
+            scored_actions = scored_actions[:top_k]
         if return_states:
-            return [(act, candidate) for _, act, candidate in scored_actions[:top_k]]
-        return [act for _, act, _ in scored_actions[:top_k]]
+            return [(act, candidate) for _, act, candidate in scored_actions]
+        return [act for _, act, _ in scored_actions]
 
-    def _oscillation_penalty(self, state, pid):
-        """Soft penalty for landing on a square this player occupied recently.
-
-        Two genuinely equal-length paths (e.g. a fork around a wall) produce
-        an *exact* tie in evaluate()'s distance/progress terms, so without a
-        tiebreaker the bot can happily bounce between them forever -- the
-        joint-state 'is_repeated' check almost never catches this because the
-        opponent is also moving, so the full board rarely repeats exactly.
-        Weighting by recency means a single necessary backtrack barely costs
-        anything, while repeatedly ping-ponging over the same square or two
-        gets progressively more expensive and reliably breaks the tie.
-        """
-        my_pos = state['p1_pos'] if pid == 1 else state['p2_pos']
-        recent = state.get('p1_recent', ()) if pid == 1 else state.get('p2_recent', ())
-        if not recent:
-            return 0.0
-        penalty = 0.0
-        n = len(recent)
-        for i, pos in enumerate(recent):
-            if pos == my_pos:
-                recency_weight = (i + 1) / n  # most recent entries weigh close to 1.0
-                penalty += self.OSCILLATION_PENALTY * recency_weight
-        return penalty
+    def _oscillation_penalty(self, state, pid, next_pos=None):
+        """Increase the cost each time a pawn returns to the same square."""
+        pos = next_pos if next_pos is not None else state[f'p{pid}_pos']
+        visits = state.get(f'p{pid}_recent', ())
+        return self.OSCILLATION_PENALTY * visits.count(pos)
 
     def evaluate(self, state, eval_pid):
         return self.evaluate_batch([state], eval_pid)[0]
@@ -1191,6 +1367,9 @@ class QuoridorBot:
                 state['p1_walls'],
                 state['p2_walls'],
                 state.get('turns_played', 0),
+                tuple((get_state_key(frame), frame['p1_walls'], frame['p2_walls'],
+                       frame.get('turns_played', 0)) for frame in state.get('position_history', ()))
+                if getattr(self.nn_model, 'input_shape', STATE_SHAPE)[0] == HISTORY_CHANNELS else (),
                 active_pid
             )
             sign = 1.0 if active_pid == eval_pid else -1.0
@@ -1216,6 +1395,10 @@ class QuoridorBot:
         return scores
 
     def apply_action(self, state, pid, action, is_random=False):
+        snapshot = {key: state[key] for key in
+                    ('p1_pos', 'p2_pos', 'p1_walls', 'p2_walls', 'turn')}
+        snapshot.update(walls_h=frozenset(state['walls_h']), walls_v=frozenset(state['walls_v']),
+                        turns_played=state.get('turns_played', 0))
         new_state = {
             'p1_pos': state['p1_pos'], 'p2_pos': state['p2_pos'],
             'p1_walls': state['p1_walls'], 'p2_walls': state['p2_walls'],
@@ -1223,6 +1406,7 @@ class QuoridorBot:
             'turn': self.get_opponent(pid),
             'turns_played': state.get('turns_played', 0) + 1,
             'history': state.get('history', set()).copy(),
+            'position_history': (*state.get('position_history', ())[-6:], snapshot),
             'p1_recent': state.get('p1_recent', ()),
             'p2_recent': state.get('p2_recent', ()),
             'random_walls': state.get('random_walls', set()).copy(),
@@ -1236,11 +1420,11 @@ class QuoridorBot:
             new_pos = action[1]
             if pid == 1:
                 new_state['p1_pos'] = new_pos
-                new_state['p1_recent'] = (state.get('p1_recent', ()) + (old_pos,))[-self.RECENT_MEMORY_LEN:]
+                new_state['p1_recent'] = state.get('p1_recent', ()) + (old_pos,)
                 new_state['p1_last_random'] = is_random
             else:
                 new_state['p2_pos'] = new_pos
-                new_state['p2_recent'] = (state.get('p2_recent', ()) + (old_pos,))[-self.RECENT_MEMORY_LEN:]
+                new_state['p2_recent'] = state.get('p2_recent', ()) + (old_pos,)
                 new_state['p2_last_random'] = is_random
         else:
             c, r, orient = action[1]
@@ -1268,20 +1452,15 @@ class QuoridorBot:
             else:
                 return None, -10000 - depth
 
-        if depth == 0: return None, self.evaluate(state, self.bot_id)
+        if depth == 0 or state.get('turns_played', 0) >= 200:
+            return None, self.evaluate(state, self.bot_id)
 
         pid = self.bot_id if maximizing else self.get_opponent(self.bot_id)
         raw_actions = self.generate_actions(state, pid)
         if not raw_actions: return None, self.evaluate(state, self.bot_id)
         
-        # Usually search the strongest four candidates, but occasionally widen
-        # the pool to ten so training explores credible alternatives.
-        top_k = (
-            self.WIDE_MOVE_POOL_SIZE
-            if random.random() < self.WIDE_MOVE_SAMPLE_CHANCE
-            else self.TOP_MOVE_POOL_SIZE
-        )
-        children = self.rank_and_prune(state, raw_actions, pid, top_k=top_k, return_states=True)
+        children = self.rank_and_prune(
+            state, raw_actions, pid, top_k=self.search_top_k, return_states=True)
         if not children: return None, self.evaluate(state, self.bot_id)
 
         if maximizing:
@@ -1324,8 +1503,25 @@ WIDTH = BOARD_PIXEL_SIZE + SIDEBAR_WIDTH + LEFT_SIDEBAR_WIDTH
 HEIGHT = max(650, BOARD_PIXEL_SIZE + 80)
 
 class Quoridor:
-    def __init__(self, headless=False, train_depth=2, play_depth=4, train_updates=None):
+    # One opening game replenishes the pool for up to three complete branches.
+    CONTINUATIONS_PER_GAME = 3
+    START_POSITION_CAPACITY = 4096
+    USED_START_CAPACITY = 16384
+    REPLAY_POSITIONS_PER_TEACHER = 8_000
+    FRESH_MAX_LOSS_WEIGHT = 4.0
+    WEAK_TEACHER_WIN_RATE = 0.58
+    WEAK_TEACHER_MIN_SHARE = 0.45
+
+    def __init__(self, headless=False, train_depth=2, play_depth=4, train_updates=None,
+                 temporary_ladder=False):
         pygame.init()
+        # Keep ladder saves separate from official teacher checkpoints.
+        self.temporary_ladder = temporary_ladder
+        self.ladder_opponent_gen = 1
+        self._ladder_save_path = os.path.abspath(LADDER_STATE_FILE)
+        self._startup_replay_path = os.path.abspath(STARTUP_REPLAY_FILE)
+        self._completed_startup_replay = None
+        self._loaded_ladder = False
         self.headless = headless
         self.train_depth = train_depth
         self.play_depth = play_depth
@@ -1369,10 +1565,10 @@ class Quoridor:
         self.LATEST_TEACHER_LOG_WINDOW = 60
         self.CURRICULUM_UNIFORM_MASS = 0.25
 
-        # Fresh positions get exactly one pass; replay never adds extra batches.
-        self.REPLAY_GAMES_PER_TEACHER = 100
+        # Fresh positions get one pass, followed by an equal number of replay batches.
+        # Their unused slots prioritize weak teachers; 80 slots retain broad replay.
         self.REPLAY_BATCH_SIZE = 256
-        self.GENERAL_REPLAY_SLOTS = 76
+        self.GENERAL_REPLAY_SLOTS = 80
         self.TACTICAL_LEAD_PLIES = 6
         self.TACTICAL_MIN_LEAD_PLIES = 2
         self.TACTICAL_MAINTAINED_PLIES = 4
@@ -1399,8 +1595,8 @@ class Quoridor:
         self.GRAD_CLIP_NORM = 1.0
 
         # State vars
-        self.student_net = PolicyValueQuoriNet(in_channels=STATE_CHANNELS)
-        self.teacher_net = PolicyValueQuoriNet(in_channels=STATE_CHANNELS)
+        self.student_net = PolicyValueQuoriNet(in_channels=HISTORY_CHANNELS)
+        self.teacher_net = PolicyValueQuoriNet(in_channels=HISTORY_CHANNELS)
         self.teacher_net.load_state_dict(self.student_net.state_dict())
         self.student_net.eval()
         self.teacher_net.eval()
@@ -1424,6 +1620,7 @@ class Quoridor:
 
         self.replay_games = {}
         self.next_replay_game_id = 1
+        self._reset_position_generation()
         self.last_game_batches = []
         self.episode_trajectory = []
         self.last_loss = 0.0
@@ -1479,6 +1676,9 @@ class Quoridor:
         self.architecture_transition_status = "same_architecture"
         self._discover_model_archives()
         self.load_checkpoint_if_exists()
+        self._apply_lr_schedule()
+        if self.temporary_ladder:
+            self._configure_temporary_ladder()
         self._sync_model_archives()
         self.update_opponent_pool()
 
@@ -1496,6 +1696,9 @@ class Quoridor:
         self.manual_snapshot_index = max(0, len(self.manual_snapshots) - 1)
         self.game_start_time = time.time()
         self.reset_game()
+        if hasattr(self, '_restored_ladder_session'):
+            self._restore_ladder_session(self._restored_ladder_session)
+            del self._restored_ladder_session
         if hasattr(self, '_restored_rng'):
             python_rng, torch_rng, cuda_rng = self._restored_rng
             random.setstate(python_rng)
@@ -1503,13 +1706,42 @@ class Quoridor:
             if torch.cuda.is_available() and cuda_rng:
                 torch.cuda.set_rng_state_all(cuda_rng)
             del self._restored_rng
-        if self._checkpoint_needs_initial_save:
+        if self._checkpoint_needs_initial_save and not self.temporary_ladder:
             self.save_checkpoint(manual=True)
 
 
     # ==========================================
     # SECTION 4: OPPONENT POOL
     # ==========================================
+    @property
+    def curriculum_teacher_gen(self):
+        """Training target is separate from the saved teacher/student identity."""
+        return self.ladder_opponent_gen if getattr(self, 'temporary_ladder', False) else self.teacher_gen
+
+    def _configure_temporary_ladder(self):
+        if self.teacher_gen != 9:
+            raise ValueError('--temporary-ladder requires the existing Gen #10 student (teacher Gen #9)')
+        if not getattr(self, '_loaded_ladder', False) and not any(
+                os.path.isfile(self._checkpoint_path(name, self._checkpoint_source_dir))
+                for name in (TRAINING_STATE_FILE, STUDENT_WEIGHTS_FILE)):
+            raise ValueError('--temporary-ladder requires saved student weights')
+        missing = set(range(1, 9)) - set(self._available_official_generations())
+        if missing:
+            raise ValueError(f'Ladder requires every teacher Gen #1-9; missing {sorted(missing)}')
+        if getattr(self, '_loaded_ladder', False):
+            print(f'Resumed Gen #10 ladder: {self.games_played} games, target Gen #{self.ladder_opponent_gen}.')
+            return
+        self.rematch_teacher_gen = None
+        self.checkpoint_log.clear()
+        self.student_eval_history.clear()
+        self.latest_teacher_history.clear()
+        self._reset_lr_search_for_new_teacher()
+        self.curriculum_latest_credit = 1.0
+        self.student_win_rate_str = 'Pending greedy WR'
+        print('Gen #10 bootstrap: normal curriculum against targets #1 through #9. '
+              'Autosaves run every 250 games; pausing or closing also saves. '
+              'No new teachers until all gates pass.')
+
     def _validate_model_archive_payload(self, payload):
         if (
             payload.get("format") != MODEL_ARCHIVE_FORMAT
@@ -1651,6 +1883,8 @@ class Quoridor:
         return self._validate_model_archive_payload(payload)
 
     def _write_model_archives(self):
+        if getattr(self, 'temporary_ladder', False):
+            return
         ranges = {}
         for architecture_id, group in self._archive_groups.items():
             generations = list(group["official"])
@@ -1684,6 +1918,11 @@ class Quoridor:
                 source_directory = next(iter(old_directories), None)
                 if source_directory is not None:
                     os.replace(source_directory, directory)
+                    # Manual student snapshots can extend the generation range.
+                    # Checkpoint paths must follow the folder we just moved.
+                    for attribute in ("_checkpoint_dir", "_checkpoint_source_dir"):
+                        if getattr(self, attribute, None) == source_directory:
+                            setattr(self, attribute, directory)
                     old_directories.remove(source_directory)
                 else:
                     os.makedirs(directory)
@@ -1791,6 +2030,8 @@ class Quoridor:
 
     def _sync_model_archives(self):
         """Consolidate every known model by exact architecture at startup."""
+        if getattr(self, 'temporary_ladder', False):
+            return
         groups = {}
         cleanup_files = set()
         for filename in os.listdir('.'):
@@ -1958,16 +2199,20 @@ class Quoridor:
         return sorted(generations)
 
     def update_opponent_pool(self):
+        target_gen = self.curriculum_teacher_gen
+        target_net = self._load_net_for_gen(target_gen)
+        if target_net is None:
+            raise RuntimeError(f'Curriculum teacher Gen #{target_gen} is unavailable')
         self.opponent_pool = []
         self.opponent_support_base_weights = []
 
         # Latest teacher is explicit and always present. Its actual probability
         # is computed dynamically from latest-teacher competence.
-        self.opponent_pool.append((self.teacher_net, self.teacher_gen))
+        self.opponent_pool.append((target_net, target_gen))
         self.opponent_support_base_weights.append(0.0)
 
-        recent_start = max(1, self.teacher_gen - self.RECENT_WINDOW_SIZE + 1)
-        recent_support_gens = list(range(recent_start, self.teacher_gen))
+        recent_start = max(1, target_gen - self.RECENT_WINDOW_SIZE + 1)
+        recent_support_gens = list(range(recent_start, target_gen))
         recent_entries = []
 
         for i, gen in enumerate(recent_support_gens, start=1):
@@ -2010,7 +2255,7 @@ class Quoridor:
         self._refresh_opponent_weights()
         latest_share = self._latest_teacher_share()
         print(
-            f"Opponent pool updated. Latest target: Gen #{self.teacher_gen} "
+            f"Opponent pool updated. Latest target: Gen #{target_gen} "
             f"({latest_share*100:.1f}%) | Support models: {len(self.opponent_pool)-1} "
             f"| Total weight: {sum(self.opponent_weights):.4f}"
         )
@@ -2060,7 +2305,7 @@ class Quoridor:
         if not generations:
             return False
         # Keep the latest-teacher-only opener's normal qualification window.
-        if not self._passes_training_generation_gate(self.teacher_gen):
+        if not self._passes_training_generation_gate(self.curriculum_teacher_gen):
             return False
         for gen in generations:
             log = self.checkpoint_log.get(gen)
@@ -2138,11 +2383,11 @@ class Quoridor:
         return sum(
             weight for (_, gen), weight in zip(
                 self.opponent_pool, self.opponent_weights
-            ) if gen == self.teacher_gen
+            ) if gen == self.curriculum_teacher_gen
         )
 
     def _refresh_opponent_weights(self):
-        """Prioritize lower win rates, independent of history length."""
+        """Reserve live games for teachers below 58%, then weight by weakness."""
         if not self.opponent_pool:
             self.opponent_weights = []
             return
@@ -2172,12 +2417,23 @@ class Quoridor:
         total_deficit = sum(deficit_scores)
         if total_deficit <= 0.0:
             self.opponent_weights = [1.0 / count] * count
-            return
+        else:
+            self.opponent_weights = [
+                uniform_weight + deficit_mass * (score / total_deficit)
+                for score in deficit_scores
+            ]
 
-        self.opponent_weights = [
-            uniform_weight + deficit_mass * (score / total_deficit)
-            for score in deficit_scores
-        ]
+        weak = {i for i, rate in enumerate(win_rates)
+                if rate is not None and rate < self.WEAK_TEACHER_WIN_RATE}
+        if weak:
+            # Reserve 45% per weak teacher (up to two); with more, share 90%.
+            # The remainder retains the existing curriculum and coverage floor.
+            reserved = min(self.WEAK_TEACHER_MIN_SHARE, 0.90 / len(weak))
+            remainder = 1.0 - reserved * len(weak)
+            self.opponent_weights = [
+                remainder * weight + (reserved if i in weak else 0.0)
+                for i, weight in enumerate(self.opponent_weights)
+            ]
 
     def _select_training_opponent(self):
         self._refresh_opponent_weights()
@@ -2190,18 +2446,23 @@ class Quoridor:
 
         latest_idx = next(
             (i for i, (_, gen) in enumerate(self.opponent_pool)
-             if gen == self.teacher_gen),
+             if gen == self.curriculum_teacher_gen),
             None
         )
         support_indices = [
             i for i, (_, gen) in enumerate(self.opponent_pool)
-            if gen != self.teacher_gen and self.opponent_weights[i] > 0.0
+            if gen != self.curriculum_teacher_gen and self.opponent_weights[i] > 0.0
         ]
 
         if latest_idx is None:
-            return self.teacher_net, self.teacher_gen
+            return self._load_net_for_gen(self.curriculum_teacher_gen), self.curriculum_teacher_gen
 
-        if not self._passes_training_generation_gate(self.teacher_gen):
+        support_rates = [self._generation_win_rate(self.opponent_pool[i][1])
+                         for i in support_indices]
+        weak_support = any(rate is not None and rate < self.WEAK_TEACHER_WIN_RATE
+                           for rate in support_rates)
+        # The latest-only opener must not starve a known weak historical matchup.
+        if not weak_support and not self._passes_training_generation_gate(self.curriculum_teacher_gen):
             return self.opponent_pool[latest_idx]
 
         if not support_indices:
@@ -2264,51 +2525,165 @@ class Quoridor:
             start = end
         return tactical
 
-    def _training_batches(self, fresh, opponent_gen):
-        """Uniform position draws, with no replacement across either replay draw."""
-        general_pool = [sample for games in self.replay_games.values()
-                        for game in games for sample in game['positions']]
-        same_pool = [sample for sample in general_pool
-                     if sample['teacher_gen'] == opponent_gen]
-        fresh = list(fresh)
-        random.shuffle(fresh)
+    def _replay_teacher_weights(self, generations):
+        """Prioritize teachers below the gate, independent of buffer size."""
+        if not generations:
+            return {}
+        rates = {gen: self._generation_win_rate(gen) for gen in generations}
+        target = self.GATE_WIN_RATE_THRESHOLD
+        deficits = {gen: max(0.0, target - rate) if rate is not None else 0.0
+                    for gen, rate in rates.items()}
+        if not any(deficits.values()):
+            # Once every observed teacher passes, keep working on relative weaknesses.
+            target = max((rate for rate in rates.values() if rate is not None), default=target)
+            deficits = {gen: max(0.0, target - rate) if rate is not None else 0.0
+                        for gen, rate in rates.items()}
+        total = sum(deficits.values())
+        floor = self.CURRICULUM_UNIFORM_MASS / len(generations)
+        return {gen: (floor + (1.0 - self.CURRICULUM_UNIFORM_MASS) * deficit / total
+                      if total else 1.0 / len(generations))
+                for gen, deficit in deficits.items()}
+
+    def _training_batches(self, fresh, opponent_gen, *, replay_only=False):
+        """Shuffle contiguous spans (up to eight plies for short continuations)."""
+        def sample_key(sample):
+            return sample.get('position_key') or (sample['game_id'], sample['ply_index'])
+
+        # Disjoint spans give short puzzles and long-game positions the same
+        # replay opportunities; overlapping spans overrepresented long games.
+        general_pool = []
+        for games in self.replay_games.values():
+            for game in games:
+                game.setdefault('replay_uses', [0] * len(game['positions']))
+                start, seen = 0, set()
+                for index, sample in enumerate(game['positions']):
+                    key = sample_key(sample)
+                    if index - start == HISTORY_LENGTH or key in seen:
+                        general_pool.append((game, start, index))
+                        start, seen = index, set()
+                    seen.add(key)
+                if seen:
+                    general_pool.append((game, start, len(game['positions'])))
+                # Splitting at repetitions keeps every row replayable without
+                # placing duplicate boards in one span or crossing game bounds.
+        same_pool = [window for window in general_pool if window[0]['teacher_gen'] == opponent_gen]
+        teacher_weights = self._replay_teacher_weights(
+            sorted({window[0]['teacher_gen'] for window in general_pool})) if not replay_only else {}
+        fresh_windows = [fresh[start:start + HISTORY_LENGTH]
+                         for start in range(0, len(fresh), HISTORY_LENGTH)]
+        random.shuffle(fresh_windows)
         fresh_slots = self.REPLAY_BATCH_SIZE - self.GENERAL_REPLAY_SLOTS
-        for start in range(0, len(fresh), fresh_slots):
-            new = fresh[start:start + fresh_slots]
-            same = random.sample(same_pool, min(fresh_slots - len(new), len(same_pool)))
-            selected = {(sample['game_id'], sample['ply_index']) for sample in same}
-            available = ([sample for sample in general_pool
-                          if (sample['game_id'], sample['ply_index']) not in selected]
-                         if selected else general_pool)
-            general = random.sample(available, min(self.GENERAL_REPLAY_SLOTS, len(available)))
-            batch = new + same + general
-            random.shuffle(batch)
-            replay = same + general
+        fresh_windows_per_batch = fresh_slots // HISTORY_LENGTH
+        fresh_batch_count = (len(fresh_windows) + fresh_windows_per_batch - 1) // fresh_windows_per_batch
+        batch_count = len(same_pool) if replay_only else 2 * fresh_batch_count
+        for batch_index in range(batch_count):
+            if replay_only and not same_pool:
+                break
+            start = batch_index * fresh_windows_per_batch
+            new_windows = fresh_windows[start:start + fresh_windows_per_batch]
+            new = [sample for window in new_windows for sample in window]
+
+            selected = {sample_key(sample) for sample in new}
+            replay_windows = []
+
+            def draw(pool, slots, *, teacher_weights=None):
+                if slots <= 0 or not pool:
+                    return []
+                picked = []
+                shuffled = random.sample(pool, len(pool))
+                coverage = sorted(shuffled, key=lambda item: (
+                    sum(item[0]['replay_uses'][item[1]:item[2]]) / (item[2] - item[1]),
+                    -item[0].get('game_id', item[0]['positions'][0]['game_id'])))
+                # Half the slots favor least-used spans (newest breaks ties);
+                # the rest sample broadly to keep established skills in play.
+                for candidates, budget in ((coverage, slots // 2), (shuffled, slots)):
+                    groups = {}
+                    for window in reversed(candidates):
+                        gen = window[0]['teacher_gen'] if teacher_weights else None
+                        groups.setdefault(gen, []).append(window)
+                    used = 0
+                    while groups:
+                        # Choose a teacher first so larger buffers cannot dominate.
+                        gen = (random.choices(list(groups),
+                                              weights=[teacher_weights[g] for g in groups], k=1)[0]
+                               if teacher_weights else None)
+                        game, offset, end = groups[gen].pop()
+                        if not groups[gen]:
+                            del groups[gen]
+                        window = game['positions'][offset:end]
+                        keys = {sample_key(sample) for sample in window}
+                        if (len(window) > min(budget - used, slots)
+                                or len(keys) != len(window) or keys & selected):
+                            continue
+                        picked.append(window)
+                        replay_windows.append((game, offset, end))
+                        selected.update(keys)
+                        slots -= len(window)
+                        used += len(window)
+                        if not slots or used == budget:
+                            break
+                return picked
+
+            priority_windows = (draw(same_pool, self.REPLAY_BATCH_SIZE) if replay_only else
+                                draw(general_pool, fresh_slots - len(new), teacher_weights=teacher_weights))
+            general_windows = [] if replay_only else draw(general_pool, self.GENERAL_REPLAY_SLOTS)
+            priority = [sample for window in priority_windows for sample in window]
+            general = [sample for window in general_windows for sample in window]
+            windows = new_windows + priority_windows + general_windows
+            random.shuffle(windows)
+            batch = [sample for window in windows for sample in window]
+            if not batch:
+                continue
+            replay = priority + general
             counts = {
                 'batch_size': len(batch), 'fresh': len(new),
-                'same_teacher': len(same), 'general': len(general),
+                'priority': len(priority), 'general': len(general),
+                'priority_by_teacher': {gen: sum(s['teacher_gen'] == gen for s in priority)
+                                        for gen in sorted({s['teacher_gen'] for s in priority})},
                 'fresh_tactical': sum(s['tactical'] for s in new),
-                'same_teacher_tactical': sum(s['tactical'] for s in same),
+                'priority_tactical': sum(s['tactical'] for s in priority),
                 'general_tactical': sum(s['tactical'] for s in general),
-                'replay_latest': sum(s['teacher_gen'] == self.teacher_gen for s in replay),
-                'replay_historic': sum(s['teacher_gen'] != self.teacher_gen for s in replay),
+                'replay_latest': sum(s['teacher_gen'] == self.curriculum_teacher_gen for s in replay),
+                'replay_historic': sum(s['teacher_gen'] != self.curriculum_teacher_gen for s in replay),
+                'first_replay': sum(game['replay_uses'][start:end].count(0)
+                                    for game, start, end in replay_windows),
             }
             yield batch, counts
+            # Production resumes the generator only after the optimizer succeeds.
+            for game, start, end in replay_windows:
+                for index in range(start, end):
+                    game['replay_uses'][index] += 1
+            if replay_only:
+                used = {(id(game), start, end) for game, start, end in replay_windows}
+                same_pool = [window for window in same_pool
+                             if (id(window[0]), window[1], window[2]) not in used]
 
-    def _optimize_student_batch(self, batch):
+    def _fresh_sample_weights(self, batch, fresh_game_id, device):
+        weights = make_value_batch(
+            [self.TACTICAL_LOSS_WEIGHT if s['tactical'] else 1.0 for s in batch],
+            device=device, name="training weights")
+        fresh = torch.tensor([fresh_game_id is not None and s.get('game_id') == fresh_game_id
+                              for s in batch], dtype=torch.bool, device=device)
+        if fresh.any() and not fresh.all():
+            # Raise diluted fresh data toward half the loss, with at most a 4x
+            # multiplier. A tiny puzzle cannot overwhelm a full replay batch.
+            boost = max(1.0, min(self.FRESH_MAX_LOSS_WEIGHT,
+                                float(weights[~fresh].sum() / weights[fresh].sum())))
+            weights[fresh] *= boost
+        return weights, fresh
+
+    def _optimize_student_batch(self, batch, *, fresh_game_id=None):
         """Train outcomes from raw logits so wrong saturated values can recover."""
         if not batch:
             return False
         self.student_net.train()
         try:
             device = model_device(self.student_net)
-            states = make_state_batch([s['state'] for s in batch], device=device,
-                                      name="training states")
+            states = make_model_state_batch(self.student_net, [s['state'] for s in batch],
+                                            name="training states")
             targets = make_value_batch([s['target'] for s in batch], device=device,
                                        name="training targets")
-            weights = make_value_batch(
-                [self.TACTICAL_LOSS_WEIGHT if s['tactical'] else 1.0 for s in batch],
-                device=device, name="training weights")
+            weights, fresh_mask = self._fresh_sample_weights(batch, fresh_game_id, device)
             reflect = torch.rand(states.shape[0], device=device) < 0.5
             states[reflect] = mirror_state_batch(states[reflect])
             self.optimizer.zero_grad(set_to_none=True)
@@ -2334,16 +2709,22 @@ class Quoridor:
                     raise ValueError('invalid search visit targets')
                 policy[reflect[policy_rows]] = mirror_policy_batch(policy[reflect[policy_rows]])
                 policy_loss = -(policy * torch.log_softmax(logits[policy_rows], dim=1)).sum(1)
-                policy_weights = weights[policy_rows, 0]
+                # Older replay and exploratory value-only moves may lack
+                # targets; balance the actual policy subset separately.
+                policy_weights, _ = self._fresh_sample_weights(
+                    [batch[i] for i in policy_rows], fresh_game_id, device)
+                policy_weights = policy_weights[:, 0]
                 loss = loss + (policy_loss * policy_weights).sum() / policy_weights.sum()
                 if not torch.isfinite(loss):
                     raise FloatingPointError('non-finite joint policy/value loss')
             with torch.no_grad():
                 weighted_errors = weights * value_loss_fn(predictions, targets)
                 total_error = weighted_errors.sum().item()
-                tactical_error = weighted_errors[weights > 1].sum().item()
+                tactical_mask = torch.tensor([s['tactical'] for s in batch], device=device)
+                tactical_error = weighted_errors[tactical_mask].sum().item()
                 self._last_tactical_loss_share = (
                     tactical_error / total_error if total_error else 0.0)
+                self._last_fresh_weight_share = float(weights[fresh_mask].sum() / weights.sum())
             loss.backward()
             try:
                 torch.nn.utils.clip_grad_norm_(
@@ -2357,8 +2738,10 @@ class Quoridor:
                             and not torch.isfinite(parameter.grad).all().item()):
                         raise FloatingPointError(f"non-finite gradient in {name}")
                 raise FloatingPointError("student gradient norm is NaN or infinite")
+            self._apply_lr_schedule()
             self.optimizer.step()
             self.optimizer_steps += 1
+            self._apply_lr_schedule()
             self.last_loss = loss.item()
             return True
         finally:
@@ -2366,8 +2749,24 @@ class Quoridor:
 
     def _roll_replay_buffers_for_new_teacher(self):
         # Older windows retain every previously accepted game, including wins.
-        self.replay_games.setdefault(
-            self.teacher_gen, deque(maxlen=self.REPLAY_GAMES_PER_TEACHER))
+        self.replay_games.setdefault(self.curriculum_teacher_gen, deque())
+
+    def _trim_replay(self, teacher_gen):
+        """Bound positions, evicting entire oldest games, never partial histories."""
+        games = self.replay_games[teacher_gen]
+        # Remove the old 100-game maxlen when loading or reusing a legacy buffer.
+        if not isinstance(games, deque) or games.maxlen is not None:
+            games = self.replay_games[teacher_gen] = deque(games)
+        positions = sum(len(game['positions']) for game in games)
+        while games and positions > self.REPLAY_POSITIONS_PER_TEACHER:
+            positions -= len(games.popleft()['positions'])
+
+    def _apply_lr_schedule(self):
+        """Count completed updates across ladder stages, promotions and resumes."""
+        steps = self.optimizer_steps
+        lr = (1e-4 if steps < 50_000 else 3e-5 if steps < 150_000
+              else 1e-5 if steps < 250_000 else 3e-6)
+        return self._set_learning_rate(lr, f'schedule at {steps:,} total updates')
 
     def _set_learning_rate(self, requested_lr, reason):
         if not math.isfinite(requested_lr) or requested_lr <= 0:
@@ -2395,16 +2794,8 @@ class Quoridor:
         self._reset_lr_inertia()
 
     def _adjust_lr_manually(self, factor):
-        changed = self._set_learning_rate(
-            self.optimizer.param_groups[0]['lr'] * factor, f'manual x{factor:g}')
-        if changed:
-            self._reset_lr_inertia()
-            if self.student_eval_history:
-                self.lr_inertia['best_combined_wr'] = (
-                    sum(self.student_eval_history) / len(self.student_eval_history))
-        self.toast_msg = f"LR: {self.optimizer.param_groups[0]['lr']:.8f}"
-        if not changed:
-            self.toast_msg += ' (unchanged)'
+        self._apply_lr_schedule()
+        self.toast_msg = 'LR is fixed by total optimizer updates'
         self.toast_timer = 180
 
     def _reduce_lr_on_stagnation(self):
@@ -2430,8 +2821,9 @@ class Quoridor:
 
     def _reset_lr_inertia(self):
         self.lr_inertia = {
-            'version': 1, 'teacher_gen': self.teacher_gen,
+            'version': 1, 'teacher_gen': self.curriculum_teacher_gen,
             'train_depth': self.train_depth, 'wall_policy': 'all_legal_v1',
+            'search_version': GREEDY_WR_VERSION,
             'seats': [[], []], 'previous': None, 'slow': None,
             'velocity': 0.0, 'declines': 0, 'cooldown': 0,
             'last_step': self.optimizer_steps, 'observed_step': self.optimizer_steps,
@@ -2445,7 +2837,7 @@ class Quoridor:
         self._reset_lr_inertia()
         if not isinstance(saved, dict) or any(
             saved.get(key) != self.lr_inertia[key]
-            for key in ('version', 'teacher_gen', 'train_depth', 'wall_policy')
+            for key in ('version', 'teacher_gen', 'train_depth', 'wall_policy', 'search_version')
         ):
             return
         seats = saved.get('seats')
@@ -2475,9 +2867,9 @@ class Quoridor:
     def _record_lr_result(self, winner_id):
         """Never mix seats, teachers, cutoffs, or frozen tests into LR evidence."""
         if (self.mode != 'TRAIN' or self.is_evaluating or winner_id not in (1, 2)
-                or self.current_opponent_gen != self.teacher_gen):
+                or self.current_opponent_gen != self.curriculum_teacher_gen):
             return
-        if (self.lr_inertia['teacher_gen'] != self.teacher_gen
+        if (self.lr_inertia['teacher_gen'] != self.curriculum_teacher_gen
                 or self.lr_inertia['train_depth'] != self.train_depth):
             self._reset_lr_inertia()
         seat = self.lr_inertia['seats'][self.student_id - 1]
@@ -2582,7 +2974,7 @@ class Quoridor:
     def update_escalation_state(self):
         flags = []
         for gen, log in self.checkpoint_log.items():
-            if gen >= self.teacher_gen - self.RECENT_WINDOW_SIZE + 1: continue
+            if gen >= self.curriculum_teacher_gen - self.RECENT_WINDOW_SIZE + 1: continue
             if len(log) < self.MIN_SAMPLES_TRUSTED: continue
             
             win_rate = sum(log) / len(log)
@@ -2612,8 +3004,8 @@ class Quoridor:
         print(f"\n--- MATCH #{self.games_played} TERMINAL METRICS ---")
         print(f"Red Player (P1):  {self.p1_gen_str}")
         print(f"Blue Player (P2): {self.p2_gen_str}")
-        print(f"Latest Teacher:   Gen #{self.teacher_gen}")
-        print("Walls: all legal | LR: manual")
+        print(f"Curriculum Target: Gen #{self.curriculum_teacher_gen}")
+        print("Walls: all legal | LR: total-update schedule")
         print(f"Optimizer steps: {self.optimizer_steps}")
         print(f"Studt Win Rate:  {self.student_win_rate_str}")
         print(f"Training WRs:    {self._format_training_win_rates()}")
@@ -2636,12 +3028,58 @@ class Quoridor:
         self.screen.blit(scaled_surface, (0, 0))
         pygame.display.flip()
 
+    def _reset_position_generation(self):
+        self.start_positions = {}
+        self.used_start_positions = {}
+        self.continuations_remaining = 0
+        self.full_games_played = self.games_played
+        self.continuation_games_played = 0
+
+    def _remember_start_position(self, state):
+        """Save unlabelled, playable snapshots, including offspring of puzzles."""
+        ply = state.get('turns_played', 0)
+        if (ply < HISTORY_LENGTH or ply >= 200
+                or (ply - self._episode_start_ply) % 3
+                or state['p1_pos'][1] == 0 or state['p2_pos'][1] == 8):
+            return
+        key = get_position_key(state)
+        if key in self.start_positions or key in self.used_start_positions:
+            return
+        snapshot = copy.deepcopy(state)
+        # Restricted checkpoint loading cannot deserialize frozenset frames.
+        for frame in snapshot.get('position_history', ()):
+            frame['walls_h'], frame['walls_v'] = set(frame['walls_h']), set(frame['walls_v'])
+        phase = ('endgame' if min(get_shortest_path_dist(state, pid) for pid in (1, 2)) <= 4
+                 else 'middlegame')
+        self.start_positions[key] = {'state': snapshot, 'phase': phase}
+        if len(self.start_positions) > self.START_POSITION_CAPACITY:
+            del self.start_positions[next(iter(self.start_positions))]
+
+    def _take_start_position(self):
+        if not self.continuations_remaining or not self.start_positions:
+            return None
+        phase = 'middlegame' if self.continuations_remaining == self.CONTINUATIONS_PER_GAME else 'endgame'
+        candidates = [key for key, saved in self.start_positions.items() if saved['phase'] == phase]
+        key = random.choice(candidates or list(self.start_positions))
+        saved = self.start_positions.pop(key)
+        self.used_start_positions[key] = None
+        if len(self.used_start_positions) > self.USED_START_CAPACITY:
+            del self.used_start_positions[next(iter(self.used_start_positions))]
+        self.continuations_remaining -= 1
+        return saved
+
+    def _configure_training_search(self):
+        for bot in (self.bot1, self.bot2):
+            bot.mcts_simulations = max(1, self.train_depth) * 64
+
     def reset_game(self):
+        if not hasattr(self, 'start_positions'):
+            self._reset_position_generation()
         self.state = {
             'p1_pos': (4, 8), 'p2_pos': (4, 0),
             'p1_walls': 10, 'p2_walls': 10,
             'walls_h': set(), 'walls_v': set(),
-            'turn': 1, 'turns_played': 0, 'history': set(),
+            'turn': 1, 'turns_played': 0, 'history': set(), 'position_history': (),
             'p1_recent': (), 'p2_recent': (),
             'random_walls': set(), 'p1_last_random': False, 'p2_last_random': False
         }
@@ -2654,10 +3092,16 @@ class Quoridor:
         self.game_start_time = time.time()
         self.episode_trajectory = []
         self.episode_policies = []
+        self.episode_position_keys = []
         self._pending_search_policy = None
         self.game_has_exploration = False
+        self.episode_kind = 'opening'
 
         if getattr(self, 'mode', 'MENU') == 'TRAIN':
+            saved = self._take_start_position()
+            if saved is not None:
+                self.state = copy.deepcopy(saved['state'])
+                self.episode_kind = saved['phase']
             if hasattr(self, 'opponent_pool') and self.opponent_pool:
                 pool_opponent, pool_gen = self._select_training_opponent()
                 self.current_opponent_gen = pool_gen
@@ -2665,9 +3109,11 @@ class Quoridor:
                 pool_opponent, pool_gen = self.teacher_net, self.teacher_gen
                 self.current_opponent_gen = pool_gen
 
-            self.current_opponent_is_latest = (pool_gen == self.teacher_gen)
+            self.current_opponent_is_latest = pool_gen == self.curriculum_teacher_gen
 
-            if self.games_played % 2 == 0:
+            seat_game = (self.full_games_played if self.episode_kind == 'opening'
+                         else self.continuation_games_played)
+            if seat_game % 2 == 0:
                 self.bot1 = QuoridorBot(bot_id=1, max_depth=self.train_depth, nn_model=pool_opponent, heuristic_weight=self.heuristic_weight)
                 self.bot2 = QuoridorBot(bot_id=2, max_depth=self.train_depth, nn_model=self.student_net, heuristic_weight=self.heuristic_weight)
                 self.student_id = 2
@@ -2679,13 +3125,16 @@ class Quoridor:
                 self.p1_gen_str, self.p2_gen_str = f"Gen #{self.teacher_gen + 1} (Student)", f"Gen #{pool_gen} (Teacher)"
             # Alternate within each seat so greedy WR includes both sides.
             self.game_has_exploration = (
-                self.current_opponent_is_latest
-                and self.latest_games_by_seat[self.student_id - 1] % 2 == 1)
+                self.episode_kind != 'opening' or (
+                    self.current_opponent_is_latest
+                    and self.latest_games_by_seat[self.student_id - 1] % 2 == 1))
+            self._configure_training_search()
         else:
             self.bot1 = QuoridorBot(bot_id=1, max_depth=self.play_depth, nn_model=self.teacher_net, heuristic_weight=self.heuristic_weight)
             self.bot2 = QuoridorBot(bot_id=2, max_depth=self.play_depth, nn_model=self.teacher_net, heuristic_weight=self.heuristic_weight)
             self.p1_gen_str = self.p2_gen_str = f"Gen #{self.teacher_gen} Official"
 
+        self._episode_start_ply = self.state['turns_played']
         self.p1_draw_x, self.p1_draw_y = self._get_center_pixels(self.state['p1_pos'])
         self.p2_draw_x, self.p2_draw_y = self._get_center_pixels(self.state['p2_pos'])
 
@@ -2706,6 +3155,8 @@ class Quoridor:
 
     def save_manual_student(self):
         """Atomically preserve the current student without changing official files."""
+        if getattr(self, 'temporary_ladder', False):
+            return self.save_checkpoint(manual=True)
         validate_model_contract(self.student_net, "student before manual save")
         candidate_gen = self.teacher_gen + 1
         iterations = [
@@ -2772,6 +3223,8 @@ class Quoridor:
         return digest.digest()
 
     def _migrate_loaded_checkpoint(self):
+        if getattr(self, 'temporary_ladder', False) or getattr(self, '_loaded_ladder', False):
+            return
         source = self._checkpoint_source_dir
         if source is None or os.path.abspath(source) == os.path.abspath(self._checkpoint_dir):
             return
@@ -2791,6 +3244,8 @@ class Quoridor:
         self._copy_checkpoint_files(source, self._checkpoint_dir)
 
     def _copy_checkpoint_files(self, source, destination_dir):
+        if getattr(self, 'temporary_ladder', False):
+            return
         if os.path.abspath(source) == os.path.abspath(destination_dir):
             return
 
@@ -2821,13 +3276,26 @@ class Quoridor:
     def load_checkpoint_if_exists(self):
         # One atomic bundle is authoritative over all legacy sidecar files.
         bundle = None
+        history_migration = False
         self._checkpoint_source_dir = self._locate_checkpoint_source()
         bundle_path = self._checkpoint_path(
             TRAINING_STATE_FILE, self._checkpoint_source_dir
         )
+        if self.temporary_ladder and os.path.isfile(self._ladder_save_path):
+            bundle_path = self._ladder_save_path
+            self._loaded_ladder = True
         if os.path.exists(bundle_path):
             bundle = torch.load(bundle_path, map_location='cpu',
                                 weights_only=True)
+            if self._loaded_ladder:
+                ladder = bundle.get('ladder', {})
+                target = ladder.get('target_gen')
+                if (ladder.get('version') != 1 or type(target) is not int
+                        or not 1 <= target <= 9 or bundle['meta']['teacher_gen'] != 9):
+                    raise ValueError('invalid ladder resume state')
+                self.ladder_opponent_gen = target
+                self.train_depth = ladder['train_depth']
+                self._restored_ladder_session = ladder['session']
             if bundle.get('format_version') not in (1, 2):
                 raise ValueError('unsupported training checkpoint format')
             current_architecture = capture_model_architecture(self.student_net)
@@ -2874,6 +3342,12 @@ class Quoridor:
                 and student_architecture['id'] == current_architecture['id']
                 and _state_dict_schema(bundle['student']) == current_architecture['state_schema']
             )
+            if (not student_matches_current and student_architecture is not None
+                    and student_architecture['input_encoder']['id'] == 'relative_9ch_path_moves_v2'
+                    and 'policy_features.0.weight' in bundle['student']):
+                history_weights = upgrade_history_weights(bundle['student'])
+                history_migration = _state_dict_schema(history_weights) == current_architecture['state_schema']
+            student_restored = student_matches_current or history_migration
             same_architecture = teacher_matches_current and student_matches_current
             if teacher_matches_current:
                 self.teacher_net.load_state_dict(bundle['teacher'], strict=True)
@@ -2893,7 +3367,13 @@ class Quoridor:
             if student_matches_current:
                 self.student_net.load_state_dict(bundle['student'], strict=True)
                 self.optimizer.load_state_dict(bundle['optimizer'])
+            elif history_migration:
+                self.student_net.load_state_dict(history_weights, strict=True)
+                self.optimizer.load_state_dict(upgrade_history_optimizer(bundle['optimizer']))
+                self.architecture_transition_status = 'preserved_two_head_weights_and_Adam; added_zero_history_channels'
             else:
+                if getattr(self, 'temporary_ladder', False):
+                    raise RuntimeError('Temporary ladder cannot reset incompatible student weights')
                 self.architecture_transition_status = 'fresh_student_and_optimizer'
 
             if not teacher_matches_current:
@@ -2912,19 +3392,30 @@ class Quoridor:
                 and student_architecture['input_encoder'] == current_architecture['input_encoder']
             )
             replay_version = bundle.get('replay_format_version')
-            if replay_version not in (None, REPLAY_FORMAT_VERSION):
+            if replay_version not in (None, 1, REPLAY_FORMAT_VERSION):
                 raise ValueError('unsupported replay format')
-            if replay_version == REPLAY_FORMAT_VERSION and (same_architecture or replay_compatible):
+            if ((replay_version == 1 and (same_architecture or replay_compatible))
+                    or (replay_version == REPLAY_FORMAT_VERSION
+                        and (same_architecture or replay_compatible or history_migration))):
+                replay_games = replay_games_for_windows(bundle['replay_games'], history_migration)
                 self.replay_games = {
-                    int(gen): deque(games, maxlen=self.REPLAY_GAMES_PER_TEACHER)
-                    for gen, games in bundle['replay_games'].items()
+                    int(gen): deque(games)
+                    for gen, games in replay_games.items()
                 }
+                for gen in self.replay_games:
+                    self._trim_replay(gen)
                 self.next_replay_game_id = bundle['next_replay_game_id']
             elif replay_version is None:
-                print('Replay policy migration: clearing old replay; preserving model and training state.')
+                print('Legacy replay has no per-game windows; keeping its source checkpoint unchanged.')
             else:
                 self.architecture_transition_status += '; incompatible_replay_preserved_in_source_bundle'
                 print('Architecture transition: old-encoder replay remains only in the source bundle.')
+            generation = bundle.get('position_generation', {})
+            self.start_positions = dict(generation.get('starts', {}))
+            self.used_start_positions = dict.fromkeys(generation.get('used', ()))
+            self.continuations_remaining = generation.get('remaining', 0)
+            self.full_games_played = generation.get('full_games', bundle['meta']['games_played'])
+            self.continuation_games_played = generation.get('continuation_games', 0)
             self.last_loss = bundle['last_loss']
             self._restored_rng = (bundle['python_rng'], bundle['torch_rng'], bundle.get('cuda_rng'))
         elif os.path.exists(self._checkpoint_path(
@@ -2985,12 +3476,22 @@ class Quoridor:
             except Exception as exc:
                 raise RuntimeError(f"Optimizer checkpoint rejected: {exc}") from exc
 
+        if (bundle is None and isinstance(self.student_net, PolicyValueQuoriNet)
+                and self.student_net.in_channels == STATE_CHANNELS):
+            upgraded_student = PolicyValueQuoriNet(HISTORY_CHANNELS)
+            upgraded_student.load_state_dict(upgrade_history_weights(self.student_net.state_dict()))
+            saved_optimizer = upgrade_history_optimizer(self.optimizer.state_dict())
+            self.student_net = upgraded_student.eval()
+            self.optimizer = optim.Adam(self.student_net.parameters())
+            self.optimizer.load_state_dict(saved_optimizer)
+            history_migration = True
+
         validate_model_contract(self.teacher_net, "teacher network")
         validate_model_contract(self.student_net, "student network")
         validate_optimizer_state_shapes(self.optimizer)
         print(
-            f"Neural tensor contract verified: state {STATE_SHAPE}, "
-            f"batch [B, {STATE_CHANNELS}, {BOARD_SIZE}, {BOARD_SIZE}], "
+            f"Neural tensor contract verified: student state {self.student_net.input_shape}, "
+            f"batch [B, {self.student_net.in_channels}, {BOARD_SIZE}, {BOARD_SIZE}], "
             f"value [B, {VALUE_WIDTH}]."
         )
 
@@ -3076,6 +3577,7 @@ class Quoridor:
                     self.heuristic_lr_floor = meta.get(
                         'heuristic_lr_floor', self.optimizer.param_groups[0]['lr'])
                     self.optimizer_steps = meta.get('optimizer_steps', 0)
+                    self._completed_startup_replay = meta.get('completed_startup_replay')
                     self.replay_samples_latest = meta.get('replay_samples_latest', 0)
                     self.replay_samples_historic = meta.get('replay_samples_historic', 0)
                     self.replay_samples_tactical = meta.get('replay_samples_tactical', 0)
@@ -3098,26 +3600,18 @@ class Quoridor:
         # evidence only with the matching atomic model/Adam snapshot.
         self._restore_lr_inertia(
             bundle['meta'].get('lr_inertia')
-            if bundle is not None and student_matches_current else None)
+            if bundle is not None and student_restored else None)
         self._restore_game_sampling(
             meta if bundle is not None or os.path.exists(meta_path) else {})
 
-        if bundle is not None and not student_matches_current:
+        if bundle is not None and not student_restored:
             self._reset_student_training_progress()
             self._checkpoint_needs_initial_save = True
-
-        if bundle is not None and bundle.get('replay_format_version') is None:
-            # Persist the migration immediately, without reserializing live
-            # metadata/RNG or rewriting weights/Adam sidecars. All other bundle
-            # fields are preserved exactly, including architecture archives.
-            migrated = dict(bundle)
-            for key in ('latest_replay', 'historic_replay', 'tactical_replay'):
-                migrated.pop(key, None)
-            migrated.update(replay_format_version=REPLAY_FORMAT_VERSION,
-                            replay_games={}, next_replay_game_id=1)
-            self._write_training_bundle(migrated, self._checkpoint_source_dir)
+        if history_migration:
+            self._checkpoint_needs_initial_save = True
 
         if bundle is None:
+            self.full_games_played = self.games_played
             self._loaded_student_architecture = capture_model_architecture(
                 self.student_net
             )
@@ -3131,9 +3625,11 @@ class Quoridor:
         self.games_played = self.optimizer_steps = 0
         self.replay_games = {}
         self.next_replay_game_id = 1
+        self._reset_position_generation()
         self.replay_samples_latest = self.replay_samples_historic = self.replay_samples_tactical = 0
         self.episode_trajectory = []
         self.episode_policies = []
+        self.episode_position_keys = []
         self._pending_search_policy = None
         self.last_game_batches = []
         self.last_loss = 0.0
@@ -3157,6 +3653,8 @@ class Quoridor:
             del self._restored_rng
 
     def _write_training_bundle(self, bundle, directory=None):
+        if getattr(self, 'temporary_ladder', False):
+            return
         target = self._checkpoint_path(TRAINING_STATE_FILE, directory)
         temporary = target + '.tmp'
         with open(temporary, 'wb') as f:
@@ -3168,7 +3666,7 @@ class Quoridor:
     def _checkpoint_metadata(self):
         return {
                 'games_played': self.games_played,
-                'greedy_wr_version': 1,
+                'greedy_wr_version': GREEDY_WR_VERSION,
                 'latest_games_by_seat': list(self.latest_games_by_seat),
                 'teacher_gen': self.teacher_gen,
                 'rematch_teacher_gen': self.rematch_teacher_gen,
@@ -3191,14 +3689,21 @@ class Quoridor:
                 'curriculum_latest_credit': self.curriculum_latest_credit,
                 'heuristic_lr_floor': self.heuristic_lr_floor,
                 'optimizer_steps': self.optimizer_steps,
+                'completed_startup_replay': getattr(self, '_completed_startup_replay', None),
                 'replay_samples_latest': self.replay_samples_latest,
                 'replay_samples_historic': self.replay_samples_historic,
                 'replay_samples_tactical': self.replay_samples_tactical,
+                'replay_positions_by_teacher': {
+                    gen: sum(len(game['positions']) for game in games)
+                    for gen, games in self.replay_games.items()},
+                'replay_position_budget': self.REPLAY_POSITIONS_PER_TEACHER,
                 'gate_log_window_size': self.LOG_WINDOW_SIZE
             }
 
     def save_meta(self):
         # Observational sidecar only; restoration uses the bundle's metadata.
+        if getattr(self, 'temporary_ladder', False):
+            return
         target = self._checkpoint_path(META_FILE)
         temporary = target + '.tmp'
         with open(temporary, 'w') as f:
@@ -3207,18 +3712,11 @@ class Quoridor:
             os.fsync(f.fileno())
         os.replace(temporary, target)
 
-    def save_checkpoint(self, manual=False):
-        # A training episode owns deferred targets and updates. Save only after
-        # it commits; the input thread requests a save instead of racing Adam.
-        if self.episode_trajectory or (
-                not self.game_over and getattr(self, 'mode', None) == 'TRAIN'):
-            self._save_requested = True
-            print('Checkpoint requested; saving after this game finishes.')
-            return
+    def _training_bundle(self):
         validate_model_contract(self.teacher_net, "teacher network before save")
         validate_model_contract(self.student_net, "student network before save")
         validate_optimizer_state_shapes(self.optimizer, "optimizer before save")
-        bundle = {
+        return {
             'format_version': 2,
             'teacher': _model_state_dict(self.teacher_net),
             'student': self.student_net.state_dict(),
@@ -3229,11 +3727,29 @@ class Quoridor:
             'replay_format_version': REPLAY_FORMAT_VERSION,
             'replay_games': {gen: list(games) for gen, games in self.replay_games.items()},
             'next_replay_game_id': self.next_replay_game_id,
+            'position_generation': {
+                'starts': self.start_positions, 'used': list(self.used_start_positions),
+                'remaining': self.continuations_remaining,
+                'full_games': self.full_games_played,
+                'continuation_games': self.continuation_games_played,
+            },
             'last_loss': self.last_loss,
             'python_rng': random.getstate(),
             'torch_rng': torch.get_rng_state(),
             'cuda_rng': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
         }
+
+    def save_checkpoint(self, manual=False):
+        if getattr(self, 'temporary_ladder', False):
+            return self._save_ladder(pause=manual)
+        # Normal teacher checkpoints commit at game boundaries. Ladder saves
+        # additionally retain the unfinished episode and can pause between moves.
+        if self.episode_trajectory or (
+                not self.game_over and getattr(self, 'mode', None) == 'TRAIN'):
+            self._save_requested = True
+            print('Checkpoint requested; saving after this game finishes.')
+            return
+        bundle = self._training_bundle()
         self._write_training_bundle(bundle)
         self._save_requested = False
         # Compatibility exports. Interrupted exports cannot supersede the bundle.
@@ -3249,7 +3765,75 @@ class Quoridor:
         print(f"[{'Manual' if manual else 'Auto'} Saved] Gen #{self.teacher_gen} saved.")
         self.toast_msg, self.toast_timer = f"Saved Checkpoint! (Gen #{self.teacher_gen})", 120
 
-    def play_eval_game(self, bot1, bot2, game_curr, game_total, vs_gen):
+    def _save_ladder(self, pause=True):
+        """Called by the training owner between operations; never creates a teacher."""
+        if pause:
+            self.is_training_active = False
+        fields = ('state', 'mode', 'game_over', 'winner', 'winner_id', '_result_recorded',
+                  'student_id', 'current_opponent_gen', 'current_opponent_is_latest',
+                  'game_has_exploration', 'episode_trajectory', 'episode_policies',
+                  'episode_position_keys', 'episode_kind', '_episode_start_ply',
+                  '_pending_search_policy', '_game_start_optimizer_steps',
+                  'p1_gen_str', 'p2_gen_str', '_manual_promotion_test_requested')
+        session = {name: copy.deepcopy(getattr(self, name)) for name in fields}
+        # Restricted torch loading supports sets, but not frozenset snapshots.
+        for frame in session['state'].get('position_history', ()):
+            frame['walls_h'], frame['walls_v'] = set(frame['walls_h']), set(frame['walls_v'])
+        session['match_history'] = list(self.match_history)
+        session['elapsed_seconds'] = max(0.0, time.time() - self.game_start_time)
+        bundle = self._training_bundle()
+        bundle['ladder'] = dict(version=1, target_gen=self.ladder_opponent_gen,
+                                train_depth=self.train_depth, session=session)
+        target = self._ladder_save_path
+        with open(target + '.tmp', 'wb') as stream:
+            torch.save(bundle, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Replace only after the complete new checkpoint is flushed to disk.
+        os.replace(target + '.tmp', target)
+        self._save_requested = False
+        self.toast_msg = 'Ladder saved and paused' if pause else 'Ladder autosaved'
+        self.toast_timer = 240 if pause else 120
+        # Human-readable companion; the atomic bundle above is authoritative.
+        progress = dict(games_played=self.games_played, student_gen=10,
+                        target_gen=self.ladder_opponent_gen,
+                        phase='opponent_pool' if self._passes_training_generation_gate(self.ladder_opponent_gen)
+                              else 'target_only',
+                        generations_to_pass=self._training_generations(),
+                        greedy_results={str(gen): list(log) for gen, log in self.checkpoint_log.items()},
+                        rematch_teacher_gen=self.rematch_teacher_gen,
+                        current_opponent_gen=self.current_opponent_gen,
+                        current_ply=self.state['turns_played'], paused=not self.is_training_active,
+                        resume='Launch Quoridor.py --temporary-ladder, then start/continue training')
+        progress_path = os.path.join(os.path.dirname(target), LADDER_PROGRESS_FILE)
+        with open(progress_path + '.tmp', 'w') as stream:
+            json.dump(progress, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(progress_path + '.tmp', progress_path)
+        print(f'{self.toast_msg}: {target}')
+        return target
+
+    def _restore_ladder_session(self, session):
+        session = dict(session)
+        self.match_history = deque(session.pop('match_history'), maxlen=6)
+        self.game_start_time = time.time() - session.pop('elapsed_seconds')
+        self.__dict__.update(session)
+        opponent = self._load_net_for_gen(self.current_opponent_gen)
+        if opponent is None:
+            raise ValueError('saved ladder opponent is unavailable')
+        self.bot1 = QuoridorBot(1, self.train_depth,
+                               self.student_net if self.student_id == 1 else opponent, self.heuristic_weight)
+        self.bot2 = QuoridorBot(2, self.train_depth,
+                               self.student_net if self.student_id == 2 else opponent, self.heuristic_weight)
+        self._configure_training_search()
+        self.p1_draw_x, self.p1_draw_y = self._get_center_pixels(self.state['p1_pos'])
+        self.p2_draw_x, self.p2_draw_y = self._get_center_pixels(self.state['p2_pos'])
+        self.is_training_active = False
+        self._resume_ladder_game = True
+        self.toast_msg, self.toast_timer = 'Ladder restored and paused', 240
+
+    def play_eval_game(self, bot1, bot2, game_curr, game_total, vs_gen, *, opening_seed=None):
         eval_state = {
             'p1_pos': (4, 8), 'p2_pos': (4, 0),
             'p1_walls': 10, 'p2_walls': 10,
@@ -3258,12 +3842,21 @@ class Quoridor:
             'p1_recent': (), 'p2_recent': (),
             'random_walls': set(), 'p1_last_random': False, 'p2_last_random': False
         }
+        if opening_seed is not None:
+            # Replay the same legal four-ply opening with the seats swapped.
+            # A local RNG keeps openings independent of either model's search.
+            opening_rng = random.Random(opening_seed)
+            rules = QuoridorBot()
+            for _ in range(4):
+                pid = eval_state['turn']
+                action = opening_rng.choice(rules.generate_actions(eval_state, pid))
+                eval_state = rules.apply_action(eval_state, pid, action)
         self.eval_game_curr, self.eval_game_total, self.eval_vs_gen = game_curr, game_total, vs_gen
         saved_state = self.state
         self.state = eval_state
         result = 0
         try:
-            for _ in range(200):
+            for _ in range(200 - eval_state['turns_played']):
                 if hasattr(self, '_trainer_commands'):
                     self._publish_trainer_view()
                     while not self._trainer_allowed.wait(0.05):
@@ -3281,9 +3874,6 @@ class Quoridor:
                     self.draw_board((-1, -1))
                     pygame.time.delay(10)
 
-                if eval_state['p1_pos'][1] == 0: result = 1; break
-                if eval_state['p2_pos'][1] == 8: result = 2; break
-                
                 pid = eval_state['turn']
                 active_bot = bot1 if pid == 1 else bot2
                 action, _ = active_bot.get_move_and_eval(eval_state, epsilon=0.0)
@@ -3292,6 +3882,8 @@ class Quoridor:
                     break
                 eval_state = active_bot.apply_action(eval_state, pid, action, is_random=getattr(active_bot, 'was_last_random', False))
                 self.state = eval_state
+                if eval_state['p1_pos'][1] == 0: result = 1; break
+                if eval_state['p2_pos'][1] == 8: result = 2; break
         finally:
             self.state = saved_state
         return result
@@ -3314,12 +3906,14 @@ class Quoridor:
         total_games = len(opponents) * games_per_model
         completed_games = 0
         results = {}
+        all_passed = True
         print(
             f"\n--- FINAL NON-TRAINING TEST: Candidate Gen "
             f"#{self.teacher_gen + 1} ---"
         )
         print(
-            f"10 frozen games against each of {len(opponents)} training models."
+            f"{games_per_model} frozen games against each of {len(opponents)} training models, "
+            "using paired openings with seats swapped."
         )
 
         self.is_evaluating = True
@@ -3328,6 +3922,8 @@ class Quoridor:
                 gen_results = []
                 for game_index in range(games_per_model):
                     completed_games += 1
+                    # Include the standard start, then distinct seeded openings.
+                    opening_seed = game_index // 2 if game_index >= 2 else None
                     if game_index % 2 == 0:
                         eval_bot1 = QuoridorBot(
                             bot_id=1, max_depth=2, nn_model=self.student_net,
@@ -3338,7 +3934,8 @@ class Quoridor:
                             heuristic_weight=self.heuristic_weight
                         )
                         result = self.play_eval_game(
-                            eval_bot1, eval_bot2, completed_games, total_games, gen
+                            eval_bot1, eval_bot2, completed_games, total_games, gen,
+                            opening_seed=opening_seed
                         )
                         student_won = 1 if result == 1 else 0
                     else:
@@ -3351,7 +3948,8 @@ class Quoridor:
                             heuristic_weight=self.heuristic_weight
                         )
                         result = self.play_eval_game(
-                            eval_bot1, eval_bot2, completed_games, total_games, gen
+                            eval_bot1, eval_bot2, completed_games, total_games, gen,
+                            opening_seed=opening_seed
                         )
                         student_won = 1 if result == 2 else 0
 
@@ -3360,14 +3958,21 @@ class Quoridor:
                         f"Final test {completed_games}/{total_games} vs Gen #{gen}: "
                         f"{'WIN' if student_won else 'LOSS/DRAW'}"
                     )
+                    remaining = games_per_model - len(gen_results)
+                    best_win_rate = (sum(gen_results) + remaining) / games_per_model
+                    if not self._passes_generation_gate(gen, best_win_rate):
+                        all_passed = False
+                        print(f"Stopping final test: Gen #{gen} cannot pass even "
+                              f"with wins in all {remaining} remaining games.")
+                        break
                 results[gen] = gen_results
+                if not all_passed:
+                    break
         finally:
             self.is_evaluating = False
 
-        all_passed = True
         passed_by_gen = {}
-        for _, gen in opponents:
-            gen_results = results[gen]
+        for gen, gen_results in results.items():
             win_rate = sum(gen_results) / len(gen_results)
             passed = self._passes_generation_gate(gen, win_rate)
             passed_by_gen[gen] = passed
@@ -3395,9 +4000,9 @@ class Quoridor:
                         gen_results,
                         maxlen=self.LOG_WINDOW_SIZE
                     )
-                if gen == self.teacher_gen:
+                if gen == self.curriculum_teacher_gen:
                     self.latest_teacher_history.extend(gen_results)
-            latest_log = self.checkpoint_log.get(self.teacher_gen)
+            latest_log = self.checkpoint_log.get(self.curriculum_teacher_gen)
             if latest_log:
                 latest_wins = sum(latest_log)
                 latest_games = len(latest_log)
@@ -3419,33 +4024,62 @@ class Quoridor:
         print("Manual promotion test queued after the current training game.")
 
     def _install_promoted_student(self):
+        finishing_ladder = getattr(self, 'temporary_ladder', False)
+        if finishing_ladder and self.ladder_opponent_gen < 9:
+            self.update_escalation_state()
+            self.ladder_opponent_gen += 1
+            self._reset_curriculum_progress()
+            self.update_opponent_pool()
+            print(f'Gen #10 now targets Gen #{self.ladder_opponent_gen}; '
+                  'student/optimizer preserved; no teacher created.')
+            return
+        if finishing_ladder:
+            # The real official teacher is still Gen #9. Normal promotion now
+            # installs Gen #10 once, then enables ordinary training and saving.
+            self.temporary_ladder = False
         # Preserve the teacher that was actually trained against before the
-        # live teacher network is overwritten.
-        torch.save(
-            _model_state_dict(self.teacher_net),
-            self._checkpoint_path(f'quorinet_teacher_gen_{self.teacher_gen}.pth')
-        )
+        # live teacher network is overwritten. Bootstrap teachers are archived.
+        if not finishing_ladder:
+            torch.save(
+                _model_state_dict(self.teacher_net),
+                self._checkpoint_path(f'quorinet_teacher_gen_{self.teacher_gen}.pth')
+            )
 
         self.update_escalation_state()
         self.teacher_gen += 1
         self.teacher_net = copy.deepcopy(self.student_net)
         self.teacher_net.eval()
 
+        self._reset_curriculum_progress()
+        self._sync_model_archives()
+        self.update_opponent_pool()
+        self.save_checkpoint(manual=True)
+        if finishing_ladder:
+            # A completed ladder must not resume its older pre-promotion state.
+            ladder_path = getattr(self, '_ladder_save_path', None)
+            if ladder_path:
+                for path in (ladder_path, os.path.join(os.path.dirname(ladder_path), LADDER_PROGRESS_FILE)):
+                    if os.path.isfile(path):
+                        os.remove(path)
+            self.toast_msg, self.toast_timer = 'Gen #10 teacher installed; normal saving enabled', 300
+            print(self.toast_msg)
+
+    def _reset_curriculum_progress(self):
+        """Use the same fresh qualification window after either kind of advance."""
         self._roll_replay_buffers_for_new_teacher()
         self.latest_teacher_history.clear()
         self.checkpoint_log.clear()
         self._reset_lr_search_for_new_teacher()
         self.curriculum_latest_credit = 1.0
-
-        self._sync_model_archives()
-        self.update_opponent_pool()
+        self.rematch_teacher_gen = None
         self.student_eval_history.clear()
         self.student_win_rate_str = "Pending greedy WR"
-        self.save_checkpoint(manual=True)
 
-    def train_step(self, state_tensor, turn_pid, next_state_tensor, next_turn_pid, done, winner_id):
-        validate_state_tensor(state_tensor, "train_step state")
-        validate_state_tensor(next_state_tensor, "train_step next_state")
+    def train_step(self, state_tensor, turn_pid, next_state_tensor, next_turn_pid, done, winner_id,
+                   *, position_key=None):
+        shape = tuple(getattr(self.student_net, 'input_shape', STATE_SHAPE))
+        validate_state_tensor(state_tensor, "train_step state", shape=shape)
+        validate_state_tensor(next_state_tensor, "train_step next_state", shape=shape)
         if turn_pid not in (1, 2) or next_turn_pid not in (1, 2):
             raise ValueError(
                 f"turn_pid and next_turn_pid must be 1 or 2, got "
@@ -3456,6 +4090,12 @@ class Quoridor:
 
         # Keep the student fixed throughout the game. Each state receives one
         # target only after the result is known.
+        # Old paused ladder sessions predate board keys; keep those rows aligned.
+        if not hasattr(self, 'episode_position_keys'):
+            self.episode_position_keys = []
+        self.episode_position_keys.extend(
+            [None] * (len(self.episode_trajectory) - len(self.episode_position_keys)))
+        self.episode_position_keys.append(position_key)
         self.episode_trajectory.append((
             state_tensor.detach().cpu().clone(),
             turn_pid,
@@ -3473,12 +4113,14 @@ class Quoridor:
         self.last_game_batches = []
         opponent_gen = self.current_opponent_gen
         accepted = winner_id in (1, 2) and (
-            opponent_gen == self.teacher_gen or winner_id != self.student_id)
+            getattr(self, 'episode_kind', 'opening') != 'opening'
+            or opponent_gen == self.curriculum_teacher_gen or winner_id != self.student_id)
         if not accepted:
             reason = 'unfinished' if winner_id == 0 else 'historical student win'
             print(f"Gen #{opponent_gen} {reason}: discarded {len(self.episode_trajectory)} plies.")
             self.episode_trajectory.clear()
             self.episode_policies.clear()
+            self.episode_position_keys.clear()
             return
 
         tactical = self._tactical_replay_indices()
@@ -3491,35 +4133,46 @@ class Quoridor:
              'tactical': index in tactical}
             for index, (state, pid, _, _) in enumerate(self.episode_trajectory)
         ]
-        for sample, policy in zip(fresh, self.episode_policies):
+        for sample, policy, key in zip(fresh, self.episode_policies, self.episode_position_keys):
             if policy is not None:
                 sample['policy'] = policy
+            if key is not None:
+                sample['position_key'] = key
         for batch, counts in self._training_batches(fresh, opponent_gen):
-            if not self._optimize_student_batch(batch):
+            if not self._optimize_student_batch(batch, fresh_game_id=game_id):
                 raise RuntimeError('accepted game optimizer update did not complete')
             self.replay_samples_latest += counts['replay_latest']
             self.replay_samples_historic += counts['replay_historic']
             self.replay_samples_tactical += (
-                counts['same_teacher_tactical'] + counts['general_tactical'])
+                counts['priority_tactical'] + counts['general_tactical'])
             counts['tactical'] = sum(sample['tactical'] for sample in batch)
             counts['weighted_tactical_loss_share'] = self._last_tactical_loss_share
+            counts['fresh_weight_share'] = getattr(self, '_last_fresh_weight_share', 0.0)
             counts['loss'] = self.last_loss
             self.last_game_batches.append(counts)
             print(f"Batch {len(self.last_game_batches)}: size={len(batch)} "
-                  f"fresh/same/general={counts['fresh']}/{counts['same_teacher']}/{counts['general']} "
+                  f"fresh/priority/general={counts['fresh']}/{counts['priority']}/{counts['general']} "
+                  f"priority by teacher={counts['priority_by_teacher']} "
+                  f"first tracked replay={counts['first_replay']} "
+                  f"fresh value weight={counts['fresh_weight_share']:.1%} "
                   f"tactical={counts['tactical']} "
                   f"weighted tactical loss={self._last_tactical_loss_share:.2%}")
 
         # Commit only after all fresh positions have trained. This game cannot
         # fill its own replay slots; eviction always removes an entire game.
-        self.replay_games.setdefault(
-            opponent_gen, deque(maxlen=self.REPLAY_GAMES_PER_TEACHER)).append({
+        self.replay_games.setdefault(opponent_gen, deque())
+        self._trim_replay(opponent_gen)
+        self.replay_games[opponent_gen].append({
                 'game_id': game_id, 'teacher_gen': opponent_gen,
                 'student_outcome': student_outcome, 'positions': fresh,
+                'source': getattr(self, 'episode_kind', 'opening'),
+                'replay_uses': [0] * len(fresh),
             })
+        self._trim_replay(opponent_gen)
         self.next_replay_game_id += 1
         self.episode_trajectory.clear()
         self.episode_policies.clear()
+        self.episode_position_keys.clear()
 
     def log_match_result(self, winner_id):
         duration = round(time.time() - self.game_start_time, 1)
@@ -3550,7 +4203,10 @@ class Quoridor:
         if self.headless:
             return
         self.virtual_screen.fill(BG_COLOR)
-        title = self.title_font.render("QuoriNet Trainer", True, TEXT_COLOR)
+        temporary_ladder = getattr(self, 'temporary_ladder', False)
+        title = self.title_font.render(
+            'Gen #10 Temporary Ladder' if temporary_ladder else 'QuoriNet Trainer',
+            True, TEXT_COLOR)
         self.virtual_screen.blit(title, title.get_rect(center=(WIDTH // 2, 110)))
 
         self.rect_train = pygame.Rect(WIDTH // 2 - 160, 220, 320, 55)
@@ -3559,12 +4215,13 @@ class Quoridor:
         pygame.draw.rect(self.virtual_screen, MUTED_TEXT, self.rect_save_manual)
         for rect, label in (
             (self.rect_train, "TRAIN BOT (WATCH)"),
-            (self.rect_save_manual, "SAVE CURRENT STUDENT"),
+            (self.rect_save_manual, 'SAVE & PAUSE LADDER' if temporary_ladder else 'SAVE CURRENT STUDENT'),
         ):
             text = self.font.render(label, True, (255, 255, 255))
             self.virtual_screen.blit(text, text.get_rect(center=rect.center))
 
-        self._blit_text("[F11/F: fullscreen, C: save checkpoint]",
+        self._blit_text('C: save ladder progress and pause.' if temporary_ladder else
+                        '[F11/F: fullscreen, C: save checkpoint]',
                         WIDTH // 2 - 145, 370, MUTED_TEXT)
         if self.toast_timer > 0:
             self.toast_timer -= 1
@@ -3616,10 +4273,12 @@ class Quoridor:
             f"Vs Gen #{self.eval_vs_gen} ({self.eval_game_curr}/{self.eval_game_total})"
             if self.is_evaluating else "Waiting on live gates"
         )
+        if getattr(self, 'temporary_ladder', False) and not self.is_evaluating:
+            final_test = f'Gen #1-{self.ladder_opponent_gen}: normal gates'
         metrics = [
             ("Red Player (P1)", self.p1_gen_str),
             ("Blue Player (P2)", self.p2_gen_str),
-            ("Latest Teacher Gen", f"Gen #{self.teacher_gen}"),
+            ("Curriculum Target Gen", f"Gen #{self.curriculum_teacher_gen}"),
             ("Candidate Student Gen", f"Gen #{self.teacher_gen + 1}"),
             ("Wall candidates", "All legal"),
             ("Student Win Rate", self.student_win_rate_str),
@@ -3635,12 +4294,8 @@ class Quoridor:
             self.virtual_screen.blit(rendered, (x + SIDEBAR_WIDTH - rendered.get_width() - 12, y))
             y += 20
 
-        self.rect_lr_up = pygame.Rect(x + 12, 240, 156, 26)
-        self.rect_lr_down = pygame.Rect(x + 180, 240, 168, 26)
-        for rect, label in ((self.rect_lr_up, 'LR x10'), (self.rect_lr_down, 'LR x0.1')):
-            pygame.draw.rect(self.virtual_screen, MUTED_TEXT, rect)
-            text = self.small_font.render(label, True, (255, 255, 255))
-            self.virtual_screen.blit(text, text.get_rect(center=rect.center))
+        self._blit_text(f'LR schedule: {self.optimizer_steps:,} updates',
+                        x + 12, 240, MUTED_TEXT)
 
         self._blit_text("MATCH LOG HISTORY", x + 12, 270, font=self.small_font)
         for label, dx in (("Game", 12), ("Winner", 72), ("Turns", 180), ("Time", 245)):
@@ -3725,7 +4380,8 @@ class Quoridor:
         else:
             training_status = (
                 "TRAINING PAUSED" if not self.is_training_active
-                else f"Games: {self.games_played} | Turns: {self.state['turns_played']}"
+                else f"Games: {self.games_played} | {self.episode_kind.title()}: "
+                     f"{self.state['turns_played'] - self._episode_start_ply} new plies"
             )
         training_surface = self.small_font.render(training_status, True, P2_COLOR)
         self.virtual_screen.blit(
@@ -3747,7 +4403,9 @@ class Quoridor:
              "Stop Training" if self.is_training_active else "Continue Training",
              P1_COLOR if self.is_training_active else (46, 125, 50)),
             (self.rect_test_promotion,
-             "Promotion Test Queued" if self._manual_promotion_test_requested else "Test Promotion",
+             ("Ladder Test Queued" if self._manual_promotion_test_requested else "Test Ladder")
+             if getattr(self, 'temporary_ladder', False) else
+             ("Promotion Test Queued" if self._manual_promotion_test_requested else "Test Promotion"),
              MUTED_TEXT if self._manual_promotion_test_requested else ORANGE_COLOR),
             (self.rect_new_game, "New Game", MUTED_TEXT),
             (self.rect_menu, "Menu", MUTED_TEXT),
@@ -3784,11 +4442,14 @@ class Quoridor:
 
     def _commit_training_action(self, state_tensor, turn_pid):
         done, winner_id = self._detect_terminal()
+        self._remember_start_position(self.state)
         next_pid = self.state['turn']
         bot = self.bot1 if turn_pid == 1 else self.bot2
         self._pending_search_policy = getattr(bot, 'last_policy', None)
-        self.train_step(state_tensor, turn_pid, encode_state(self.state, next_pid),
-                        next_pid, done, winner_id)
+        history = self.state.get('position_history', ())
+        self.train_step(state_tensor, turn_pid, encode_state_for_model(self.student_net, self.state, next_pid),
+                        next_pid, done, winner_id,
+                        position_key=get_position_key(history[-1]) if history else None)
         self.check_win()
 
     def check_win(self):
@@ -3814,6 +4475,17 @@ class Quoridor:
 
             if self.mode == "TRAIN":
                 self.games_played += 1
+                if self.episode_kind != 'opening':
+                    self.continuation_games_played += 1
+                    print(f'{self.episode_kind.title()} continuation: '
+                          f'{self.state["turns_played"] - self._episode_start_ply} new plies; '
+                          'excluded from full-game WR and rematches.')
+                    self.save_meta()
+                    if self.games_played % 250 == 0 or self._save_requested:
+                        self.save_checkpoint(manual=self._save_requested)
+                    return
+                self.full_games_played += 1
+                self.continuations_remaining = self.CONTINUATIONS_PER_GAME
                 if self.current_opponent_is_latest:
                     self.latest_games_by_seat[self.student_id - 1] += 1
 
@@ -3849,7 +4521,7 @@ class Quoridor:
                 # after every result, including historical opponents.
                 self._refresh_opponent_weights()
 
-                latest_log = self.checkpoint_log.get(self.teacher_gen)
+                latest_log = self.checkpoint_log.get(self.curriculum_teacher_gen)
                 if latest_log:
                     latest_wins = sum(latest_log)
                     latest_games = len(latest_log)
@@ -3863,7 +4535,7 @@ class Quoridor:
                 print(f"Learning: {self.optimizer_steps - self._game_start_optimizer_steps} "
                       f"steps this game / {self.optimizer_steps} total | "
                       f"LR={self.optimizer.param_groups[0]['lr']:.8f} "
-                      f"(manual) | walls=all legal | "
+                      f"(update schedule) | walls=all legal | "
                       f"replay samples latest/historic="
                       f"{self.replay_samples_latest}/{self.replay_samples_historic}")
                 print(f"Current training WRs: {self._format_training_win_rates()}")
@@ -3887,7 +4559,7 @@ class Quoridor:
                     if self.run_final_promotion_test():
                         print(
                             f"Candidate Gen #{self.teacher_gen + 1} passed every "
-                            f"final gate. Installing new teacher."
+                            f"final gate. Advancing curriculum."
                         )
                         self._install_promoted_student()
                     else:
@@ -4105,15 +4777,16 @@ class Quoridor:
         return passed
 
     def _restore_game_sampling(self, meta):
-        if meta.get('greedy_wr_version') == 1:
+        if meta.get('greedy_wr_version') == GREEDY_WR_VERSION:
             counts = meta.get('latest_games_by_seat', [0, 0])
             if (not isinstance(counts, list) or len(counts) != 2
                     or any(type(n) is not int or n < 0 for n in counts)):
                 raise ValueError('invalid latest-teacher game counts by seat')
             self.latest_games_by_seat = list(counts)
             return
-        # Old WR histories do not identify exploratory games. Start clean
-        # metrics while preserving the model, optimizer and replay.
+        # Outcomes from a different search cannot qualify the current student.
+        # Preserve learned weights, optimizer, replay and curriculum position.
+        self.latest_games_by_seat = [0, 0]
         self.student_eval_history.clear()
         self.latest_teacher_history.clear()
         self.checkpoint_log.clear()
@@ -4123,23 +4796,31 @@ class Quoridor:
         self._reset_lr_search_for_new_teacher()
 
     def _training_epsilon(self, active_bot):
+        # Compatibility for older callers: a positive value enables sampling.
+        return self._training_temperature(active_bot)
+
+    def _training_root_noise(self, active_bot):
         is_teacher = (active_bot.nn_model is not self.student_net)
-        if not self.game_has_exploration or not self.current_opponent_is_latest or is_teacher:
-            return 0.0
-        return 0.30 * (0.85 ** self.state['turns_played'])
+        return (not self.is_evaluating and self.game_has_exploration
+                and (self.current_opponent_is_latest
+                     or getattr(self, 'episode_kind', 'opening') != 'opening') and not is_teacher)
+
+    def _training_temperature(self, active_bot):
+        # Proposed Quoridor schedule: turns_played counts completed plies.
+        elapsed = self.state['turns_played'] - getattr(self, '_episode_start_ply', 0)
+        return 1.0 if self._training_root_noise(active_bot) and elapsed < 11 else 0.0
 
     def run_headless_training(self, num_games):
         print(f"Starting Headless Turbo Training for {num_games} games...")
-        self.mode = "TRAIN"
-        self.is_training_active = True
-        self.reset_game()
+        self._apply_trainer_command('start')
         self._quit_requested = False
+        commands = queue.SimpleQueue()
         
         def command_listener():
             while True:
                 cmd = sys.stdin.readline().strip().lower()
-                if cmd == 'p': self.is_training_active = not self.is_training_active
-                elif cmd == 's': self._save_requested = True
+                if cmd == 'p': commands.put('toggle')
+                elif cmd == 's': commands.put('save')
                 elif cmd == 'q': self._quit_requested = True
                 elif not cmd: return
                     
@@ -4147,7 +4828,13 @@ class Quoridor:
         target_games, last_print = self.games_played + num_games, self.games_played
         
         while self.games_played < target_games:
-            if self._quit_requested and self.game_over:
+            while not commands.empty():
+                command = commands.get_nowait()
+                if command == 'toggle':
+                    self._apply_trainer_command('active', not self.is_training_active)
+                else:
+                    self._apply_trainer_command(command)
+            if self._quit_requested and (self.game_over or self.temporary_ladder):
                 break
             if not self.is_training_active and not self._quit_requested:
                 time.sleep(0.5)
@@ -4162,13 +4849,12 @@ class Quoridor:
                 continue
 
             active_bot = self.bot1 if self.state['turn'] == 1 else self.bot2
-            pre_action_state_tensor = encode_state(self.state, self.state['turn'])
+            pre_action_state_tensor = encode_state_for_model(self.student_net, self.state, self.state['turn'])
             pre_action_pid = self.state['turn']
             
-            # Explore only when the student is facing the latest champion.
-            eps = self._training_epsilon(active_bot)
-            
-            action, _ = active_bot.get_move_and_eval(self.state, epsilon=eps)
+            action, _ = active_bot.get_move_and_eval(
+                self.state, temperature=self._training_temperature(active_bot),
+                root_noise=self._training_root_noise(active_bot))
             if action: self.state = active_bot.apply_action(self.state, pre_action_pid, action, is_random=getattr(active_bot, 'was_last_random', False))
             else: self.state['turns_played'] = 200
                 
@@ -4182,12 +4868,14 @@ class Quoridor:
     def _publish_trainer_view(self):
         """Publish detached display data; only the worker touches models/state."""
         names = (
-            'state', 'game_over', 'winner', 'games_played', 'teacher_gen',
+            'state', 'game_over', 'winner', 'games_played', 'teacher_gen', 'optimizer_steps',
+            'episode_kind', '_episode_start_ply',
             'current_opponent_gen', 'p1_gen_str', 'p2_gen_str',
             'student_win_rate_str', 'last_loss', 'is_evaluating',
             'eval_vs_gen', 'eval_game_curr', 'eval_game_total',
             '_manual_promotion_test_requested', 'match_history',
             'checkpoint_log', 'opponent_weights', 'toast_msg', 'toast_timer',
+            'ladder_opponent_gen', 'temporary_ladder',
         )
         snapshot = {name: copy.deepcopy(getattr(self, name)) for name in names}
         snapshot['opponent_pool'] = [(None, gen) for _, gen in self.opponent_pool]
@@ -4201,17 +4889,72 @@ class Quoridor:
         self._trainer_snapshot = snapshot
         self.toast_timer = 0
 
+    def _run_startup_replay(self):
+        """Consume a one-time replay request before any new game is generated."""
+        path = getattr(self, '_startup_replay_path', None)
+        if not getattr(self, 'temporary_ladder', False) or not path or not os.path.isfile(path):
+            return
+        with open(path, encoding='utf-8') as stream:
+            request = json.load(stream)
+        generation, request_id = request.get('generation'), request.get('id')
+        if (request.get('version') != 1 or type(generation) is not int
+                or generation < 1 or not isinstance(request_id, str) or not request_id):
+            raise ValueError('invalid one-time replay request')
+        if getattr(self, '_completed_startup_replay', None) == request_id:
+            os.remove(path)  # Already committed with the weights; do not replay twice.
+            return
+        games = self.replay_games.get(generation, ())
+        total = sum(len(game['positions']) for game in games)
+        if not total:
+            raise ValueError(f'No saved replay plies for Gen #{generation}')
+
+        # Commit weights and the completion marker together after the full pass
+        # so this one-time request cannot repeat after a restart.
+        print(f'Startup replay: Gen #{generation}, {len(games)} saved games, {total} plies; one pass.')
+        completed = 0
+        for batch, counts in self._training_batches([], generation, replay_only=True):
+            if not self._optimize_student_batch(batch):
+                raise RuntimeError('startup replay optimizer update did not complete')
+            self.replay_samples_latest += counts['replay_latest']
+            self.replay_samples_historic += counts['replay_historic']
+            self.replay_samples_tactical += counts['priority_tactical']
+            completed += len(batch)
+            self.toast_msg = f'Replaying Gen #{generation}: {completed}/{total} saved plies'
+            self.toast_timer = 180
+            print(self.toast_msg)
+            if hasattr(self, '_trainer_commands'):
+                self._publish_trainer_view()
+        if completed != total:
+            raise RuntimeError(f'startup replay covered {completed}/{total} plies')
+        # New weights start a new episode; a partially played old game cannot
+        # contribute a mixed-policy win rate. No games or wins are fabricated.
+        self.reset_game()
+        self._resume_ladder_game = True
+        self._completed_startup_replay = request_id
+        self.save_checkpoint()
+        os.remove(path)
+        self.toast_msg, self.toast_timer = 'Saved replay pass complete; normal training resumes', 240
+        print(self.toast_msg)
+
     def _apply_trainer_command(self, command, value=None):
         if command == 'start':
             self.mode, self.is_training_active = 'TRAIN', True
-            self.reset_game()
+            self._run_startup_replay()
+            if getattr(self, '_resume_ladder_game', False):
+                self._resume_ladder_game = False
+            else:
+                self.reset_game()
         elif command == 'menu':
             self.mode = 'MENU'
         elif command == 'active':
             self.is_training_active = value
+            if value:
+                self._run_startup_replay()
+                self._resume_ladder_game = False
             if not value:
                 self.save_checkpoint(manual=True)
         elif command == 'new':
+            self._resume_ladder_game = False
             self.reset_game()
         elif command == 'lr':
             self._adjust_lr_manually(value)
@@ -4240,10 +4983,11 @@ class Quoridor:
                         self.reset_game()
                     else:
                         active_bot = self.bot1 if self.state['turn'] == 1 else self.bot2
-                        state_tensor = encode_state(self.state, self.state['turn'])
+                        state_tensor = encode_state_for_model(self.student_net, self.state, self.state['turn'])
                         pid = self.state['turn']
                         action, _ = active_bot.get_move_and_eval(
-                            self.state, epsilon=self._training_epsilon(active_bot))
+                            self.state, temperature=self._training_temperature(active_bot),
+                            root_noise=self._training_root_noise(active_bot))
                         if action:
                             self.state = active_bot.apply_action(
                                 self.state, pid, action,
@@ -4261,6 +5005,14 @@ class Quoridor:
                 self._trainer_error = sys.exc_info()[1]
         except Exception as error:
             self._trainer_error = error
+        finally:
+            # The worker owns the models; closing the window must save here,
+            # after the current operation, rather than racing it from the UI.
+            if self.temporary_ladder and self._trainer_error is None:
+                try:
+                    self.save_checkpoint(manual=True)
+                except Exception as error:
+                    self._trainer_error = error
 
     def run_trainer(self):
         # Pygame stays on the main thread. One worker preserves the existing
@@ -4283,6 +5035,9 @@ class Quoridor:
         last_snapshot = None
 
         def request(command, value=None):
+            if view.temporary_ladder and command in ('save', 'snapshot'):
+                view.is_training_active = False
+                self._trainer_allowed.clear()
             self._trainer_commands.put((command, value))
             view.toast_msg = 'Request queued; finishing current operation'
             view.toast_timer = 180
@@ -4326,11 +5081,7 @@ class Quoridor:
                             elif view.rect_save_manual.collidepoint(mouse_pos):
                                 request('snapshot')
                         elif view.mode == "TRAIN":
-                            if view.rect_lr_up.collidepoint(mouse_pos):
-                                request('lr', 10.0)
-                            elif view.rect_lr_down.collidepoint(mouse_pos):
-                                request('lr', 0.1)
-                            elif view.rect_menu.collidepoint(mouse_pos):
+                            if view.rect_menu.collidepoint(mouse_pos):
                                 view.mode = "MENU"
                                 self._trainer_allowed.clear()
                                 request('menu')
@@ -4357,6 +5108,8 @@ class Quoridor:
             self._trainer_allowed.set()
             worker.join()
             pygame.quit()
+            if self._trainer_error is not None:
+                raise self._trainer_error
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -4365,13 +5118,15 @@ if __name__ == "__main__":
     parser.add_argument('--threads', type=int, default=min(4, os.cpu_count() or 1),
                         help='PyTorch CPU threads; small boards often benefit from 1-4')
     parser.add_argument('--train-depth', type=int, default=2,
-                        help='legacy search depth / MCTS budget in units of 64 simulations (default: 2)')
+                        help='legacy search depth / training MCTS budget in units of 64 simulations, raised for root coverage (default: 2)')
     parser.add_argument('--play-depth', type=int, default=4,
                         help='legacy search depth / MCTS budget in units of 64 simulations (default: 4)')
     parser.add_argument('--train-updates', type=int, default=None,
                         help='deprecated and ignored; fresh positions each receive one pass')
     parser.add_argument('--checkpoint-dir', default=None,
                         help='directory for all training saves; defaults to the working directory')
+    parser.add_argument('--temporary-ladder', action='store_true',
+                        help='start/resume Gen #10 through Gen #1-9; saves every 250 games, on pause, and on close')
     parser.add_argument(
         "--headless",
         type=int,
@@ -4410,7 +5165,11 @@ if __name__ == "__main__":
         random.seed(args.seed)
         torch.manual_seed(args.seed)
     if args.checkpoint_dir:
-        os.makedirs(args.checkpoint_dir, exist_ok=True)
+        if args.temporary_ladder:
+            if not os.path.isdir(args.checkpoint_dir):
+                parser.error('--temporary-ladder requires an existing checkpoint directory')
+        else:
+            os.makedirs(args.checkpoint_dir, exist_ok=True)
         os.chdir(args.checkpoint_dir)
 
     if args.headless < 0:
@@ -4428,7 +5187,8 @@ if __name__ == "__main__":
         headless=headless_mode,
         train_depth=args.train_depth,
         play_depth=args.play_depth,
-        train_updates=args.train_updates
+        train_updates=args.train_updates,
+        temporary_ladder=args.temporary_ladder,
     )
     if args.overfit_one_game:
         passed = game.run_headless_single_game_overfit_check(
