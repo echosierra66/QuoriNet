@@ -12,7 +12,7 @@ import threading
 import pygame
 import torch
 
-from trainer import ArchivedValueNet, Quoridor as Trainer, QuoridorBot
+from Quoridor import ArchivedValueNet, Quoridor as Trainer, QuoridorBot
 
 
 SCALE = 0.92
@@ -611,6 +611,7 @@ class Quoridor(Trainer):
                         'turn': 2,
                         'turns_played': self.state['turns_played'],
                         'history': self.state['history'].copy(),
+                        'position_history': self.state.get('position_history', ()),
                         'p1_recent': self.state.get('p1_recent', ()),
                         'p2_recent': self.state.get('p2_recent', ()),
                     }
