@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="350" viewBox="0 0 960 350" role="img" aria-labelledby="title desc">
+<title id="title">One network input: eight positions, nine planes each</title><desc id="desc">Every position is encoded from the player to move NOW, including preceding positions.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#52667c"/></marker></defs>
+<rect width="960" height="100%" fill="white"/>
+<text x="30" y="36" font-family="Segoe UI, Arial, sans-serif" font-size="25" fill="#17324d" font-weight="600" text-anchor="start">One network input: eight positions, nine planes each</text>
+<text x="30" y="64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">Every position is encoded from the player to move NOW, including preceding positions.</text>
+<rect x="30" y="108" width="104" height="95" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="82.0" y="149.38" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">t: now</text>
+<text x="82.0" y="173.18" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">9 planes</text>
+<path d="M82 203 L82 238" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="143" y="108" width="104" height="95" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="195.0" y="149.38" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">t − 1</text>
+<text x="195.0" y="173.18" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">9 planes</text>
+<path d="M195 203 L195 238" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="256" y="108" width="104" height="95" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="308.0" y="149.38" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">t − 2</text>
+<text x="308.0" y="173.18" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">9 planes</text>
+<path d="M308 203 L308 238" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="369" y="108" width="104" height="95" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="421.0" y="149.38" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">t − 3</text>
+<text x="421.0" y="173.18" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">9 planes</text>
+<path d="M421 203 L421 238" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="482" y="108" width="104" height="95" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="534.0" y="149.38" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">t − 4</text>
+<text x="534.0" y="173.18" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">9 planes</text>
+<path d="M534 203 L534 238" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="595" y="108" width="104" height="95" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="647.0" y="149.38" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">t − 5</text>
+<text x="647.0" y="173.18" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">9 planes</text>
+<path d="M647 203 L647 238" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="708" y="108" width="104" height="95" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="760.0" y="149.38" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">t − 6</text>
+<text x="760.0" y="173.18" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">9 planes</text>
+<path d="M760 203 L760 238" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="821" y="108" width="104" height="95" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="873.0" y="149.38" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">t − 7</text>
+<text x="873.0" y="173.18" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">9 planes</text>
+<path d="M873 203 L873 238" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="30" y="240" width="895" height="60" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="477.5" y="277.14" font-family="Segoe UI, Arial, sans-serif" font-size="21" fill="#17324d" font-weight="600" text-anchor="middle">Concatenate newest first → one 72 × 9 × 9 input</text>
+<text x="30" y="330" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">Missing positions: zero planes. Player 2: rotate every frame and swap player ownership.</text>
+</svg>

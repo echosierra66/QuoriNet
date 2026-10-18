@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="380" viewBox="0 0 960 380" role="img" aria-labelledby="title desc">
+<title id="title">From a played game to a training update</title><desc id="desc">The student stays fixed while the game is played. Updates follow game admission.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#52667c"/></marker></defs>
+<rect width="960" height="100%" fill="white"/>
+<text x="30" y="36" font-family="Segoe UI, Arial, sans-serif" font-size="25" fill="#17324d" font-weight="600" text-anchor="start">From a played game to a training update</text>
+<text x="30" y="64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">The student stays fixed while the game is played. Updates follow game admission.</text>
+<rect x="30" y="105" width="255" height="100" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="157.5" y="148.52" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">Choose a teacher</text>
+<text x="157.5" y="173.72" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Saved earlier network</text>
+<rect x="350" y="105" width="255" height="100" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="477.5" y="148.52" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">Play a game</text>
+<text x="477.5" y="173.72" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Student versus teacher</text>
+<rect x="670" y="105" width="260" height="100" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="800.0" y="148.52" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">Check game admission</text>
+<text x="800.0" y="173.72" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Keep only eligible outcomes</text>
+<path d="M285 155 L350 155" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M605 155 L670 155" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="350" y="255" width="255" height="90" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="477.5" y="293.52" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">Train the student</text>
+<text x="477.5" y="318.71999999999997" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Fresh positions + replay</text>
+<path d="M800 205 V300 H605" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M350 300 H150 V205" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="635" y="328" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">Search simulations happen</text>
+<text x="635" y="351" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">inside each move.</text>
+<text x="816" y="259" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">if accepted</text>
+</svg>

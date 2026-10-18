@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="440" viewBox="0 0 960 440" role="img" aria-labelledby="title desc">
+<title id="title">One MCTS simulation</title><desc id="desc">Values below are illustrative; each position uses its own player-to-move perspective.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#52667c"/></marker></defs>
+<rect width="960" height="100%" fill="white"/>
+<text x="30" y="36" font-family="Segoe UI, Arial, sans-serif" font-size="25" fill="#17324d" font-weight="600" text-anchor="start">One MCTS simulation</text>
+<text x="30" y="64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">Values below are illustrative; each position uses its own player-to-move perspective.</text>
+<rect x="75" y="97" width="275" height="65" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="212.5" y="123.38" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Root: player 1 to move</text>
+<text x="212.5" y="147.18" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">Backup value +0.4</text>
+<rect x="75" y="215" width="275" height="65" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="212.5" y="241.38" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Child: player 2 to move</text>
+<text x="212.5" y="265.18" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">Backup value −0.4</text>
+<rect x="75" y="333" width="275" height="65" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="212.5" y="359.38" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Leaf: player 1 to move</text>
+<text x="212.5" y="383.18" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">Estimated value +0.4</text>
+<path d="M135 162 L135 215" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M135 280 L135 333" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M285 333 L285 280" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)" stroke-dasharray="6 5"/>
+<path d="M285 215 L285 162" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)" stroke-dasharray="6 5"/>
+<rect x="430" y="97" width="490" height="65" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="675.0" y="135.96" font-family="Segoe UI, Arial, sans-serif" font-size="19" fill="#17324d" font-weight="600" text-anchor="middle">1. Select actions through the tree</text>
+<rect x="430" y="215" width="490" height="65" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="675.0" y="253.96" font-family="Segoe UI, Arial, sans-serif" font-size="19" fill="#17324d" font-weight="600" text-anchor="middle">2. Expand and evaluate a leaf</text>
+<rect x="430" y="333" width="490" height="65" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="675.0" y="371.96" font-family="Segoe UI, Arial, sans-serif" font-size="19" fill="#17324d" font-weight="600" text-anchor="middle">3. Back up values; negate at each turn</text>
+<text x="367" y="190" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#087f8c" font-weight="400" text-anchor="middle">select</text>
+<text x="367" y="310" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#b65d21" font-weight="400" text-anchor="middle">back up</text>
+</svg>

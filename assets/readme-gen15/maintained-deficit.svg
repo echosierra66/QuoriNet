@@ -1,0 +1,658 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="1140" viewBox="0 0 960 1140" role="img" aria-labelledby="title desc">
+<title id="title">A wall strategy creates a maintained deficit</title><desc id="desc">Legal worked continuation: P1 is the student (orange); P2 is the teacher (blue).</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#52667c"/></marker></defs>
+<rect width="960" height="100%" fill="white"/>
+<text x="30" y="36" font-family="Segoe UI, Arial, sans-serif" font-size="25" fill="#17324d" font-weight="600" text-anchor="start">A wall strategy creates a maintained deficit</text>
+<text x="30" y="64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">Legal worked continuation: P1 is the student (orange); P2 is the teacher (blue).</text>
+<text x="30" y="91" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">Coordinates are (column, row). P1 aims for row 0; P2 aims for row 8. Arrows show shortest-move routes.</text>
+<text x="30" y="113" font-family="Segoe UI, Arial, sans-serif" font-size="15" fill="#52667c" font-weight="400" text-anchor="start">d1 / d2 = shortest-move distances. Gap and band are always expressed from P1’s perspective.</text>
+<text x="30" y="150" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="start">5: before the teacher places H(0,3)</text>
+<text x="30" y="174" font-family="Segoe UI, Arial, sans-serif" font-size="15" fill="#52667c" font-weight="400" text-anchor="start">P2 to move; total ply 17</text>
+<text x="70" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">0</text>
+<text x="49" y="221" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">0</text>
+<text x="95" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">1</text>
+<text x="49" y="246" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">1</text>
+<text x="120" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">2</text>
+<text x="49" y="271" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">2</text>
+<text x="145" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">3</text>
+<text x="49" y="296" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">3</text>
+<text x="170" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">4</text>
+<text x="49" y="321" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">4</text>
+<text x="195" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">5</text>
+<text x="49" y="346" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">5</text>
+<text x="220" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">6</text>
+<text x="49" y="371" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">6</text>
+<text x="245" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">7</text>
+<text x="49" y="396" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">7</text>
+<text x="270" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">8</text>
+<text x="49" y="421" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">8</text>
+<rect x="59" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="84" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="109" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="134" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="159" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="184" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="209" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="234" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="259" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="59" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="84" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="109" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="134" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="159" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="184" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="209" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="234" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="259" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="59" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="84" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="109" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="134" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="159" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="184" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="209" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="234" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="259" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="59" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="84" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="109" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="134" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="159" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="184" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="209" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="234" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="259" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="59" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="84" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="109" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="134" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="159" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="184" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="209" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="234" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="259" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="59" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="84" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="109" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="134" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="159" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="184" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="209" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="234" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="259" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="59" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="84" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="109" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="134" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="159" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="184" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="209" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="234" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="259" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="59" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="84" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="109" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="134" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="159" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="184" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="209" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="234" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="259" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="59" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="84" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="109" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="134" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="159" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="184" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="209" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="234" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="259" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<path d="M59 203 H281" stroke="#b65d21" stroke-width="2"/>
+<path d="M59 430 H281" stroke="#3868b2" stroke-width="2"/>
+<path d="M70 316 L70 291 L70 266 L70 241 L70 216" fill="none" stroke="#b65d21" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+<path d="M220 316 L220 341 L220 366 L220 391 L220 416" fill="none" stroke="#3868b2" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+<path d="M234 228.5 H281" stroke="#52667c" stroke-width="5"/>
+<path d="M257.5 355 V402" stroke="#52667c" stroke-width="5"/>
+<path d="M257.5 280 V327" stroke="#52667c" stroke-width="5"/>
+<circle cx="70" cy="316" r="9" fill="#b65d21"/>
+<text x="70" y="320" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="white" font-weight="600" text-anchor="middle">1</text>
+<circle cx="220" cy="316" r="9" fill="#3868b2"/>
+<text x="220" y="320" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="white" font-weight="600" text-anchor="middle">2</text>
+<text x="30" y="458" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">d1 = 4; d2 = 4</text>
+<text x="30" y="483" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="start">Gap -1 → band -1</text>
+<text x="340" y="150" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="start">6: the wall creates band −2</text>
+<text x="340" y="174" font-family="Segoe UI, Arial, sans-serif" font-size="15" fill="#52667c" font-weight="400" text-anchor="start">P1 to move; total ply 18</text>
+<text x="380" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">0</text>
+<text x="359" y="221" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">0</text>
+<text x="405" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">1</text>
+<text x="359" y="246" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">1</text>
+<text x="430" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">2</text>
+<text x="359" y="271" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">2</text>
+<text x="455" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">3</text>
+<text x="359" y="296" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">3</text>
+<text x="480" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">4</text>
+<text x="359" y="321" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">4</text>
+<text x="505" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">5</text>
+<text x="359" y="346" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">5</text>
+<text x="530" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">6</text>
+<text x="359" y="371" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">6</text>
+<text x="555" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">7</text>
+<text x="359" y="396" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">7</text>
+<text x="580" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">8</text>
+<text x="359" y="421" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">8</text>
+<rect x="369" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="394" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="419" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="444" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="469" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="494" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="519" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="544" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="569" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="369" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="394" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="419" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="444" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="469" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="494" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="519" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="544" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="569" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="369" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="394" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="419" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="444" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="469" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="494" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="519" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="544" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="569" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="369" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="394" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="419" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="444" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="469" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="494" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="519" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="544" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="569" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="369" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="394" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="419" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="444" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="469" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="494" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="519" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="544" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="569" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="369" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="394" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="419" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="444" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="469" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="494" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="519" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="544" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="569" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="369" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="394" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="419" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="444" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="469" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="494" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="519" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="544" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="569" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="369" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="394" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="419" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="444" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="469" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="494" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="519" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="544" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="569" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="369" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="394" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="419" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="444" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="469" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="494" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="519" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="544" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="569" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<path d="M369 203 H591" stroke="#b65d21" stroke-width="2"/>
+<path d="M369 430 H591" stroke="#3868b2" stroke-width="2"/>
+<path d="M380 316 L405 316 L430 316 L430 291 L430 266 L430 241 L430 216" fill="none" stroke="#b65d21" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+<path d="M530 316 L530 341 L530 366 L530 391 L530 416" fill="none" stroke="#3868b2" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+<path d="M544 228.5 H591" stroke="#52667c" stroke-width="5"/>
+<path d="M369 303.5 H416" stroke="#b84949" stroke-width="5"/>
+<path d="M567.5 355 V402" stroke="#52667c" stroke-width="5"/>
+<path d="M567.5 280 V327" stroke="#52667c" stroke-width="5"/>
+<circle cx="380" cy="316" r="9" fill="#b65d21"/>
+<text x="380" y="320" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="white" font-weight="600" text-anchor="middle">1</text>
+<circle cx="530" cy="316" r="9" fill="#3868b2"/>
+<text x="530" y="320" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="white" font-weight="600" text-anchor="middle">2</text>
+<text x="340" y="458" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">d1 = 6; d2 = 4</text>
+<text x="340" y="483" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="start">Gap -3 → band -2</text>
+<text x="650" y="150" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="start">7: P1 detours to (1,4)</text>
+<text x="650" y="174" font-family="Segoe UI, Arial, sans-serif" font-size="15" fill="#52667c" font-weight="400" text-anchor="start">P2 to move; total ply 19</text>
+<text x="690" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">0</text>
+<text x="669" y="221" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">0</text>
+<text x="715" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">1</text>
+<text x="669" y="246" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">1</text>
+<text x="740" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">2</text>
+<text x="669" y="271" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">2</text>
+<text x="765" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">3</text>
+<text x="669" y="296" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">3</text>
+<text x="790" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">4</text>
+<text x="669" y="321" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">4</text>
+<text x="815" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">5</text>
+<text x="669" y="346" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">5</text>
+<text x="840" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">6</text>
+<text x="669" y="371" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">6</text>
+<text x="865" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">7</text>
+<text x="669" y="396" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">7</text>
+<text x="890" y="199" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">8</text>
+<text x="669" y="421" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">8</text>
+<rect x="679" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="704" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="729" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="754" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="779" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="804" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="829" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="854" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="879" y="205" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="679" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="704" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="729" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="754" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="779" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="804" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="829" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="854" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="879" y="230" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="679" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="704" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="729" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="754" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="779" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="804" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="829" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="854" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="879" y="255" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="679" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="704" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="729" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="754" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="779" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="804" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="829" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="854" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="879" y="280" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="679" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="704" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="729" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="754" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="779" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="804" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="829" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="854" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="879" y="305" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="679" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="704" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="729" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="754" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="779" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="804" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="829" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="854" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="879" y="330" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="679" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="704" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="729" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="754" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="779" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="804" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="829" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="854" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="879" y="355" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="679" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="704" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="729" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="754" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="779" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="804" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="829" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="854" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="879" y="380" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="679" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="704" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="729" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="754" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="779" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="804" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="829" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="854" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="879" y="405" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<path d="M679 203 H901" stroke="#b65d21" stroke-width="2"/>
+<path d="M679 430 H901" stroke="#3868b2" stroke-width="2"/>
+<path d="M715 316 L740 316 L740 291 L740 266 L740 241 L740 216" fill="none" stroke="#b65d21" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+<path d="M840 316 L840 341 L840 366 L840 391 L840 416" fill="none" stroke="#3868b2" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+<path d="M854 228.5 H901" stroke="#52667c" stroke-width="5"/>
+<path d="M679 303.5 H726" stroke="#b84949" stroke-width="5"/>
+<path d="M877.5 355 V402" stroke="#52667c" stroke-width="5"/>
+<path d="M877.5 280 V327" stroke="#52667c" stroke-width="5"/>
+<circle cx="715" cy="316" r="9" fill="#b65d21"/>
+<text x="715" y="320" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="white" font-weight="600" text-anchor="middle">1</text>
+<circle cx="840" cy="316" r="9" fill="#3868b2"/>
+<text x="840" y="320" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="white" font-weight="600" text-anchor="middle">2</text>
+<text x="650" y="458" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">d1 = 5; d2 = 4</text>
+<text x="650" y="483" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="start">Gap -3 → band -2</text>
+<text x="30" y="507" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="start">8: P2 advances to (6,5)</text>
+<text x="30" y="531" font-family="Segoe UI, Arial, sans-serif" font-size="15" fill="#52667c" font-weight="400" text-anchor="start">P1 to move; total ply 20</text>
+<text x="70" y="556" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">0</text>
+<text x="49" y="578" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">0</text>
+<text x="95" y="556" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">1</text>
+<text x="49" y="603" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">1</text>
+<text x="120" y="556" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">2</text>
+<text x="49" y="628" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">2</text>
+<text x="145" y="556" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">3</text>
+<text x="49" y="653" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">3</text>
+<text x="170" y="556" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">4</text>
+<text x="49" y="678" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">4</text>
+<text x="195" y="556" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">5</text>
+<text x="49" y="703" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">5</text>
+<text x="220" y="556" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">6</text>
+<text x="49" y="728" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">6</text>
+<text x="245" y="556" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">7</text>
+<text x="49" y="753" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">7</text>
+<text x="270" y="556" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">8</text>
+<text x="49" y="778" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">8</text>
+<rect x="59" y="562" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="84" y="562" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="109" y="562" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="134" y="562" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="159" y="562" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="184" y="562" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="209" y="562" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="234" y="562" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="259" y="562" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="59" y="587" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="84" y="587" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="109" y="587" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="134" y="587" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="159" y="587" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="184" y="587" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="209" y="587" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="234" y="587" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="259" y="587" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="59" y="612" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="84" y="612" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="109" y="612" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="134" y="612" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="159" y="612" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="184" y="612" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="209" y="612" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="234" y="612" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="259" y="612" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="59" y="637" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="84" y="637" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="109" y="637" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="134" y="637" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="159" y="637" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="184" y="637" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="209" y="637" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="234" y="637" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="259" y="637" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="59" y="662" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="84" y="662" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="109" y="662" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="134" y="662" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="159" y="662" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="184" y="662" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="209" y="662" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="234" y="662" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="259" y="662" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="59" y="687" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="84" y="687" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="109" y="687" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="134" y="687" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="159" y="687" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="184" y="687" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="209" y="687" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="234" y="687" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="259" y="687" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="59" y="712" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="84" y="712" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="109" y="712" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="134" y="712" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="159" y="712" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="184" y="712" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="209" y="712" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="234" y="712" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="259" y="712" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="59" y="737" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="84" y="737" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="109" y="737" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="134" y="737" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="159" y="737" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="184" y="737" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="209" y="737" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="234" y="737" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="259" y="737" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="59" y="762" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="84" y="762" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="109" y="762" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="134" y="762" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="159" y="762" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="184" y="762" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="209" y="762" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="234" y="762" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="259" y="762" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<path d="M59 560 H281" stroke="#b65d21" stroke-width="2"/>
+<path d="M59 787 H281" stroke="#3868b2" stroke-width="2"/>
+<path d="M95 673 L120 673 L120 648 L120 623 L120 598 L120 573" fill="none" stroke="#b65d21" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+<path d="M220 698 L220 723 L220 748 L220 773" fill="none" stroke="#3868b2" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+<path d="M234 585.5 H281" stroke="#52667c" stroke-width="5"/>
+<path d="M59 660.5 H106" stroke="#b84949" stroke-width="5"/>
+<path d="M257.5 712 V759" stroke="#52667c" stroke-width="5"/>
+<path d="M257.5 637 V684" stroke="#52667c" stroke-width="5"/>
+<circle cx="95" cy="673" r="9" fill="#b65d21"/>
+<text x="95" y="677" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="white" font-weight="600" text-anchor="middle">1</text>
+<circle cx="220" cy="698" r="9" fill="#3868b2"/>
+<text x="220" y="702" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="white" font-weight="600" text-anchor="middle">2</text>
+<text x="30" y="815" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">d1 = 5; d2 = 3</text>
+<text x="30" y="840" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="start">Gap -3 → band -2</text>
+<text x="340" y="507" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="start">9: P1 detours to (2,4)</text>
+<text x="340" y="531" font-family="Segoe UI, Arial, sans-serif" font-size="15" fill="#52667c" font-weight="400" text-anchor="start">P2 to move; total ply 21</text>
+<text x="380" y="556" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">0</text>
+<text x="359" y="578" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">0</text>
+<text x="405" y="556" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">1</text>
+<text x="359" y="603" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">1</text>
+<text x="430" y="556" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">2</text>
+<text x="359" y="628" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">2</text>
+<text x="455" y="556" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">3</text>
+<text x="359" y="653" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">3</text>
+<text x="480" y="556" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">4</text>
+<text x="359" y="678" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">4</text>
+<text x="505" y="556" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">5</text>
+<text x="359" y="703" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">5</text>
+<text x="530" y="556" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">6</text>
+<text x="359" y="728" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">6</text>
+<text x="555" y="556" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">7</text>
+<text x="359" y="753" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">7</text>
+<text x="580" y="556" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">8</text>
+<text x="359" y="778" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#52667c" font-weight="400" text-anchor="middle">8</text>
+<rect x="369" y="562" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="394" y="562" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="419" y="562" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="444" y="562" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="469" y="562" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="494" y="562" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="519" y="562" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="544" y="562" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="569" y="562" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="369" y="587" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="394" y="587" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="419" y="587" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="444" y="587" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="469" y="587" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="494" y="587" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="519" y="587" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="544" y="587" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="569" y="587" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="369" y="612" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="394" y="612" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="419" y="612" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="444" y="612" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="469" y="612" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="494" y="612" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="519" y="612" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="544" y="612" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="569" y="612" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="369" y="637" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="394" y="637" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="419" y="637" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="444" y="637" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="469" y="637" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="494" y="637" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="519" y="637" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="544" y="637" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="569" y="637" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="369" y="662" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="394" y="662" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="419" y="662" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="444" y="662" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="469" y="662" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="494" y="662" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="519" y="662" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="544" y="662" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="569" y="662" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="369" y="687" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="394" y="687" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="419" y="687" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="444" y="687" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="469" y="687" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="494" y="687" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="519" y="687" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="544" y="687" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="569" y="687" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="369" y="712" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="394" y="712" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="419" y="712" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="444" y="712" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="469" y="712" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="494" y="712" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="519" y="712" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="544" y="712" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="569" y="712" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="369" y="737" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="394" y="737" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="419" y="737" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="444" y="737" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="469" y="737" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="494" y="737" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="519" y="737" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="544" y="737" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="569" y="737" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="369" y="762" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="394" y="762" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="419" y="762" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="444" y="762" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="469" y="762" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="494" y="762" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="519" y="762" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="544" y="762" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="569" y="762" width="22" height="22" fill="#edf4f8" stroke="#b8cad8"/>
+<path d="M369 560 H591" stroke="#b65d21" stroke-width="2"/>
+<path d="M369 787 H591" stroke="#3868b2" stroke-width="2"/>
+<path d="M430 673 L430 648 L430 623 L430 598 L430 573" fill="none" stroke="#b65d21" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+<path d="M530 698 L530 723 L530 748 L530 773" fill="none" stroke="#3868b2" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+<path d="M544 585.5 H591" stroke="#52667c" stroke-width="5"/>
+<path d="M369 660.5 H416" stroke="#b84949" stroke-width="5"/>
+<path d="M567.5 712 V759" stroke="#52667c" stroke-width="5"/>
+<path d="M567.5 637 V684" stroke="#52667c" stroke-width="5"/>
+<circle cx="430" cy="673" r="9" fill="#b65d21"/>
+<text x="430" y="677" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="white" font-weight="600" text-anchor="middle">1</text>
+<circle cx="530" cy="698" r="9" fill="#3868b2"/>
+<text x="530" y="702" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="white" font-weight="600" text-anchor="middle">2</text>
+<text x="340" y="815" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">d1 = 4; d2 = 3</text>
+<text x="340" y="840" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="start">Gap -3 → band -2</text>
+<text x="650" y="520" font-family="Segoe UI, Arial, sans-serif" font-size="20" fill="#17324d" font-weight="600" text-anchor="start">Why the deficit appears</text>
+<text x="650" y="551" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">The red wall blocks P1 at</text>
+<text x="650" y="574" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">columns 0 and 1, between</text>
+<text x="650" y="597" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">rows 3 and 4. P1 must go</text>
+<text x="650" y="620" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">sideways to column 2.</text>
+<text x="650" y="643" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start"></text>
+<text x="650" y="666" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">P1 distance increases: 4 → 6.</text>
+<text x="650" y="689" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">P2 distance stays at 4.</text>
+<text x="650" y="712" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start"></text>
+<text x="650" y="735" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">Positions 6, 7, 8, 9 all have</text>
+<text x="650" y="758" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">band −2: the minimum four</text>
+<text x="650" y="781" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">consecutive recorded plies.</text>
+<text x="30" y="884" font-family="Segoe UI, Arial, sans-serif" font-size="21" fill="#17324d" font-weight="600" text-anchor="start">The six preceding pre-action positions receive base loss weight 3</text>
+<text x="68" y="918" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">0</text>
+<rect x="42" y="933" width="53" height="70" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="68.5" y="962.24" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#17324d" font-weight="600" text-anchor="middle">-1</text>
+<text x="68.5" y="984.64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">w=3</text>
+<text x="132" y="918" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">1</text>
+<rect x="106" y="933" width="53" height="70" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="132.5" y="962.24" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#17324d" font-weight="600" text-anchor="middle">-1</text>
+<text x="132.5" y="984.64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">w=3</text>
+<text x="196" y="918" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">2</text>
+<rect x="170" y="933" width="53" height="70" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="196.5" y="962.24" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#17324d" font-weight="600" text-anchor="middle">-1</text>
+<text x="196.5" y="984.64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">w=3</text>
+<text x="260" y="918" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">3</text>
+<rect x="234" y="933" width="53" height="70" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="260.5" y="962.24" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#17324d" font-weight="600" text-anchor="middle">-1</text>
+<text x="260.5" y="984.64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">w=3</text>
+<text x="324" y="918" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">4</text>
+<rect x="298" y="933" width="53" height="70" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="324.5" y="962.24" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#17324d" font-weight="600" text-anchor="middle">-1</text>
+<text x="324.5" y="984.64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">w=3</text>
+<text x="388" y="918" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">5</text>
+<rect x="362" y="933" width="53" height="70" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="388.5" y="962.24" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#17324d" font-weight="600" text-anchor="middle">-1</text>
+<text x="388.5" y="984.64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">w=3</text>
+<text x="452" y="918" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">6</text>
+<rect x="426" y="933" width="53" height="70" rx="8" fill="#edf4f8" stroke="#3868b2" stroke-width="1.5"/>
+<text x="452.5" y="962.24" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#17324d" font-weight="600" text-anchor="middle">-2</text>
+<text x="452.5" y="984.64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">w=1</text>
+<text x="516" y="918" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">7</text>
+<rect x="490" y="933" width="53" height="70" rx="8" fill="#edf4f8" stroke="#3868b2" stroke-width="1.5"/>
+<text x="516.5" y="962.24" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#17324d" font-weight="600" text-anchor="middle">-2</text>
+<text x="516.5" y="984.64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">w=1</text>
+<text x="580" y="918" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">8</text>
+<rect x="554" y="933" width="53" height="70" rx="8" fill="#edf4f8" stroke="#3868b2" stroke-width="1.5"/>
+<text x="580.5" y="962.24" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#17324d" font-weight="600" text-anchor="middle">-2</text>
+<text x="580.5" y="984.64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">w=1</text>
+<text x="644" y="918" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">9</text>
+<rect x="618" y="933" width="53" height="70" rx="8" fill="#edf4f8" stroke="#3868b2" stroke-width="1.5"/>
+<text x="644.5" y="962.24" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#17324d" font-weight="600" text-anchor="middle">-2</text>
+<text x="644.5" y="984.64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">w=1</text>
+<text x="708" y="918" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">10</text>
+<rect x="682" y="933" width="53" height="70" rx="8" fill="#edf4f8" stroke="#3868b2" stroke-width="1.5"/>
+<text x="708.5" y="962.24" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#17324d" font-weight="600" text-anchor="middle">-2</text>
+<text x="708.5" y="984.64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">w=1</text>
+<text x="772" y="918" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">11</text>
+<rect x="746" y="933" width="53" height="70" rx="8" fill="#edf4f8" stroke="#3868b2" stroke-width="1.5"/>
+<text x="772.5" y="962.24" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#17324d" font-weight="600" text-anchor="middle">-2</text>
+<text x="772.5" y="984.64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">w=1</text>
+<text x="836" y="918" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">12</text>
+<rect x="810" y="933" width="53" height="70" rx="8" fill="#edf4f8" stroke="#3868b2" stroke-width="1.5"/>
+<text x="836.5" y="962.24" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#17324d" font-weight="600" text-anchor="middle">-2</text>
+<text x="836.5" y="984.64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">w=1</text>
+<text x="900" y="918" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">13</text>
+<rect x="874" y="933" width="53" height="70" rx="8" fill="#edf4f8" stroke="#3868b2" stroke-width="1.5"/>
+<text x="900.5" y="962.24" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#17324d" font-weight="600" text-anchor="middle">-2</text>
+<text x="900.5" y="984.64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">w=1</text>
+<rect x="42" y="1018" width="373" height="44" fill="#087f8c" rx="3"/>
+<text x="228.5" y="1045.44" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="white" font-weight="600" text-anchor="middle">Positions 0–5: preceding strategy</text>
+<rect x="426" y="1018" width="501" height="44" fill="#3868b2" rx="3"/>
+<text x="676.5" y="1045.44" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="white" font-weight="600" text-anchor="middle">Positions 6–13: maintained deficit</text>
+<text x="30" y="1095" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">Position 5 stores the teacher’s wall action. Positions 0–4 store both players’ preceding moves.</text>
+<text x="30" y="1124" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">The selector weights the setup, not the deficit positions simply because they are losing.</text>
+</svg>

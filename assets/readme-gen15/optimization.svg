@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="620" viewBox="0 0 960 620" role="img" aria-labelledby="title desc">
+<title id="title">One optimizer update</title><desc id="desc">An example can have an outcome target without a policy target. Normalize the two losses separately.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#52667c"/></marker></defs>
+<rect width="960" height="100%" fill="white"/>
+<text x="30" y="36" font-family="Segoe UI, Arial, sans-serif" font-size="25" fill="#17324d" font-weight="600" text-anchor="start">One optimizer update</text>
+<text x="30" y="64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">An example can have an outcome target without a policy target. Normalize the two losses separately.</text>
+<rect x="250" y="95" width="460" height="65" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="480.0" y="133.62" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">Batch inputs + targets + base weights</text>
+<rect x="250" y="192" width="460" height="75" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="480.0" y="223.38" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Reflect each example with probability 0.5</text>
+<text x="480.0" y="247.18" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">Transform its input history and policy target together</text>
+<path d="M480 160 L480 192" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M480 267 V290 H250 V315" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M480 290 H710 V315" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="30" y="315" width="430" height="108" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="245.0" y="350.97999999999996" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Value loss: all examples</text>
+<text x="245.0" y="374.78" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">BCE with logit 2z and target (y + 1)/2</text>
+<text x="245.0" y="398.5799999999999" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">Weighted mean; fresh boost capped at 4</text>
+<rect x="500" y="315" width="430" height="108" rx="8" fill="#edf4f8" stroke="#3868b2" stroke-width="1.5"/>
+<text x="715.0" y="350.97999999999996" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Policy loss: targeted examples only</text>
+<text x="715.0" y="374.78" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">Cross-entropy over 209 action logits</text>
+<text x="715.0" y="398.5799999999999" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">Recalculate weights on this subset</text>
+<path d="M250 423 V450 H480 V473" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M710 423 V450 H480" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="190" y="473" width="580" height="66" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="480.0" y="512.12" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">Add losses → gradients → clip norm to 1 → Adam</text>
+<path d="M480 539 L480 565" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="480" y="591" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">One successful step adds 1 to the optimizer-update counter.</text>
+</svg>

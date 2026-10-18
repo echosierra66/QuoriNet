@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="410" viewBox="0 0 960 410" role="img" aria-labelledby="title desc">
+<title id="title">Game admission and outcome targets</title><desc id="desc">First check that a real winner exists. A 200-ply cutoff supplies no outcome target.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#52667c"/></marker></defs>
+<rect width="960" height="100%" fill="white"/>
+<text x="30" y="36" font-family="Segoe UI, Arial, sans-serif" font-size="25" fill="#17324d" font-weight="600" text-anchor="start">Game admission and outcome targets</text>
+<text x="30" y="64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">First check that a real winner exists. A 200-ply cutoff supplies no outcome target.</text>
+<rect x="30" y="92" width="445" height="46" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="252.5" y="120.78" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Completed opening vs latest teacher</text>
+<rect x="515" y="92" width="415" height="46" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="722.5" y="120.78" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Keep student win or loss</text>
+<path d="M475 115 L515 115" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="30" y="149" width="445" height="46" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="252.5" y="177.78" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Completed opening vs another teacher</text>
+<rect x="515" y="149" width="415" height="46" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="722.5" y="177.78" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Keep student loss only</text>
+<path d="M475 172 L515 172" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="30" y="206" width="445" height="46" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="252.5" y="234.78" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Completed continuation vs any teacher</text>
+<rect x="515" y="206" width="415" height="46" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="722.5" y="234.78" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Keep student win or loss</text>
+<path d="M475 229 L515 229" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="30" y="263" width="445" height="46" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="252.5" y="291.78" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Unfinished game at cutoff</text>
+<rect x="515" y="263" width="415" height="46" rx="8" fill="#edf4f8" stroke="#b65d21" stroke-width="1.5"/>
+<text x="722.5" y="291.78" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Discard outcome-training positions</text>
+<path d="M475 286 L515 286" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="30" y="359" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="start">If player 1 wins: player-1-to-move examples get +1; player-2-to-move examples get −1.</text>
+<text x="30" y="388" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">Record both sides. Hold the student fixed until the game ends and admission is decided.</text>
+</svg>

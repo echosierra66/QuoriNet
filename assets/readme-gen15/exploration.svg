@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="355" viewBox="0 0 960 355" role="img" aria-labelledby="title desc">
+<title id="title">Exploration in an exploratory training game</title><desc id="desc">Only the student explores. Each interval refers to elapsed plies since this episode started.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#52667c"/></marker></defs>
+<rect width="960" height="100%" fill="white"/>
+<text x="30" y="36" font-family="Segoe UI, Arial, sans-serif" font-size="25" fill="#17324d" font-weight="600" text-anchor="start">Exploration in an exploratory training game</text>
+<text x="30" y="64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">Only the student explores. Each interval refers to elapsed plies since this episode started.</text>
+<text x="303" y="109" font-family="Segoe UI, Arial, sans-serif" font-size="20" fill="#17324d" font-weight="600" text-anchor="start">Elapsed plies 0–10</text>
+<text x="665" y="109" font-family="Segoe UI, Arial, sans-serif" font-size="20" fill="#17324d" font-weight="600" text-anchor="start">Elapsed plies 11 onward</text>
+<text x="30" y="165" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="start">Student root priors</text>
+<rect x="290" y="135" width="630" height="52" fill="#087f8c" rx="3"/>
+<text x="605.0" y="167.12" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="white" font-weight="600" text-anchor="middle">75% prior + 25% Dirichlet noise</text>
+<text x="30" y="235" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="start">Student action choice</text>
+<rect x="290" y="205" width="300" height="52" fill="#3868b2" rx="3"/>
+<text x="440.0" y="236.44" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="white" font-weight="600" text-anchor="middle">Temperature 1: sample visits</text>
+<rect x="600" y="205" width="320" height="52" fill="#3868b2" rx="3"/>
+<text x="760.0" y="236.44" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="white" font-weight="600" text-anchor="middle">Temperature 0: most visits</text>
+<text x="30" y="303" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">Teacher: no root noise or visit sampling. Immediate student root wins skip noise.</text>
+<text x="30" y="332" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">Greedy games and promotion tests disable both student exploration mechanisms.</text>
+</svg>

@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="495" viewBox="0 0 960 495" role="img" aria-labelledby="title desc">
+<title id="title">Continuation games: saved context, new outcomes</title><desc id="desc">The shared pool can contain starts from openings and earlier continuation games.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#52667c"/></marker></defs>
+<rect width="960" height="100%" fill="white"/>
+<text x="30" y="36" font-family="Segoe UI, Arial, sans-serif" font-size="25" fill="#17324d" font-weight="600" text-anchor="start">Continuation games: saved context, new outcomes</text>
+<text x="30" y="64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">The shared pool can contain starts from openings and earlier continuation games.</text>
+<rect x="30" y="110" width="245" height="105" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="152.5" y="156.02" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">Opening game</text>
+<text x="152.5" y="181.22" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Ends with result A or cutoff</text>
+<rect x="355" y="110" width="270" height="105" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="490.0" y="156.02" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">Saved-start pool</text>
+<text x="490.0" y="181.22" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Up to 4,096 positions</text>
+<path d="M275 163 L355 163" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)" stroke-dasharray="6 5"/>
+<text x="677" y="128" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="start">Save nonterminal positions:</text>
+<text x="677" y="157" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">total ply ≥ 8 and &lt; 200;</text>
+<text x="677" y="186" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">every 3 elapsed plies.</text>
+<rect x="30" y="295" width="260" height="112" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="160.0" y="331.92" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">Continuation game 1</text>
+<text x="160.0" y="357.12" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Prefer middlegame</text>
+<text x="160.0" y="382.32" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">New result B or cutoff</text>
+<path d="M490 215 L160 295" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="350" y="295" width="260" height="112" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="480.0" y="331.92" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">Continuation game 2</text>
+<text x="480.0" y="357.12" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Prefer endgame</text>
+<text x="480.0" y="382.32" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">New result C or cutoff</text>
+<path d="M490 215 L480 295" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="670" y="295" width="260" height="112" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="800.0" y="331.92" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">Continuation game 3</text>
+<text x="800.0" y="357.12" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Prefer endgame</text>
+<text x="800.0" y="382.32" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">New result D or cutoff</text>
+<path d="M490 215 L800 295" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="30" y="445" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="start">Only each newly played suffix receives its own outcome. It never inherits result A.</text>
+<text x="30" y="476" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">History and total ply count carry over; a start at ply 150 leaves at most 50 more plies.</text>
+</svg>

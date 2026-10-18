@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="660" viewBox="0 0 960 660" role="img" aria-labelledby="title desc">
+<title id="title">Residual policy and value network</title><desc id="desc">All shared feature maps retain the 9 × 9 board. BN = batch normalization.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#52667c"/></marker></defs>
+<rect width="960" height="100%" fill="white"/>
+<text x="30" y="36" font-family="Segoe UI, Arial, sans-serif" font-size="25" fill="#17324d" font-weight="600" text-anchor="start">Residual policy and value network</text>
+<text x="30" y="64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">All shared feature maps retain the 9 × 9 board. BN = batch normalization.</text>
+<rect x="300" y="92" width="360" height="64" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="480.0" y="130.12" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">Input: 72 × 9 × 9</text>
+<rect x="300" y="187" width="360" height="74" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="480.0" y="217.52" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">3 × 3 convolution: 72 → 64</text>
+<text x="480.0" y="242.72" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">BN, ReLU</text>
+<path d="M480 156 L480 187" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="270" y="292" width="420" height="82" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="480.0" y="326.52" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">8 residual blocks, 64 channels</text>
+<text x="480.0" y="351.71999999999997" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Each: two 3 × 3 convolutions + input</text>
+<path d="M480 261 L480 292" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M480 374 V394 H250 V414" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M480 394 H710 V414" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="35" y="414" width="430" height="112" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="250.0" y="451.97999999999996" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Policy head</text>
+<text x="250.0" y="475.78" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">1 × 1: 64 → 32, BN, ReLU; 1 × 1: 32 → 3</text>
+<text x="250.0" y="499.5799999999999" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">81 pawn + 64 H-wall + 64 V-wall</text>
+<rect x="495" y="414" width="430" height="112" rx="8" fill="#edf4f8" stroke="#b65d21" stroke-width="1.5"/>
+<text x="710.0" y="451.97999999999996" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Value head</text>
+<text x="710.0" y="475.78" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">1 × 1: 64 → 8, BN, ReLU; flatten 648</text>
+<text x="710.0" y="499.5799999999999" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">Dense 648 → 64, ReLU; dense 64 → 1</text>
+<path d="M250 526 L250 555" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M710 526 L710 555" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="35" y="555" width="430" height="64" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="250.0" y="593.12" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">209 logits → search action priors</text>
+<rect x="495" y="555" width="430" height="64" rx="8" fill="#edf4f8" stroke="#b65d21" stroke-width="1.5"/>
+<text x="710.0" y="593.12" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">Raw z for loss; tanh(z) for search</text>
+</svg>

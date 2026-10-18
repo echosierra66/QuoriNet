@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="395" viewBox="0 0 960 395" role="img" aria-labelledby="title desc">
+<title id="title">Selecting replay spans for a normal batch</title><desc id="desc">Each draw first favors less-used spans, then samples broadly. Reject duplicate identities or spans that do not fit.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#52667c"/></marker></defs>
+<rect width="960" height="100%" fill="white"/>
+<text x="30" y="36" font-family="Segoe UI, Arial, sans-serif" font-size="25" fill="#17324d" font-weight="600" text-anchor="start">Selecting replay spans for a normal batch</text>
+<text x="30" y="64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">Each draw first favors less-used spans, then samples broadly. Reject duplicate identities or spans that do not fit.</text>
+<rect x="30" y="100" width="260" height="90" rx="8" fill="#edf4f8" stroke="#3868b2" stroke-width="1.5"/>
+<text x="160.0" y="138.88" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Teacher-weighted replay</text>
+<text x="160.0" y="162.68" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">Up to 176 minus fresh slots</text>
+<rect x="350" y="100" width="260" height="90" rx="8" fill="#edf4f8" stroke="#3868b2" stroke-width="1.5"/>
+<text x="480.0" y="128.04" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#17324d" font-weight="600" text-anchor="middle">Choose a teacher</text>
+<text x="480.0" y="150.44" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">25% uniform; 75% deficits</text>
+<text x="480.0" y="172.83999999999997" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">Reference starts at 57%</text>
+<rect x="670" y="100" width="260" height="90" rx="8" fill="#edf4f8" stroke="#3868b2" stroke-width="1.5"/>
+<text x="800.0" y="128.04" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#17324d" font-weight="600" text-anchor="middle">Choose its replay spans</text>
+<text x="800.0" y="150.44" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">First: less-used spans</text>
+<text x="800.0" y="172.83999999999997" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">Then: broader sampling</text>
+<path d="M290 145 L350 145" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M610 145 L670 145" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="30" y="240" width="260" height="90" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="160.0" y="278.88" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">General replay</text>
+<text x="160.0" y="302.68" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">Up to 80 slots</text>
+<rect x="350" y="240" width="260" height="90" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="480.0" y="278.88" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">All available replay spans</text>
+<text x="480.0" y="302.68" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">No teacher-first weighting</text>
+<rect x="670" y="240" width="260" height="90" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="800.0" y="268.04" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#17324d" font-weight="600" text-anchor="middle">Choose replay spans</text>
+<text x="800.0" y="290.44" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">First: less-used spans</text>
+<text x="800.0" y="312.84000000000003" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="middle">Then: broader sampling</text>
+<path d="M290 285 L350 285" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M610 285 L670 285" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="30" y="375" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">Use counts advance after a successful optimizer update. Both draws share batch deduplication.</text>
+</svg>

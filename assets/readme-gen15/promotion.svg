@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="560" viewBox="0 0 960 560" role="img" aria-labelledby="title desc">
+<title id="title">Qualification and the promotion test</title><desc id="desc">All games in the promotion test use fixed networks and depth setting 2.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#52667c"/></marker></defs>
+<rect width="960" height="100%" fill="white"/>
+<text x="30" y="36" font-family="Segoe UI, Arial, sans-serif" font-size="25" fill="#17324d" font-weight="600" text-anchor="start">Qualification and the promotion test</text>
+<text x="30" y="64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">All games in the promotion test use fixed networks and depth setting 2.</text>
+<rect x="30" y="96" width="400" height="105" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="230.0" y="129.42" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">Rolling qualification</text>
+<text x="230.0" y="154.61999999999998" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Latest: ≥30 results and ≥57% wins</text>
+<text x="230.0" y="179.82" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Others: nonempty log and ≥57% wins</text>
+<rect x="510" y="96" width="420" height="105" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="720.0" y="129.42" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">Start promotion test</text>
+<text x="720.0" y="154.61999999999998" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Rematch cleared</text>
+<text x="720.0" y="179.82" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Manual request can skip qualification</text>
+<path d="M430 149 L510 149" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="30" y="252" width="900" height="70" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="480.0" y="293.46" font-family="Segoe UI, Arial, sans-serif" font-size="19" fill="#17324d" font-weight="600" text-anchor="middle">10 games per teacher = 5 pairs with student/teacher player assignments exchanged</text>
+<rect x="30" y="350" width="170" height="65" rx="8" fill="#edf4f8" stroke="#3868b2" stroke-width="1.5"/>
+<text x="115.0" y="376.38" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Standard start</text>
+<text x="115.0" y="400.18" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">2 games</text>
+<rect x="212" y="350" width="170" height="65" rx="8" fill="#edf4f8" stroke="#3868b2" stroke-width="1.5"/>
+<text x="297.0" y="376.38" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Seed 1</text>
+<text x="297.0" y="400.18" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">2 games</text>
+<rect x="394" y="350" width="170" height="65" rx="8" fill="#edf4f8" stroke="#3868b2" stroke-width="1.5"/>
+<text x="479.0" y="376.38" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Seed 2</text>
+<text x="479.0" y="400.18" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">2 games</text>
+<rect x="576" y="350" width="170" height="65" rx="8" fill="#edf4f8" stroke="#3868b2" stroke-width="1.5"/>
+<text x="661.0" y="376.38" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Seed 3</text>
+<text x="661.0" y="400.18" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">2 games</text>
+<rect x="758" y="350" width="170" height="65" rx="8" fill="#edf4f8" stroke="#3868b2" stroke-width="1.5"/>
+<text x="843.0" y="376.38" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#17324d" font-weight="600" text-anchor="middle">Seed 4</text>
+<text x="843.0" y="400.18" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="middle">2 games</text>
+<text x="30" y="449" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">Seeded starts play four legal opening plies before evaluation. Cutoffs count as non-wins.</text>
+<rect x="30" y="479" width="435" height="56" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="247.5" y="513.12" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">≥6/10 vs EVERY teacher → promote</text>
+<rect x="495" y="479" width="435" height="56" rx="8" fill="#edf4f8" stroke="#b65d21" stroke-width="1.5"/>
+<text x="712.5" y="513.12" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">Any failure → return to training</text>
+</svg>

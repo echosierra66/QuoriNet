@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="475" viewBox="0 0 960 475" role="img" aria-labelledby="title desc">
+<title id="title">What a complete resume needs</title><desc id="desc">The training bundle is authoritative; a JSON summary or student weights alone are incomplete.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#52667c"/></marker></defs>
+<rect width="960" height="100%" fill="white"/>
+<text x="30" y="36" font-family="Segoe UI, Arial, sans-serif" font-size="25" fill="#17324d" font-weight="600" text-anchor="start">What a complete resume needs</text>
+<text x="30" y="64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">The training bundle is authoritative; a JSON summary or student weights alone are incomplete.</text>
+<rect x="30" y="100" width="425" height="200" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="242.5" y="168.32" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">Architecture archives</text>
+<text x="242.5" y="193.51999999999998" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Official teachers and manual snapshots</text>
+<text x="242.5" y="218.72" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Network definitions and executable modules</text>
+<text x="242.5" y="243.92" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Saved encoders and generation inventories</text>
+<rect x="505" y="100" width="425" height="200" rx="8" fill="#edf4f8" stroke="#3868b2" stroke-width="1.5"/>
+<text x="717.5" y="168.32" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">Active training bundle</text>
+<text x="717.5" y="193.51999999999998" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Student, latest teacher, optimizer</text>
+<text x="717.5" y="218.72" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Replay, use counts, saved/used starts</text>
+<text x="717.5" y="243.92" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#52667c" font-weight="400" text-anchor="middle">Counters, quota, random states</text>
+<rect x="30" y="340" width="900" height="70" rx="8" fill="#edf4f8" stroke="#087f8c" stroke-width="1.5"/>
+<text x="480.0" y="381.12" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="middle">Compatibility migration: original 9 input channels + 63 zero-weight channels → 72</text>
+<text x="30" y="449" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#52667c" font-weight="400" text-anchor="start">Older teachers keep their saved encoders; normal generation 15 moves do not repeat migration.</text>
+</svg>

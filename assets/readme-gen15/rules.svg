@@ -1,0 +1,129 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="365" viewBox="0 0 960 365" role="img" aria-labelledby="title desc">
+<title id="title">Legal pawn moves and wall placement</title><desc id="desc">Local board excerpts; orange moves upward. Blue is the opponent.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#52667c"/></marker></defs>
+<rect width="960" height="100%" fill="white"/>
+<text x="30" y="36" font-family="Segoe UI, Arial, sans-serif" font-size="25" fill="#17324d" font-weight="600" text-anchor="start">Legal pawn moves and wall placement</text>
+<text x="30" y="64" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">Local board excerpts; orange moves upward. Blue is the opponent.</text>
+<text x="34" y="106" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="start">Adjacent step</text>
+<rect x="49" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="80" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="111" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="142" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="173" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="49" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="80" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="111" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="142" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="173" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="49" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="80" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="111" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="142" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="173" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="49" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="80" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="111" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="142" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="173" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="49" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="80" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="111" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="142" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="173" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<circle cx="125" cy="232" r="10" fill="#b65d21"/>
+<path d="M125 225 L125 200" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="34" y="310" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">Move across an open edge.</text>
+<text x="267" y="106" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="start">Straight jump</text>
+<rect x="282" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="313" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="344" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="375" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="406" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="282" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="313" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="344" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="375" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="406" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="282" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="313" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="344" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="375" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="406" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="282" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="313" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="344" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="375" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="406" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="282" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="313" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="344" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="375" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="406" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<circle cx="358" cy="232" r="10" fill="#b65d21"/>
+<circle cx="358" cy="201" r="10" fill="#3868b2"/>
+<path d="M373 232 Q414 189 358 170" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="267" y="310" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">Jump beyond the opponent.</text>
+<text x="500" y="106" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="start">Blocked straight jump</text>
+<rect x="515" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="546" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="577" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="608" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="639" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="515" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="546" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="577" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="608" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="639" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="515" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="546" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="577" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="608" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="639" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="515" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="546" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="577" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="608" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="639" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="515" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="546" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="577" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="608" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="639" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<circle cx="591" cy="232" r="10" fill="#b65d21"/>
+<circle cx="591" cy="201" r="10" fill="#3868b2"/>
+<path d="M546 185 H606" stroke="#17324d" stroke-width="7"/>
+<path d="M585 227 L560 207" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M598 227 L622 207" fill="none" stroke="#52667c" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="500" y="310" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">Use eligible side squares.</text>
+<text x="733" y="106" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#17324d" font-weight="600" text-anchor="start">Wall checks</text>
+<rect x="748" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="779" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="810" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="841" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="872" y="125" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="748" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="779" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="810" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="841" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="872" y="156" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="748" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="779" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="810" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="841" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="872" y="187" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="748" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="779" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="810" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="841" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="872" y="218" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="748" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="779" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="810" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="841" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<rect x="872" y="249" width="28" height="28" fill="#edf4f8" stroke="#b8cad8"/>
+<circle cx="762" cy="263" r="10" fill="#b65d21"/>
+<circle cx="886" cy="139" r="10" fill="#3868b2"/>
+<path d="M779 185 H839" stroke="#087f8c" stroke-width="7"/>
+<text x="733" y="310" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">No overlap or crossing;</text>
+<text x="733" y="334" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#52667c" font-weight="400" text-anchor="start">both goal routes must remain.</text>
+</svg>
