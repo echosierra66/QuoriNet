@@ -309,7 +309,7 @@ Start with `PolicyValueQuoriNet` and the encoders in `Quoridor.py` for the repre
 Authorship note, recorded from Ochir Erdembileg's account:
 Ochir Erdembileg conceived the project's ideas and technical direction and authored
 the commit history.
-erkheslost's contribution was to implement batching.
+Erkhes Unentugs contributed batching and proposed that the teacher shouldn't have exploration.
 This refers to the project's design and development, not authorship of established
 methods such as neural networks, residual networks, or Monte Carlo tree search.
 The supplied working folder contains no Git history, so the commit count has not
