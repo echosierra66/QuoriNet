@@ -12,22 +12,11 @@ Quoridor is played on a 9×9 board with ten walls per player. Reach the opposite
 
 QuoriNet was prepared for open-source release on 12 October 2026. I plan to keep maintaining the project and committing updated weights as training progresses.
 
-## What is available
+## Download weights
 
-The saved collection contains **official generations 1–14**, manual student snapshots, and the active student numbered **15**. Generation 14 is the latest promoted teacher in this copy. The student numbered 15 is still a candidate; there is no separate official generation 15 checkpoint.
+Download the latest pretrained weights from [Google Drive](https://drive.google.com/drive/folders/1ZH1Fax6PrfDrHTMOZihURBQoL376pk-G?usp=drive_link).
 
-| Item | Saved state |
-| --- | --- |
-| Latest official teacher | Generation 14 |
-| Active candidate | Generation 15, by the trainer's numbering |
-| Recorded games | 63,540 |
-| Completed optimizer updates | 113,904 |
-| Learning rate | `0.00003` |
-| Current network | 64 feature channels, 8 residual blocks |
-| Input | 8 positions × 9 planes = `(72, 9, 9)` |
-| Policy output | 209 action scores |
-
-The counters come from [`gen 10-14/quorinet_meta.json`](gen%2010-14/quorinet_meta.json); the architecture is described in [`NN architecture.json`](gen%2010-14/NN%20architecture.json). They describe the stored training state. An independent benchmark against external opponents, an Elo rating, and controlled component comparisons are still outstanding.
+For a complete training resume, download the full checkpoint collection and place the `gen 1-9` and `gen 10-14` folders beside `Quoridor.py`.
 
 ## How it works
 
