@@ -2,7 +2,7 @@
 
 QuoriNet is a Quoridor engine that learns by playing against saved earlier versions of itself. A neural network estimates a position and suggests actions. Search tests actions and replies. After an accepted game finishes, the engine trains the current network on the game's result and searched action targets, together with replay from earlier accepted games.
 
-This README describes **`10.15 gen 15.zip`**, inspected on 19 October 2026. The archive's `Quoridor.py` is byte-for-byte identical to [the workspace source](Quoridor.py). This is a separate revised copy; the original README and illustrated paper are preserved.
+This README describes **`10.15 gen 15.zip`**, as it is on 19 October 2026. The archive's `Quoridor.py` is byte-for-byte identical to [the workspace source](Quoridor.py). 
 
 ![The student plays a teacher, then trains after an accepted game finishes](assets/readme-gen15/training-loop.svg)
 
