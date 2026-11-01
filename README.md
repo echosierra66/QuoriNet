@@ -1,4 +1,5 @@
-# QuoriNet — generation 15 illustrated README
+# QuoriNet — README
+Ochir Erdembileg.
 
 QuoriNet is a Quoridor engine that learns by playing against saved earlier versions of itself. A neural network estimates a position and suggests actions. Search tests actions and replies. After an accepted game finishes, the engine trains the current network on the game's result and searched action targets, together with replay from earlier accepted games.
 
